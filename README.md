@@ -6,7 +6,7 @@ Telegram-бот для удалённого управления [podkop](https:
 
 > **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант-форк. 
 
-> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, для тех, кто предпочитает веб вместо Telegram. Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
+> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, удобное администрирование бота через веб и тестирование активных маршрутов.  Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md) (English: [CHANGELOG.md](CHANGELOG.md))
 
