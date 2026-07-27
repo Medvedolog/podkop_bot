@@ -4,7 +4,7 @@ Telegram-бот для удалённого управления [podkop](https:
 
 Поддерживает варианты podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus (новый пакет/сервис/UCI namespace `forkop`). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
 
-> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант — детект (перед `plus`), пути/пакет/repo `forkop`, домен `fakeip.forkop.fyi` (с устойчивостью к обоим доменам). Мониторинг и диагностика — наравне с Plus. Управление: замена URL подписки и действие секции (`connection`/`bypass`/`block`/`zapret`) — нативно; структурные операции (создание/удаление дочерних секций URLTest, правки подсетей через rule-модель) — пока read-only с честным показом текущего конфига и отсылкой в LuCI. После ручной миграции Plus→Forkop во время работы бота перезапустите его: `/etc/init.d/podkop_bot restart`.
+> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант-форк. 
 
 > 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, для тех, кто предпочитает веб вместо Telegram. Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
 
