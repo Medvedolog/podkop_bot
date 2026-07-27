@@ -1,12 +1,14 @@
-# 🤖 podkop_bot v0.15.9
+# 🤖 podkop_bot v0.18.1
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
-Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
+Поддерживает варианты podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus (новый пакет/сервис/UCI namespace `forkop`). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
 
-> 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md)
-> 
-> 🗺️ Структура меню и описание всех карточек — [BOT_STRUCTURE.md](BOT_STRUCTURE.md)
+> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант — детект (перед `plus`), пути/пакет/repo `forkop`, домен `fakeip.forkop.fyi` (с устойчивостью к обоим доменам). Мониторинг и диагностика — наравне с Plus. Управление: замена URL подписки и действие секции (`connection`/`bypass`/`block`/`zapret`) — нативно; структурные операции (создание/удаление дочерних секций URLTest, правки подсетей через rule-модель) — пока read-only с честным показом текущего конфига и отсылкой в LuCI. После ручной миграции Plus→Forkop во время работы бота перезапустите его: `/etc/init.d/podkop_bot restart`.
+
+> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, для тех, кто предпочитает веб вместо Telegram. Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
+
+> 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md) (English: [CHANGELOG.md](CHANGELOG.md))
 
 ---
 
@@ -256,7 +258,7 @@ ash install.sh --unattended --action update-luci
 ### 🤖 Управление транспортом бота
 
 * **Transport Policy**: `auto` / `socks` / `direct` — с описанием рисков и подтверждением
-* **Fallback SOCKS** (`tier2_N`): добавление, удаление, тест доступности всех tier'ов
+* **Fallback-прокси** (`tier2_N`): добавление, удаление, тест доступности всех tier'ов. Формат записи: `socks5h://[user:pass@]host:port[#Имя]` — опциональные учётные данные и локальная мнемоника. Пароль маскируется везде в логах/UI/алертах (`user:***@`), в отображении используется мнемоника, если задана. Валидация формата при вводе (отдельно неверный формат и неверный порт 1-65535), дедуп по endpoint. Пробелы в мнемонике заменяются на `_`; пробелы в host/user/pass не допускаются
 * Активный tier выделен маркером `◀ active`
 * Custom Proxy (tier3)
 * Bind Interface — привязка исходящего интерфейса бота
@@ -329,7 +331,7 @@ ash install.sh --unattended --action update-luci
 
 ```text
 tier1   → Podkop SOCKS5 (основной туннель, primary proxy-секция)
-tier2_N → Fallback SOCKS list (socks5:// / socks5h://) + авто-секции с mixed_proxy
+tier2_N → Fallback-прокси list (socks5:// / socks5h://, опц. user:pass@ и #Имя) + авто-секции с mixed_proxy
 tier3   → Custom Proxy
 tier4   → Direct
 tier5   → Emergency Telegram IPs (обновляются через DoH)
@@ -411,7 +413,6 @@ uci commit podkop_bot
 |------|----------|
 | `podkop_bot.sh` | Основной скрипт бота |
 | `install.sh` | Установщик / обновление / удаление |
-| `BOT_STRUCTURE.md` | [Структура меню](BOT_STRUCTURE.md) — все карточки, строки и кнопки |
 | `CHANGELOG.md` | История изменений (EN) |
 | `CHANGELOG_RUS.md` | История изменений (RU) |
 | `version.txt` | Актуальная версия для self-update |
@@ -466,4 +467,4 @@ The bot maintains reachability through a 5-tier fallback transport chain (Podkop
 
 v0.15.7 adds **Weekly Report** (scheduled weekly digest with stability aggregates, traffic delta, subscription warnings, versions with mtime/hash, and bot config snapshot), **Upload Bot Script** (install bot updates via Telegram document — for testing patches without GitHub and routers behind ISP blocks), **Quiet Hours** (suppress watchdog alerts during configurable time range with overnight support), **Broadcast Alerts** / **RAM Alert** toggles, and 5-source public IP detection including Russian services for Crimea/RF. v0.15.5 adds **Server Instances** (Plus only) — live UCI-based status of sing-box server-mode inbounds with TCP+UDP port check — and **Daily Report** — a configurable scheduled Telegram digest with system stats, WAN/IP, TG connectivity, active outbound with country flag and last-switch info, sing-box restarts, traffic, bot transport chain, and Plus subscription data.
 
-Full [changelog](CHANGELOG.md) and [menu structure reference](BOT_STRUCTURE.md) available.
+Full [changelog](CHANGELOG.md) available.
