@@ -1,12 +1,30 @@
-# 🤖 podkop_bot v0.19.2
+<div align="center">
 
-Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
+# 🤖 podkop_bot
 
-Поддерживает варианты podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus (новый пакет/сервис/UCI namespace `forkop`). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
+**Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант — детект (перед `plus`), пути/пакет/repo `forkop`, домен FakeIP-проверки `fakeip.podkop.fyi` (канон в исходниках Forkop; проверяются оба домена, т.к. его можно переопределить через `FAKEIP_TEST_DOMAIN`). Мониторинг и диагностика — наравне с Plus. Управление: замена URL подписки и действие секции (`connection`/`bypass`/`block`/`zapret`) — нативно; структурные операции (создание/удаление дочерних секций URLTest, правки подсетей через rule-модель) — пока read-only с честным показом текущего конфига и отсылкой в LuCI. После ручной миграции Plus→Forkop во время работы бота перезапустите его: `/etc/init.d/podkop_bot restart`.
+[![version](https://img.shields.io/badge/version-0.19.2-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
+[![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/BotFather)
 
-> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, для тех, кто предпочитает веб вместо Telegram. Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
+[**Установка**](#-быстрая-установка) · [Возможности](#-возможности) · [Поддержка форков](#-поддержка-форков-podkop) · [Веб-интерфейс](#-веб-интерфейс--luci-app-podkop-bot) · [История изменений](CHANGELOG_RUS.md)
+
+</div>
+
+---
+
+[podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
+
+Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`.
+
+> **Forkop — что уже умеет бот.** Мониторинг и диагностика работают наравне с Plus. Нативно, прямо из Telegram, редактируются: URL подписки, действие секции (`connection`/`bypass`/`block`/`zapret`), условия секции (домены, IP, порты, устройства), каскад через другую секцию (detour), настройки источника подписки и параметры существующей URLTest. Всё остальное — то, что требует создавать или удалять дочерние секции и править правила по rule-модели, — бот пока честно показывает как есть и отправляет доделать в LuCI: писать в поля, которые backend всё равно проигнорирует, смысла нет.
+>
+> Вариант `forkop` проверяется раньше, чем `plus` — иначе после переезда бот принял бы новый пакет за старый. FakeIP-проверка ходит на `fakeip.podkop.fyi` (канон из исходников Forkop), но домен можно переопределить через `FAKEIP_TEST_DOMAIN`, поэтому проверяются оба. Если мигрировали с Plus на Forkop вручную, не останавливая бота, — перезапустите его: `/etc/init.d/podkop_bot restart`.
+
+> 🖥️ **Не всё удобно делать в чате.** Для настроек бота есть отдельная LuCI-панель — **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)**: токен, admin_ids, транспорт, алерты, расписания отчётов и Runtime Info в браузере. Ставится тем же `install.sh` с флагом `--with-luci`, подробности — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md) (English: [CHANGELOG.md](CHANGELOG.md))
 
@@ -112,9 +130,9 @@ Telegram-бот для удалённого управления [podkop](https:
 | NetShift multi-subscription URL (list) | ❌ | ✅ | ❌ | ❌ |
 
 
-> **Forkop:** мониторинг и диагностика — наравне с Plus. Подписки редактируются нативно через дочерние секции (`config subscription_url`), действие секции пишется в `action`. Операции, помеченные 👁, требуют создания/удаления дочерних секций или правил Forkop — бот показывает текущее состояние конфига и отправляет в LuCI, вместо записи в поля, которые backend игнорирует.
+> **Forkop.** Мониторинг и диагностика — наравне с Plus. Подписки бот правит нативно, через дочерние секции (`config subscription_url`), действие секции пишет в `action`. Значок 👁 означает, что операция требует создать или удалить дочернюю секцию либо правило Forkop: такие вещи бот показывает как есть и отправляет в LuCI. Записывать в поля, которые backend проигнорирует, — значит соврать об успехе, поэтому бот так не делает.
 
-> **NetShift:** базовое управление полностью поддерживается. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, `selector_text`/`urltest_text` режимы) — отображаются read-only, редактируются в LuCI. После обновления с podkop-evolution на NetShift бот автоматически переключает runtime.
+> **NetShift.** Базовое управление поддерживается целиком. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, режимы `selector_text`/`urltest_text`) показываются только на чтение — править их нужно в LuCI. При обновлении с podkop-evolution на NetShift бот переключает runtime сам, вмешиваться не нужно.
 
 ---
 
@@ -125,7 +143,7 @@ wget -O /tmp/install_podkop_bot.sh https://raw.githubusercontent.com/Medvedolog/
 ash /tmp/install_podkop_bot.sh
 ```
 
-Установщик автоматически определяет вариант podkop (original / evolution / netshift / plus / forkop), устанавливает зависимости (`curl`, `jq`) и поддерживает **4 интерактивных режима**:
+Установщик сам разберётся, какой вариант podkop стоит на роутере (original / evolution / netshift / plus / forkop), доставит зависимости (`curl`, `jq`) и предложит один из **четырёх режимов**:
 
 1. **Update** — обновить скрипт, сохранить конфиг
 2. **Reinstall** — переустановить с новыми настройками
@@ -134,7 +152,7 @@ ash /tmp/install_podkop_bot.sh
 
 ### 🌐 Установка за блокировками
 
-Если GitHub недоступен напрямую (ISP блокирует), установщик предложит ввести прокси для скачивания бота и зависимостей. Поддерживается HTTP-прокси (`http://host:port`); SOCKS принимается только после того, как `curl` уже установлен. Прокси применяется временно, только на время работы установщика — в UCI и системные файлы ничего не пишется.
+Если провайдер режет GitHub, установщик сам предложит ввести прокси и скачает через него бота и зависимости. Принимается HTTP-прокси (`http://host:port`); SOCKS — только после того, как `curl` уже встал, раньше просто нечем его использовать. Прокси живёт ровно столько, сколько работает установщик: ни в UCI, ни в системные файлы он не попадает.
 
 ### 🤖 Unattended-режим (для luci-app и скриптов)
 
@@ -164,27 +182,27 @@ ash install.sh --unattended \
 
 ### 🔄 Безопасное обновление с откатом
 
-При обновлении бота (`--action update` или интерактивный режим 1) установщик:
+Обновление удалённого роутера — это всегда риск остаться без связи с ним. Поэтому при обновлении (`--action update` или режим 1) установщик действует так:
 
-1. Скачивает новый скрипт во временный файл `/tmp/podkop_bot.new`
-2. Проверяет его синтаксис (`ash -n`) — HTML-страницы с ошибками не применяются
-3. Создаёт резервную копию текущего бинаря
-4. Атомарно заменяет файл и перезапускает сервис
-5. Если новая версия не стартует — автоматически восстанавливает предыдущий бинарь
+1. Качает новый скрипт во временный файл `/tmp/podkop_bot.new`
+2. Проверяет синтаксис (`ash -n`) — если провайдер подсунул вместо скрипта страницу-заглушку, она не поедет в систему
+3. Делает резервную копию текущего бинаря
+4. Атомарно подменяет файл и перезапускает сервис
+5. Если новая версия не стартовала — сам возвращает предыдущую
 
 ### 🖥️ Веб-интерфейс — luci-app-podkop-bot
 
-Отдельный пакет LuCI для тех, кто предпочитает веб вместо Telegram для части задач: настройка бота (токен, admin_ids, транспорт, алерты, расписания отчётов) и удобный Runtime Info прямо в web-панели роутера, без необходимости открывать Telegram.
+Вбивать длинный токен и списки admin_ids с телефона — удовольствие ниже среднего. Для таких задач есть отдельный пакет LuCI: настройки бота (токен, admin_ids, транспорт, алерты, расписания отчётов) и Runtime Info — в обычной веб-панели роутера, с нормальной клавиатурой.
 
 Репозиторий: **https://github.com/Medvedolog/luci-app-podkop-bot**
 
-Ставится тем же `install.sh` — после установки/обновления бота он спросит, поставить ли веб-интерфейс (или сразу, без вопроса, флагом `--with-luci` в unattended-режиме):
+Ставится тем же `install.sh`: после установки или обновления бота он сам спросит, нужен ли веб-интерфейс. В unattended-режиме вопрос пропускается флагом `--with-luci`:
 
 ```sh
 ash install.sh --unattended --action install --config /tmp/podkop_bot_install.json --with-luci
 ```
 
-Также доступно отдельным действием `update-luci` — скачивает и ставит последний релиз (`.ipk` под opkg / `.apk` под apk, по пакетному менеджеру роутера), в фоне (detached), не блокируясь если сама LuCI-панель перезапустится в процессе:
+Есть и отдельное действие `update-luci` — качает и ставит последний релиз (`.ipk` для opkg, `.apk` для apk — что у роутера за пакетный менеджер, то и возьмёт). Работает в фоне, отвязавшись от родительского процесса, чтобы не повиснуть, если LuCI перезапустится прямо во время установки:
 
 ```sh
 ash install.sh --unattended --action update-luci
@@ -273,16 +291,16 @@ ash install.sh --unattended --action update-luci
 * Custom Proxy (tier3)
 * Bind Interface — привязка исходящего интерфейса бота
 * **Автодобавление mixed_proxy других секций** как fallback tier'ов
-* **Daily Report** — ежедневный дайджест в Telegram. Настраивается время отправки (`HH:MM`, default `08:00`). Содержит: uptime/RAM, WAN+LAN+внешний IP, TG статус, туннель, трафик, транспорт бота, подписка Plus.
-* **Weekly Report** — еженедельный дайджест (default: воскресенье 09:00, выкл). В день weekly ежедневный отчёт подавляется. Содержит агрегаты за неделю: версии файлов с mtime и sha256[:8], стабильность (uptime бота/туннеля, рестарты sing-box, route switches, TG-статус), ресурсы (RAM snapshot + min за неделю + кол-во RAM-алертов), трафик delta с avg/day, подписка Plus с предупреждениями при истечении (<7 дней) или трафике >80%, bot config snapshot. UCI: `weekly_report=0`, `weekly_report_day=7` (1=Mon…7=Sun), `weekly_report_time=09:00`.
-* **Quiet Hours** — подавление watchdog-алертов в заданном диапазоне времени. Поддерживает overnight (23:00–07:00). Daily/Weekly Report не подавляются. UCI: `quiet_hours_enabled=0`, `quiet_hours_from=23:00`, `quiet_hours_to=07:00`.
-* **Broadcast Alerts** — рассылка watchdog-алертов всем `admin_ids` (default: только главный CHAT_ID).
-* **RAM Alert** — независимый toggle для алерта при RAM < 30 MB (default: вкл). Recovery при ≥ 40 MB, повтор раз в час. Настраивается время отправки (`HH:MM`, default `08:00`), включается/выключается toggle в Bot Settings. Ручная отправка: Maintenance → `📊 Send Daily Report Now`. Содержит: uptime/RAM/CPU, WAN+LAN+внешний IP+флаг, TG direct/tunnel статус, виртуальные адаптеры, режим секции и активный outbound с флагом страны, время последнего переключения (вручную или URLTest), рестарты sing-box, трафик за период uptime sing-box, транспорт бота с резервными каналами. На Podkop Plus дополнительно: URL подписки (секреты скрыты), трафик и дата истечения.
+* **Daily Report** — утренний дайджест в Telegram: посмотрел одно сообщение и знаешь, как роутер прожил сутки. Время отправки задаётся в `HH:MM` (по умолчанию `08:00`), включается тумблером в Bot Settings, отправить прямо сейчас можно из Maintenance → `📊 Send Daily Report Now`. Внутри: uptime, RAM и CPU; WAN, LAN и внешний IP с флагом страны; статус Telegram напрямую и через туннель; виртуальные адаптеры; режим секции и активный outbound с флагом; когда его переключали в последний раз — вручную или это сделал URLTest; рестарты sing-box; трафик за время его работы; транспорт бота с резервными каналами. На Podkop Plus добавляется URL подписки (секреты скрыты), её трафик и дата истечения.
+* **Weekly Report** — та же идея, но на неделю вперёд по масштабу: не «как дела сейчас», а «что менялось». По умолчанию выключен, шлётся в воскресенье в 09:00; в день еженедельного отчёта ежедневный не дублируется. Внутри: версии файлов с mtime и sha256[:8], стабильность (uptime бота и туннеля, рестарты sing-box, переключения маршрута, статус Telegram), память (текущая, минимум за неделю и сколько раз срабатывал RAM-алерт), прирост трафика со средним за сутки, подписка Plus с предупреждением, если осталось меньше недели или израсходовано больше 80%, и снимок настроек бота. UCI: `weekly_report=0`, `weekly_report_day=7` (1=Пн…7=Вс), `weekly_report_time=09:00`.
+* **Quiet Hours** — тихие часы: watchdog молчит в заданном диапазоне, в том числе через полночь (23:00–07:00). Отчёты Daily и Weekly под это правило не попадают — они придут в любом случае. UCI: `quiet_hours_enabled=0`, `quiet_hours_from=23:00`, `quiet_hours_to=07:00`.
+* **Broadcast Alerts** — рассылать алерты watchdog всем администраторам из `admin_ids`. По умолчанию выключено: алерты уходят только на главный `chat_id`.
+* **RAM Alert** — отдельный тумблер (по умолчанию включён): предупреждение, когда свободной памяти остаётся меньше 30 MB. Отбой приходит при 40 MB и выше, повтор — не чаще раза в час, чтобы не превращать это в спам.
 * **Admins** — см. раздел ниже
 
 ### 👤 Управление администраторами
 
-Список администраторов бота редактируется прямо в Telegram — SSH и UCI не нужны.
+Администраторов можно добавлять и убирать прямо в Telegram — лезть в SSH и править UCI руками не нужно.
 
 Открыть: **Bot Settings → 👤 Admins**
 
@@ -337,7 +355,7 @@ ash install.sh --unattended --action update-luci
 
 ### 📡 Транспортная цепочка бота
 
-Бот сам работает через многоуровневый fallback при блокировках:
+Бот и сам сидит за теми же блокировками, что и роутер, поэтому пробивается до Telegram по цепочке — сверху вниз, до первого рабочего уровня:
 
 ```text
 tier1   → Podkop SOCKS5 (основной туннель, primary proxy-секция)
@@ -347,18 +365,18 @@ tier4   → Direct
 tier5   → Emergency Telegram IPs (обновляются через DoH)
 ```
 
-Sticky-routing, Recovery Mode и IPC между watchdog и main loop позволяют боту оставаться доступным даже при проблемах с основным туннелем. После восстановления `podkop` бот возвращается на `tier1` в течение одного health interval (обычно ≤60 сек).
+Смысл простой: если упал туннель, бот не должен упасть вместе с ним — иначе вы не узнаете, что что-то сломалось, и не сможете это починить из чата. Sticky-routing, Recovery Mode и обмен состоянием между watchdog и основным циклом держат бота на связи, пока жив хоть один уровень. Как только `podkop` поднимется, бот сам вернётся на `tier1` — в пределах одного интервала проверки, обычно за минуту.
 
 ---
 
 ## 👥 Несколько роутеров и администраторов
 
-Поддерживается схема с несколькими ботами в одном Telegram supergroup:
+Если роутеров больше одного — например, дом и дача, — их удобно собрать в одну супергруппу Telegram и разговаривать со всеми в одном месте:
 
-* каждый роутер — отдельный bot token
-* несколько `admin_ids` (добавляются через `uci add_list` или через меню бота)
-* все алерты содержат префикс `[hostname]` для идентификации роутера
-* поддерживаются anonymous admins в группах через `ALLOW_ANON_ADMINS`
+* каждому роутеру — свой bot token, отдельный бот на каждого
+* администраторов может быть несколько: `admin_ids` пополняется через `uci add_list` или прямо из меню бота
+* каждый алерт помечен префиксом `[hostname]` — сразу видно, какой роутер жалуется
+* анонимные админы в группах тоже работают, включается через `ALLOW_ANON_ADMINS`
 
 ---
 
@@ -407,7 +425,7 @@ uci commit podkop_bot
 └── settings.quiet_hours_to  — конец тихих часов HH:MM (default 07:00)
 ```
 
-> **Важно:** `admin_ids` добавляются через `uci add_list`, а не через `uci set` — иначе несколько ID не сохранятся корректно.
+> **Важно:** `admin_ids` добавляются именно через `uci add_list`, а не `uci set`. С `uci set` каждый следующий ID затрёт предыдущий, и в списке останется ровно один администратор.
 
 ```sh
 uci add_list podkop_bot.settings.admin_ids="123456789"
@@ -432,11 +450,11 @@ uci commit podkop_bot
 
 ## ⚠️ Известные особенности
 
-**OpenWrt 24.10.x — баг в BusyBox `tr`:**
-Символьный класс `[:space:]` обрабатывается некорректно и удаляет букву `e` (`0x65`). Исправлено в `v0.13.90` заменой на явное перечисление символов `\n\r\t `. Затрагивает сборки OpenWrt 24.10.x вне зависимости от архитектуры.
+**OpenWrt 24.10.x — баг в BusyBox `tr`.**
+Символьный класс `[:space:]` там сломан: вместе с пробелами он съедает букву `e` (`0x65`). Ловится на любой архитектуре, дело именно в сборке 24.10.x. Починено в `v0.13.90` — вместо класса перечисляем символы явно: `\n\r\t `.
 
-**Podkop Plus — UCI-поля для списков:**
-`uci -q get` на list-полях (`subscription_urls`, `selector_proxy_links` и др.) в BusyBox ash возвращает пустую строку. Бот использует `uci show` с последующим парсингом — это корректный обход, прозрачный для пользователя.
+**Podkop Plus — списочные поля UCI.**
+`uci -q get` на list-полях (`subscription_urls`, `selector_proxy_links` и подобных) в BusyBox ash молча возвращает пустую строку — не ошибку, а именно пустоту, что коварнее. Бот вместо этого читает `uci show` и разбирает вывод сам; со стороны пользователя разницы никакой.
 
 **URLTest режим** требует заполненного списка ссылок перед переключением — иначе `podkop` не запустится. Бот предупреждает и предлагает клонировать ссылки из Selector одной кнопкой.
 
@@ -444,7 +462,7 @@ uci commit podkop_bot
 
 **Active Outbound Probe** использует текущий маршрут секции через Mixed Proxy и не переключает outbound временно. Определение страны через Google / YouTube / Cloudflare носит диагностический характер.
 
-**Mixed Proxy без заданного порта** — если `mixed_proxy_port` не установлен в UCI и включить Mixed Proxy через бота, podkop падал с `jq: invalid JSON`. Исправлено в `v0.14.1`: бот автоматически назначает первый свободный порт начиная с 2080.
+**Mixed Proxy без заданного порта.** Если в UCI не было `mixed_proxy_port`, а Mixed Proxy включали через бота, podkop падал с `jq: invalid JSON`. Починено в `v0.14.1`: бот сам подбирает первый свободный порт начиная с 2080.
 
 ---
 
@@ -458,7 +476,7 @@ MIT
 
 * [itdoginfo/podkop](https://github.com/itdoginfo/podkop) — за сам сервис
 * [yandexru45/podkop-evolution](https://github.com/yandexru45/podkop-evolution) — за форк с поддержкой subscription URL и HWID
-* [ushan0v/podkop-plus](https://github.com/ushan0v/podkop-plus) — за расширенный вариант podkop с Plus CLI
+* [ushan0v/podkop-plus](https://github.com/ushan0v/podkop-plus) и [ushan0v/forkop](https://github.com/ushan0v/forkop) — за расширенный вариант podkop с Plus CLI и его преемника
 * [VizzleTF/podkop_autoupdater](https://github.com/VizzleTF/podkop_autoupdater) — за шаблон установщика и идеи DoH-discovery транспорта
 * [Davoyan/ipregion_bot](https://github.com/Davoyan/ipregion_bot) — за идеи geo/service-диагностики через прокси
 * [vernette/ipregion](https://github.com/vernette/ipregion) — за идеи country/service probes и компактных сетевых проверок
@@ -467,7 +485,7 @@ MIT
 
 ## 🇬🇧 Summary
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus; structural edits that require creating or removing Forkop child sections are read-only and direct you to LuCI.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour and subscription-source settings; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
