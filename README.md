@@ -9,6 +9,7 @@
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/BotFather)
+[![интерфейс](https://img.shields.io/badge/интерфейс-русский-C73E3A?style=flat-square)](#-главное-меню)
 
 [**Установка**](#-быстрая-установка) · [Возможности](#-возможности) · [Поддержка форков](#-поддержка-форков-podkop) · [Веб-интерфейс](#-веб-интерфейс--luci-app-podkop-bot) · [История изменений](CHANGELOG_RUS.md)
 
@@ -19,6 +20,8 @@
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
 Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`.
+
+> 🇷🇺 **Интерфейс бота — русский.** Начиная с v0.18.x все кнопки, карточки и уведомления переведены; переключателя языка нет, английской версии интерфейса тоже. Английскими остаются только технические термины, которые переводить и не стоит: названия протоколов, поля UCI, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`. Старые английские команды (`Menu`, `Status`) бот по-прежнему понимает — если у вас в чате осталась клавиатура от прежней версии, она не сломается.
 
 > **Forkop — что уже умеет бот.** Мониторинг и диагностика работают наравне с Plus. Нативно, прямо из Telegram, редактируются: URL подписки, действие секции (`connection`/`bypass`/`block`/`zapret`), условия секции (домены, IP, порты, устройства), каскад через другую секцию (detour), настройки источника подписки и параметры существующей URLTest. Всё остальное — то, что требует создавать или удалять дочерние секции и править правила по rule-модели, — бот пока честно показывает как есть и отправляет доделать в LuCI: писать в поля, которые backend всё равно проигнорирует, смысла нет.
 >
@@ -32,65 +35,104 @@
 
 ## ✨ Возможности
 
+Названия ниже — это ровно те подписи, которые вы увидите на кнопках бота:
+
 ```text
-🛡️  Статус и управление    — podkop, sing-box, автозапуск, перезагрузка роутера
-🔀  Outbounds               — список с задержкой, переключение, добавление/удаление ссылок
-📋  Маршрутизация           — Service Lists, Domain/Subnet URL, My Domains/Subnets
-🔧  Настройки секций        — тип, режим прокси, URLTest, DNS resolver, интерфейс
-🌐  DNS и YACD              — тип DNS, сервер, bootstrap, YACD доступ и ключ
-📊  Диагностика             — Status, Tunnel Health, Runtime Info, Active Probe, Support Bundle
-🔔  Watchdog                — алерты sing-box, SOCKS, смены прокси, аварийные IP через DoH
-🤖  Транспорт бота          — tier1–5 fallback, Fallback SOCKS, Custom Proxy, Bind Interface
-👤  Администраторы          — добавление/удаление прямо из TG, анонимные группы
-⬆️  Обновления              — бот и podkop из меню, Force Update, What's New карточка
-📅  Ежедневный отчёт       — автоматический утренний дайджест в Telegram (время настраивается)
-🗓  Еженедельный отчёт     — агрегаты за неделю: стабильность, трафик, подписка, версии, bot config
-📤  Upload Bot Script      — загрузка и установка бота прямо через Telegram (без GitHub)
-🔕  Тихие часы            — подавление watchdog-алертов в заданном временном диапазоне
-🖥️  Веб-интерфейс (LuCI)   — настройка бота и удобный Runtime Info через luci-app-podkop-bot
+📊  Статус                 — podkop и sing-box, устройство, память, WAN и внешний IP
+🌐  Прокси                 — список с задержкой и флагом, переключение, добавление ссылок
+📄  Списки и маршруты      — готовые списки, домены и подсети, «Через туннель» и «В обход»
+⚙  Настройки секции       — тип подключения, режим прокси, Mixed-прокси, URLTest, DNS
+🌐  Общие                  — интерфейс, интервал обновления, QUIC, NTP в обход, DNS, YACD
+🧪  Диагностика            — состояние туннеля, проверка прокси и задержек, отчёт для поддержки
+🔔  Уведомления о сбоях    — sing-box, SOCKS, смена прокси, аварийные IP через DoH
+🤖  Настройки бота         — подключение tier1–5, резервные SOCKS, свой прокси, интерфейс
+👤  Администраторы         — добавление и удаление прямо в чате, анонимные админы в группах
+🔧  Обслуживание           — обновление бота и podkop, перезапуск, перезагрузка роутера
+📊  Отчёт за сутки         — утренний дайджест в Telegram, время настраивается
+📅  Отчёт за неделю        — стабильность, трафик, подписка и версии в одном сообщении
+📤  Загрузить скрипт       — установка новой версии бота файлом через Telegram, без GitHub
+🔕  Режим тишины           — уведомления о сбоях молчат в заданные часы
+🖥️  Веб-интерфейс (LuCI)   — настройка бота в браузере через luci-app-podkop-bot
 ```
 
-**Только на Podkop Plus:**
+**Только на Podkop Plus и Forkop:**
 
 ```text
-🔬  URLTest Filters         — фильтрация outbounds по стране и regex
-📊  Трафик подписки         — «18.5 GB / ∞ · exp 28.08» в карточке секции
-⚙️  Zapret / ByeDPI         — статус, вкл/выкл, редактирование стратегии с валидацией
-🔗  Ручные ссылки           — добавление вручную в subscription-секцию (сосуществуют с подпиской)
-🔌  Close Connections       — сброс всех соединений через Clash API
-🖧  Server Instances        — live статус серверных инстансов (VLESS, VMess, Trojan, SOCKS, Hysteria2, MTProto, Tailscale)
+🔬  Фильтры URLTest        — отбор прокси по стране, имени и регулярному выражению (Plus)
+📊  Трафик подписки        — «18.5 GB / ∞ · до 28.08» в карточке секции
+⚙️  Zapret / ByeDPI        — статус, включение, редактирование стратегии с проверкой
+🔗  Ручные ссылки          — свои ссылки в секции подписки, рядом с подписочными (Plus)
+🔌  Закрыть соединения     — сброс всех соединений через Clash API
+🖧  Службы                 — живой статус серверных инстансов (VLESS, VMess, Trojan,
+                              SOCKS, Hysteria2, MTProto, Tailscale)
 ```
 
 ---
 
 ## 🗺️ Главное меню
 
+Кнопки на главном экране идут в два столбца — так они и показаны ниже:
+
 ```text
-🏠 Menu
-├── 📊 Status
-├── 🔀 Outbounds
-├── 📋 Routing & Lists
-├── ⚙️ Section Settings
-├── 🌍 DNS & YACD
-├── 🔧 Bad WAN
-├── 🔧 Maintenance
-│   ├── ⬆️ Update Bot / Force Update
-│   ├── ⬆️ Update Podkop
-│   ├── 🔁 Reboot Router
-│   └── 🔌 Runtime Info → Diagnostics
-├── 🖧 Server Instances (Plus)
-└── ⚙️ Bot Settings
-    ├── 🤖 Transport Policy
-    ├── 📡 Fallback SOCKS
-    ├── 📅 Daily Report
-    ├── 🗓 Weekly Report
-    ├── 🔕 Quiet Hours
-    ├── 🔔 Broadcast Alerts / RAM Alert
-    ├── 👤 Admins
-    └── 🔗 Bind Interface
+🖥️ Управление Podkop
+├─ 📊 Статус            │ 🌐 Прокси
+├─ ⚙ Настройки          │ 🔄 Перезапустить
+├─ 🤖 Настройки бота    │ 🛑 Остановить · 🟢 Запустить
+├─ 🖧 Службы                                  ← только Plus / Forkop
+└─ 🔧 Обслуживание
 ```
 
-> Постоянная навигация `🏠 Menu | 📊 Status` доступна в любой момент, включая watchdog-алерты.
+Что внутри каждого раздела:
+
+```text
+📊 Статус
+└─ 🧭 Подробнее
+   ├─ 🧪 Диагностика
+   ├─ 📄 Файлы и журнал
+   └─ 🔌 Закрыть соединения                   ← только Plus / Forkop
+
+🌐 Прокси            ← заголовок карточки зависит от режима секции:
+                        «Прокси · Selector», «Прокси · URLTest»,
+                        «Прокси подписки» или «Прокси с одной ссылкой»
+├─ список прокси с задержкой и флагом страны, активный помечен ▶
+├─ ⚡ Проверить задержки · 🪺 Автовыбор (в режиме URLTest)
+├─ ➕ Прокси · ✏ URL подписки
+└─ 🧪 Диагностика
+
+⚙ Настройки
+├─ ⚙ Настройки секции   — тип подключения, режим прокси, Mixed-прокси,
+│                          URLTest, DNS-резолвер, включение секции и автозапуска
+│                          (на Forkop добавляются 🎯 Условия и 🔗 Через секцию,
+│                           на Plus — 🔬 Фильтры URLTest)
+├─ 🌐 Общие             — исходящий интерфейс, интервал обновления, QUIC,
+│                          NTP в обход, DNS, YACD, контроль WAN
+├─ 📎 Секции            — переключение между секциями podkop
+└─ 📄 Списки и маршруты — готовые списки, домены, подсети,
+                           ➡ Через туннель, ↩ В обход, свои домены и подсети
+
+🤖 Настройки бота
+├─ Подключение (Авто · SOCKS5 · Напрямую) и интервал проверки
+├─ 🔗 Резервные SOCKS · 🧪 Проверить SOCKS
+├─ ➕ Прокси бота · ➕ Привязать интерфейс
+├─ Сообщать о запуске · о сбоях · Уведомлять всех · Контроль памяти
+├─ Режим тишины · Ежедневный отчёт · Еженедельный отчёт
+└─ 👤 Администраторы
+
+🔧 Обслуживание
+├─ 🐶 Обновление Podkop · 🆕 Обновление бота
+├─ 📊 Отчёт за сутки · 📅 Отчёт за неделю
+├─ 📤 Загрузить скрипт
+├─ 🔄 Перезапустить бота
+└─ 💀 Перезагрузить роутер
+
+🧪 Диагностика          ← 📊 Статус → 🧭 Подробнее → 🧪 Диагностика
+├─ 🩺 Состояние туннеля
+├─ 🔬 Проверить прокси · 🪺 Проверить задержки
+├─ 🌐 Проверка Podkop · 🧠 Проверка бота
+└─ 📋 Отчёт для поддержки
+```
+
+> Внизу экрана всегда висит клавиатура `🏠 Меню | 📊 Статус` — она доступна в любой момент, в том числе когда пришёл алерт от watchdog.
 
 ---
 
@@ -98,36 +140,36 @@
 
 | Функция | original | evolution / netshift | plus | forkop |
 |---------|:--------:|:--------------------:|:----:|:------:|
-| Управление сервисом (старт/стоп/reload) | ✅ | ✅ | ✅ | ✅ |
-| Outbound Selector — просмотр и переключение | ✅ | ✅ | ✅ | ✅ |
-| Добавление / удаление ссылок | ✅ | ✅ | ✅ | 👁 read-only |
-| Single URL (proxy_string) | ✅ | ✅ | ✅ | 👁 read-only |
-| Subscription URL (просмотр, замена) | ❌ | ✅ | ✅ | ✅ дочерние секции |
-| Ручные ссылки в subscription-секции | ❌ | ❌ | ✅ | 👁 read-only |
-| Действие секции (туннель/обход/блок/DPI) | ✅ | ✅ | ✅ | ✅ |
-| URLTest Filters (страна, regex) | ❌ | ❌ | ✅ | ❌ до проверки на железе |
+| Управление сервисом (запуск / остановка / перезапуск) | ✅ | ✅ | ✅ | ✅ |
+| Список прокси и переключение (Selector) | ✅ | ✅ | ✅ | ✅ |
+| Добавление и удаление ссылок | ✅ | ✅ | ✅ | 👁 только просмотр |
+| Режим одной ссылки (`proxy_string`) | ✅ | ✅ | ✅ | 👁 только просмотр |
+| URL подписки (просмотр, замена) | ❌ | ✅ | ✅ | ✅ дочерние секции |
+| Свои ссылки в секции подписки | ❌ | ❌ | ✅ | 👁 только просмотр |
+| Действие секции (туннель / обход / блок / DPI) | ✅ | ✅ | ✅ | ✅ |
+| 🔬 Фильтры URLTest (страна, регулярка) | ❌ | ❌ | ✅ | ❌ до проверки на железе |
 | Трафик и срок подписки | ❌ | ❌ | ✅ | ✅ |
-| Zapret / ByeDPI секции | ❌ | ❌ | ✅ | ✅ |
-| Zapret2 секции (своё меню) | ❌ | ❌ | ❌ | ❌ в планах |
-| Close All Connections | ❌ | ❌ | ✅ | ✅ |
-| Service Lists (готовые наборы) | ✅ | ✅ | ✅ | ✅ |
-| Domain/Subnet List URLs | ✅ | ✅ | ✅ | ✅ |
-| My Domains / My Subnets | ✅ | ✅ | ✅ | 👁 read-only |
-| Переключение режима Selector ↔ URLTest | ✅ | ✅ | ✅ | 👁 read-only |
-| Настройки URLTest (существующей) | ✅ | ✅ | ✅ | ✅ редактор child |
-| Настройки DNS-резолвера / интерфейсов | ✅ | ✅ | ✅ | 👁 read-only |
-| Условия секции (домены/IP/порты/устройства) | ❌ | ❌ | ❌ | ✅ |
-| Каскад через другую секцию (detour) | ❌ | ❌ | ❌ | ✅ |
+| Секции Zapret / ByeDPI | ❌ | ❌ | ✅ | ✅ |
+| Секции Zapret2 (своё меню) | ❌ | ❌ | ❌ | ❌ в планах |
+| 🔌 Закрыть соединения | ❌ | ❌ | ✅ | ✅ |
+| Готовые списки | ✅ | ✅ | ✅ | ✅ |
+| Списки доменов и подсетей по ссылке | ✅ | ✅ | ✅ | ✅ |
+| ✏ Мои домены / ✏ Мои подсети | ✅ | ✅ | ✅ | 👁 только просмотр |
+| Переключение режима Selector ↔ URLTest | ✅ | ✅ | ✅ | 👁 только просмотр |
+| Настройки уже созданной URLTest | ✅ | ✅ | ✅ | ✅ редактор дочерней |
+| DNS-резолвер и исходящий интерфейс | ✅ | ✅ | ✅ | 👁 только просмотр |
+| 🎯 Условия секции (домены / IP / порты / устройства) | ❌ | ❌ | ❌ | ✅ |
+| 🔗 Через секцию — каскад (detour) | ❌ | ❌ | ❌ | ✅ |
 | Настройки источника подписки (интервал и пр.) | ❌ | ❌ | ❌ | ✅ |
-| Rule Sets (rule_set, rule_set_with_subnets) | ❌ | ❌ | 👁 только просмотр | ❌ пока нет |
-| Версии zapret / byedpi в Status | ❌ | ❌ | ✅ | ✅ |
-| Версия Zapret2 в Maintenance | ❌ | ❌ | ✅ | ✅ |
-| Server Instances (live статус серверов) | ❌ | ❌ | ✅ | ✅ |
-| Ежедневный отчёт | ✅ | ✅ | ✅ | ✅ |
-| Watchdog и Tunnel Health | ✅ | ✅ | ✅ | ✅ |
-| Diagnostics / Support Bundle | ✅ | ✅ | ✅ | ✅ |
-| NetShift selector_text / urltest_text | ❌ | 👁 read-only | ❌ | ❌ |
-| NetShift multi-subscription URL (list) | ❌ | ✅ | ❌ | ❌ |
+| Rule Sets (`rule_set`, `rule_set_with_subnets`) | ❌ | ❌ | 👁 только просмотр | ❌ пока нет |
+| Версии zapret / byedpi в 📊 Статусе | ❌ | ❌ | ✅ | ✅ |
+| Версия Zapret2 в 🔧 Обслуживании | ❌ | ❌ | ✅ | ✅ |
+| 🖧 Службы (живой статус серверов) | ❌ | ❌ | ✅ | ✅ |
+| Отчёт за сутки | ✅ | ✅ | ✅ | ✅ |
+| Уведомления о сбоях и 🩺 Состояние туннеля | ✅ | ✅ | ✅ | ✅ |
+| 🧪 Диагностика / 📋 Отчёт для поддержки | ✅ | ✅ | ✅ | ✅ |
+| NetShift: `selector_text` / `urltest_text` | ❌ | 👁 только просмотр | ❌ | ❌ |
+| NetShift: несколько URL подписки списком | ❌ | ✅ | ❌ | ❌ |
 
 
 > **Forkop.** Мониторинг и диагностика — наравне с Plus. Подписки бот правит нативно, через дочерние секции (`config subscription_url`), действие секции пишет в `action`. Значок 👁 означает, что операция требует создать или удалить дочернюю секцию либо правило Forkop: такие вещи бот показывает как есть и отправляет в LuCI. Записывать в поля, которые backend проигнорирует, — значит соврать об успехе, поэтому бот так не делает.
@@ -192,7 +234,7 @@ ash install.sh --unattended \
 
 ### 🖥️ Веб-интерфейс — luci-app-podkop-bot
 
-Вбивать длинный токен и списки admin_ids с телефона — удовольствие ниже среднего. Для таких задач есть отдельный пакет LuCI: настройки бота (токен, admin_ids, транспорт, алерты, расписания отчётов) и Runtime Info — в обычной веб-панели роутера, с нормальной клавиатурой.
+Вбивать длинный токен и списки admin_ids с телефона — удовольствие ниже среднего. Для таких задач есть отдельный пакет LuCI: настройки бота (токен, admin_ids, транспорт, уведомления, расписания отчётов) и сводка состояния — в обычной веб-панели роутера, с нормальной клавиатурой.
 
 Репозиторий: **https://github.com/Medvedolog/luci-app-podkop-bot**
 
@@ -229,27 +271,25 @@ ash install.sh --unattended --action update-luci
 * Запуск / остановка / перезагрузка `podkop`
 * Включение / выключение автозапуска
 * Обновление `podkop` до последней версии
-* **Обновление самого бота** прямо из меню Maintenance (без SSH)
+* **Обновление самого бота** прямо из раздела 🔧 Обслуживание (без SSH)
 
-  * перед обновлением бот показывает доступную версию и краткий блок **What's New**
-  * даёт ссылку на changelog
-  * **Force Update** — принудительная переустановка текущей версии для применения патчей
-  * **📤 Upload Bot Script** — загрузка `.sh` файла через Telegram как документ; валидирует shebang, `BOT_VERSION` и синтаксис (`busybox ash -n`), делает backup `.bak`, устанавливает и перезапускает. Для тестирования патчей без GitHub и роутеров за ISP-блокировками.
+  * перед обновлением бот показывает доступную версию и кратко — что нового
+  * даёт ссылку «Полный список изменений»
+  * **🔄 Принудительно обновить** — переустановить текущую версию, если нужно применить патч
+  * **📤 Загрузить скрипт** — присылаете `.sh` файлом в чат, и бот ставит его сам: проверяет shebang, `BOT_VERSION` и синтаксис (`busybox ash -n`), делает резервную копию `.bak`, устанавливает и перезапускается. Способ обкатать патч без GitHub — и единственный вариант для роутеров, которым GitHub недоступен.
 * **Перезагрузка роутера** с двойным подтверждением (кнопка + ввод `YES`)
 
-### 🌐 Outbound Selector / URLTest / Subscription
+### 🌐 Прокси: Selector, URLTest и подписка
 
-* Просмотр списка outbound'ов с задержкой, типом протокола и страной (флаг)
-* Переключение активного outbound
-* Активный outbound выделен маркером `▶`
-* Тест задержки всех outbound'ов одной кнопкой
+* Список прокси с задержкой, протоколом и флагом страны
+* Переключение активного прокси; активный помечен маркером `▶`
+* **⚡ Проверить задержки** — замер по всем прокси одной кнопкой
 * Добавление и удаление ссылок (`vless://`, `hy2://`, `ss://`, `trojan://`, `vmess://`, `socks5://`)
-* Удаление по `server:port` — надёжно для всех протоколов
-* Заголовок карточки отражает режим: **Outbound Selector**, **URLTest Outbounds** или **Subscription Outbounds**
-* **Клонирование ссылок из Selector в URLTest** одной кнопкой
-* Предупреждение при переключении в URLTest, если список ссылок пуст
-* **Single URL Proxy** — отдельный режим для одной ссылки
-* Для подписочных секций в шапке карточки: URL подписки + трафик и срок действия (Plus)
+* Удаление по паре `сервер:порт` — работает одинаково для всех протоколов
+* Заголовок карточки подстраивается под режим секции: **Прокси · Selector**, **Прокси · URLTest**, **Прокси подписки** или **Прокси с одной ссылкой**
+* Перенос ссылок из Selector в URLTest одной кнопкой
+* При переключении в URLTest с пустым списком бот предупредит — иначе podkop не запустится
+* В секциях с подпиской в шапке видны сам URL, трафик и срок действия (Plus)
 
 ### ⚙️ Настройки секций podkop
 
@@ -285,24 +325,24 @@ ash install.sh --unattended --action update-luci
 
 ### 🤖 Управление транспортом бота
 
-* **Transport Policy**: `auto` / `socks` / `direct` — с описанием рисков и подтверждением
-* **Fallback-прокси** (`tier2_N`): добавление, удаление, тест доступности всех tier'ов. Формат записи: `socks5h://[user:pass@]host:port[#Имя]` — опциональные учётные данные и локальная мнемоника. Пароль маскируется везде в логах/UI/алертах (`user:***@`), в отображении используется мнемоника, если задана. Валидация формата при вводе (отдельно неверный формат и неверный порт 1-65535), дедуп по endpoint. Пробелы в мнемонике заменяются на `_`; пробелы в host/user/pass не допускаются
+* **Подключение**: `Авто` / `SOCKS5` / `Напрямую` — с пояснением рисков и подтверждением
+* **🔗 Резервные SOCKS** (`tier2_N`): добавление, удаление и проверка доступности всех уровней. Формат записи: `socks5h://[user:pass@]host:port[#Имя]` — опциональные учётные данные и локальная мнемоника. Пароль маскируется везде в логах/UI/алертах (`user:***@`), в отображении используется мнемоника, если задана. Валидация формата при вводе (отдельно неверный формат и неверный порт 1-65535), дедуп по endpoint. Пробелы в мнемонике заменяются на `_`; пробелы в host/user/pass не допускаются
 * Активный tier выделен маркером `◀ active`
-* Custom Proxy (tier3)
-* Bind Interface — привязка исходящего интерфейса бота
+* **➕ Прокси бота** — свой прокси третьим уровнем (tier3)
+* **➕ Привязать интерфейс** — с какого интерфейса бот выходит наружу
 * **Автодобавление mixed_proxy других секций** как fallback tier'ов
-* **Daily Report** — утренний дайджест в Telegram: посмотрел одно сообщение и знаешь, как роутер прожил сутки. Время отправки задаётся в `HH:MM` (по умолчанию `08:00`), включается тумблером в Bot Settings, отправить прямо сейчас можно из Maintenance → `📊 Send Daily Report Now`. Внутри: uptime, RAM и CPU; WAN, LAN и внешний IP с флагом страны; статус Telegram напрямую и через туннель; виртуальные адаптеры; режим секции и активный outbound с флагом; когда его переключали в последний раз — вручную или это сделал URLTest; рестарты sing-box; трафик за время его работы; транспорт бота с резервными каналами. На Podkop Plus добавляется URL подписки (секреты скрыты), её трафик и дата истечения.
-* **Weekly Report** — та же идея, но на неделю вперёд по масштабу: не «как дела сейчас», а «что менялось». По умолчанию выключен, шлётся в воскресенье в 09:00; в день еженедельного отчёта ежедневный не дублируется. Внутри: версии файлов с mtime и sha256[:8], стабильность (uptime бота и туннеля, рестарты sing-box, переключения маршрута, статус Telegram), память (текущая, минимум за неделю и сколько раз срабатывал RAM-алерт), прирост трафика со средним за сутки, подписка Plus с предупреждением, если осталось меньше недели или израсходовано больше 80%, и снимок настроек бота. UCI: `weekly_report=0`, `weekly_report_day=7` (1=Пн…7=Вс), `weekly_report_time=09:00`.
-* **Quiet Hours** — тихие часы: watchdog молчит в заданном диапазоне, в том числе через полночь (23:00–07:00). Отчёты Daily и Weekly под это правило не попадают — они придут в любом случае. UCI: `quiet_hours_enabled=0`, `quiet_hours_from=23:00`, `quiet_hours_to=07:00`.
-* **Broadcast Alerts** — рассылать алерты watchdog всем администраторам из `admin_ids`. По умолчанию выключено: алерты уходят только на главный `chat_id`.
-* **RAM Alert** — отдельный тумблер (по умолчанию включён): предупреждение, когда свободной памяти остаётся меньше 30 MB. Отбой приходит при 40 MB и выше, повтор — не чаще раза в час, чтобы не превращать это в спам.
+* **Ежедневный отчёт** — утренний дайджест в Telegram: посмотрел одно сообщение и знаешь, как роутер прожил сутки. Время отправки задаётся в `HH:MM` (по умолчанию `08:00`), включается тумблером в 🤖 Настройках бота, отправить прямо сейчас можно из 🔧 Обслуживание → `📊 Отчёт за сутки`. Внутри: uptime, RAM и CPU; WAN, LAN и внешний IP с флагом страны; статус Telegram напрямую и через туннель; виртуальные адаптеры; режим секции и активный outbound с флагом; когда его переключали в последний раз — вручную или это сделал URLTest; рестарты sing-box; трафик за время его работы; транспорт бота с резервными каналами. На Podkop Plus добавляется URL подписки (секреты скрыты), её трафик и дата истечения.
+* **Еженедельный отчёт** — та же идея, но на неделю вперёд по масштабу: не «как дела сейчас», а «что менялось». По умолчанию выключен, шлётся в воскресенье в 09:00; в день еженедельного отчёта ежедневный не дублируется. Отправить вручную — 🔧 Обслуживание → `📅 Отчёт за неделю`. Внутри: версии файлов с mtime и sha256[:8], стабильность (uptime бота и туннеля, рестарты sing-box, переключения маршрута, статус Telegram), память (текущая, минимум за неделю и сколько раз срабатывал RAM-алерт), прирост трафика со средним за сутки, подписка Plus с предупреждением, если осталось меньше недели или израсходовано больше 80%, и снимок настроек бота. UCI: `weekly_report=0`, `weekly_report_day=7` (1=Пн…7=Вс), `weekly_report_time=09:00`.
+* **Режим тишины** — уведомления о сбоях молчат в заданном диапазоне, в том числе через полночь (23:00–07:00). Отчёты за сутки и за неделю под это правило не попадают — они придут в любом случае. UCI: `quiet_hours_enabled=0`, `quiet_hours_from=23:00`, `quiet_hours_to=07:00`.
+* **Уведомлять всех** — рассылать сообщения о сбоях всем администраторам из `admin_ids`. По умолчанию выключено: они уходят только на главный `chat_id`.
+* **Контроль памяти** — отдельный тумблер (по умолчанию включён): предупреждение, когда свободной памяти остаётся меньше 30 MB. Отбой приходит при 40 MB и выше, повтор — не чаще раза в час, чтобы не превращать это в спам.
 * **Admins** — см. раздел ниже
 
 ### 👤 Управление администраторами
 
 Администраторов можно добавлять и убирать прямо в Telegram — лезть в SSH и править UCI руками не нужно.
 
-Открыть: **Bot Settings → 👤 Admins**
+Открыть: **🤖 Настройки бота → 👤 Администраторы**
 
 * **Основной admin** (`chat_id`) — отображается с 🔒, удалить нельзя
 * **Дополнительные admins** — добавить User ID кнопкой **➕ Add Admin**, удалить с подтверждением
@@ -313,23 +353,23 @@ ash install.sh --unattended --action update-luci
 
 ### 📊 Диагностика и мониторинг
 
-* **Status**: агрегированный диагноз (`✅ Podkop is running` / `⚠️ limited` / `❌ action required`), системная информация — Host, модель устройства, uptime, RAM, CPU, WAN + внешний IP, версии
-* **Tunnel Health**: статус `sing-box`, `nftables`, режим, WAN, transport latency по tier'ам
+* **📊 Статус** — общий вердикт одной строкой: `✅ Podkop работает`, `⚠️ Работает с ограничениями`, `🟡 Бот использует резервный маршрут` или `❌ Требуется действие`. Ниже — устройство и модель, uptime, RAM, CPU, WAN и внешний IP, версии.
+* **🩺 Состояние туннеля** — `sing-box`, `nftables`, режим, WAN и задержка по каждому уровню транспорта
 
-  * два независимых TG health-чека: `TG direct` и `TG tunnel SOCKS5`
-  * блок **Active outbounds by section** — задержка и TG-достижимость для каждой секции
-  * **GitHub Connectivity** — проверка `api.github.com` и `raw.githubusercontent.com` напрямую (WAN) и через SOCKS с реальной задержкой; показывает можно ли получить обновления из-под блокировок
-* **Runtime Info**: подключения, трафик, активный outbound, задержка, маршрут бота
-* **Diagnostics** (единый хаб): Tunnel Health, Upstream Health, Global Check, Internal Diagnostics, Support Bundle, Active Probe
-* **Active Outbound Probe**: полная диагностика через текущий активный outbound
+  * две независимые проверки Telegram: напрямую и через туннель SOCKS5
+  * блок с активными прокси по каждой секции — задержка и доступность Telegram
+  * доступность GitHub: `api.github.com` и `raw.githubusercontent.com` напрямую и через SOCKS, с реальной задержкой. Сразу видно, получится ли обновиться из-под блокировок
+* **🧭 Подробнее** — соединения, трафик, активный прокси, задержка, маршрут бота
+* **🧪 Диагностика** — единый хаб: 🩺 Состояние туннеля, 🔬 Проверить прокси, 🪺 Проверить задержки, 🌐 Проверка Podkop, 🧠 Проверка бота, 📋 Отчёт для поддержки
+* **🔬 Проверить прокси** — полная проверка через текущий активный прокси
 
-  * Exit IP + GeoIP (ipapi.co + Cloudflare + Google)
-  * YouTube country hint
-  * Доступность сервисов: YouTube, Telegram API, ChatGPT, Claude.ai, Gemini, Discord
-  * Двухэтапный тест скорости: 32 KB (детект РКН-обрыва) + 1 MB замер
-* **Support Bundle**: UCI-конфиг, маршруты, nft, syslog одной кнопкой
+  * внешний IP и определение страны (ipapi.co, Cloudflare, Google)
+  * подсказка по стране от YouTube
+  * доступность сервисов: YouTube, Telegram API, ChatGPT, Claude.ai, Gemini, Discord
+  * замер скорости в два этапа: 32 KB (ловит обрыв на старте) и 1 MB (собственно скорость)
+* **📋 Отчёт для поддержки** — конфиг UCI, маршруты, nft и системный журнал одной кнопкой
 
-### 🖧 Server Instances (только Plus)
+### 🖧 Службы (только Plus и Forkop)
 
 * Live статус всех серверных инстансов из UCI (`type=server` секции podkop-plus)
 * Поддерживаемые протоколы: **VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale**
@@ -351,7 +391,7 @@ ash install.sh --unattended --action update-luci
 * Постоянная навигационная клавиатура `🏠 Menu | 📊 Status` — доступна всегда, в том числе при watchdog-алертах
 * **RAM watchdog alert** — срабатывает при свободной RAM < 30 MB, recovery при ≥ 40 MB, повтор раз в час. Советы: уменьшить URLTest outbounds, поднять `health_interval`, перейти на sing-box stable
 * **Тихие часы** — watchdog-алерты подавляются в заданном диапазоне (`quiet_hours_enabled`, `quiet_hours_from`, `quiet_hours_to`). Overnight диапазоны поддерживаются
-* **Broadcast Alerts** — при включении алерты рассылаются всем `admin_ids`
+* **Уведомлять всех** — при включении сообщения о сбоях рассылаются всем `admin_ids`
 
 ### 📡 Транспортная цепочка бота
 
@@ -485,13 +525,15 @@ MIT
 
 ## 🇬🇧 Summary
 
+> ⚠️ **The bot's interface is Russian only.** Every button, card and alert has been in Russian since v0.18.x — there is no language switch and no English UI. Only technical terms stay in English (protocol names, UCI fields, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`). This documentation and the changelog are bilingual; the bot itself is not.
+
 **podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour and subscription-source settings; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
 The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for [luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot) rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure). The same installer can also fetch and install luci-app-podkop-bot itself (`--with-luci` flag, or standalone via `--action update-luci`) — a LuCI web UI for bot configuration and a browser-friendly Runtime Info view, for anyone who'd rather not do everything through Telegram.
 
-The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
+The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Меню | 📊 Статус`) is available at all times including during watchdog alerts.
 
 v0.19.0 adds the **Forkop management MVP** — native writes for section conditions (domains/IPs/ports/devices), cascade **detour**, and **subscription source** settings, plus a **URLTest filter editor**, all guarded by transactional UCI writes (snapshot → commit → validate → automatic rollback on rejection). v0.19.2 is a P0 fix release: it eliminates a hang where the installer's endless prompt-filler could get stuck against a Russian-language y/n prompt during podkop self-update, and fixes UTF-8-safe truncation of country-flag emoji, mixed-proxy-auth transport on Forkop/Plus, and the FakeIP probe domain.
 
