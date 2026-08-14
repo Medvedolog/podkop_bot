@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🤖 podkop_bot
+# 🤖 podkop_bot 0.19.2
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
