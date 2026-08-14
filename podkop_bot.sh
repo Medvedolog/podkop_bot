@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.18.1
+# Podkop Telegram Bot v0.19.0
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.18.1"
+BOT_VERSION="0.19.2"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -96,7 +96,7 @@ _apply_variant_env() {
             PODKOP_DISPLAY_NAME="Forkop"
             PODKOP_GITHUB_REPO="ushan0v/forkop"
             PODKOP_INIT="/etc/init.d/forkop"
-            PODKOP_FAKEIP_DOMAIN="fakeip.forkop.fyi"
+            PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
             ;;
         plus)
             PODKOP_UCI="podkop-plus"
@@ -137,67 +137,16 @@ _apply_variant_env() {
     # FakeIP test domain differs on Forkop — must not be clobbered here, or a
     # re-detect (e.g. after Plus→Forkop migration) would restore the wrong domain
     # and podkop_dns_check would falsely report DNS failure.
-    case "$PODKOP_VARIANT" in
-        forkop) PODKOP_FAKEIP_DOMAIN="fakeip.forkop.fyi" ;;
-        *)      PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi" ;;
-    esac
+    PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
 }
 
 
 PODKOP_VARIANT=$(_detect_podkop_variant)
 
-case "$PODKOP_VARIANT" in
-    forkop)
-        PODKOP_UCI="forkop"
-        PODKOP_BIN="/usr/bin/forkop"
-        PODKOP_INIT="/etc/init.d/forkop"
-        PODKOP_PKG="forkop"
-        PODKOP_GITHUB_REPO="ushan0v/forkop"
-        PODKOP_DISPLAY_NAME="Forkop"
-        SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
-        PODKOP_FAKEIP_DOMAIN="fakeip.forkop.fyi"
-        ;;
-    plus)
-        PODKOP_UCI="podkop-plus"
-        PODKOP_BIN="/usr/bin/podkop-plus"
-        PODKOP_INIT="/etc/init.d/podkop-plus"
-        PODKOP_PKG="podkop-plus"
-        PODKOP_GITHUB_REPO="ushan0v/podkop-plus"
-        PODKOP_DISPLAY_NAME="Podkop Plus"
-        SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
-        PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
-        ;;
-    evolution)
-        PODKOP_UCI="podkop"
-        PODKOP_BIN="/usr/bin/podkop"
-        PODKOP_INIT="/etc/init.d/podkop"
-        PODKOP_PKG="podkop"
-        PODKOP_GITHUB_REPO="yandexru45/podkop-evolution"
-        PODKOP_DISPLAY_NAME="Podkop Evolution"
-        SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
-        PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
-        ;;
-    netshift)
-        PODKOP_UCI="netshift"
-        PODKOP_BIN="/usr/bin/netshift"
-        PODKOP_INIT="/etc/init.d/netshift"
-        PODKOP_PKG="netshift"
-        PODKOP_GITHUB_REPO="yandexru45/netshift"
-        PODKOP_DISPLAY_NAME="NetShift"
-        SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
-        PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
-        ;;
-    *)
-        PODKOP_UCI="podkop"
-        PODKOP_BIN="/usr/bin/podkop"
-        PODKOP_INIT="/etc/init.d/podkop"
-        PODKOP_PKG="podkop"
-        PODKOP_GITHUB_REPO="itdoginfo/podkop"
-        PODKOP_DISPLAY_NAME="Podkop"
-        SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
-        PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
-        ;;
-esac
+# Variant-dependent environment. Single source of truth: _apply_variant_env()
+# above (also re-run mid-session after do_update_podkop migrations), so the
+# startup values can never drift from the re-apply path.
+_apply_variant_env
 
 # Helper: does this variant support subscriptions?
 _variant_has_subscription() {
@@ -601,10 +550,14 @@ forkop_children_by_type_and_owner() {
     local _type="$1" _parent="$2" _child _owner
     [ "$PODKOP_VARIANT" = "forkop" ] || return 1
     uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$_type" '
-        $2 == t {
-            k=$1
-            sub("^" p, "", k)
-            print k
+        {
+            v=$2
+            gsub(/\047/, "", v)
+            if (v == t) {
+                k=$1
+                sub("^" p, "", k)
+                print k
+            }
         }
     ' | while IFS= read -r _child; do
         [ -n "$_child" ] || continue
@@ -1118,6 +1071,48 @@ validate_domain() {
     echo "$1" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$'
 }
 
+# ── UTF-8-safe length and truncation ──────────────────────────────────────────
+# `cut -c`/`wc -c` in BusyBox operate on BYTES. Proxy names from subscriptions
+# routinely start with a country flag (🇫🇮 = 8 bytes: two 4-byte regional
+# indicators) and Cyrillic is 2 bytes per letter, so byte arithmetic did two
+# things wrong at once: it cut inside a multi-byte sequence, leaving a broken
+# glyph, and it fired far too early — a 40-byte budget is only ~20 Cyrillic
+# characters or 5 flags.
+#
+# Both helpers count real characters. A regional-indicator pair (a flag) is
+# consumed as ONE unit so a cut can never land between its halves and leave a
+# stray letter-in-a-box. LC_ALL=C is required: under a UTF-8 locale some awk
+# builds make sprintf("%c") emit multi-byte output and the ord[] table breaks.
+# Written for BusyBox awk — no gawk-only features, no ${var:0:N} (some ash
+# builds abort on that with "bad substitution").
+_utf8_awk_body='
+    BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+    function w(p,   b) { b = ord[substr($0, p, 1)]
+        return (b >= 240) ? 4 : ((b >= 224) ? 3 : ((b >= 192) ? 2 : 1)) }
+    function ri(p,   a, b, c, d) {
+        a = ord[substr($0, p, 1)];     b = ord[substr($0, p + 1, 1)]
+        c = ord[substr($0, p + 2, 1)]; d = ord[substr($0, p + 3, 1)]
+        return (a == 240 && b == 159 && c == 135 && d >= 166 && d <= 191) }
+'
+
+_utf8_len() {
+    LC_ALL=C printf '%s' "$1" | LC_ALL=C awk "$_utf8_awk_body"'
+    { n = 0; i = 1; L = length($0)
+      while (i <= L) {
+        if (ri(i) && i + 4 <= L && ri(i + 4)) i += 8; else i += w(i)
+        n++ }
+      printf "%d", n }'
+}
+
+_utf8_head() {
+    LC_ALL=C printf '%s' "$1" | LC_ALL=C awk -v max="$2" "$_utf8_awk_body"'
+    { n = 0; i = 1; L = length($0)
+      while (i <= L && n < max) {
+        if (ri(i) && i + 4 <= L && ri(i + 4)) i += 8; else i += w(i)
+        n++ }
+      printf "%s", substr($0, 1, i - 1) }'
+}
+
 html_escape() {
     # Escapes all 5 HTML special chars including " for safe use inside href="..."
     printf '%s' "$1" | sed \
@@ -1321,7 +1316,7 @@ _resolve_primary_section() {
 # _mask_proxy      — hide the password for logs/UI: user:pass@ -> user:***@
 _proxy_endpoint() { printf '%s' "${1%%#*}"; }
 _proxy_mnemonic() { case "$1" in *#*) printf '%s' "${1#*#}";; *) printf '';; esac; }
-_mask_proxy() { printf '%s' "$1" | sed -E 's|(://[^:@/]+:)[^@/]*@|\1***@|'; }
+_mask_proxy() { printf '%s' "$1" | sed 's|\(://[^:@/]*:\)[^@/]*@|\1***@|'; }
 # _proxy_display — mnemonic if present, else masked endpoint (for logs/ROUTE_NAME)
 _proxy_display() {
     local _m; _m=$(_proxy_mnemonic "$1")
@@ -1342,6 +1337,7 @@ _load_transport_ctx() {
     _t_sec="$_primary_sec"
     _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
     _t_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+    _t_auth=$(_mixed_proxy_auth "$_t_sec")
     # Resolve actual listen IP from config.json for tier1
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
         local _sb_ip
@@ -1381,7 +1377,8 @@ _load_transport_ctx() {
         _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
         [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
         local _fb_ip; _fb_ip=$(_resolve_mixed_listen_ip_by_port "$_mp")
-        local _auto_fb="socks5h://${_fb_ip}:${_mp}"
+        local _fb_auth; _fb_auth=$(_mixed_proxy_auth "$_s")
+        local _auto_fb="socks5h://${_fb_auth}${_fb_ip}:${_mp}"
         # Only add if not already in explicit fallback list — compare by endpoint
         # (strips #mnemonic) so "socks5h://ip:port#Name" is recognized as present.
         local _already=0 _ex
@@ -1392,6 +1389,37 @@ _load_transport_ctx() {
     done
 }
 
+# _mixed_proxy_auth SECTION — print "user:pass@" for a section whose local mixed
+# proxy requires credentials, or nothing.
+#
+# Forkop (and Plus) can put the local mixed/SOCKS inbound behind a username and
+# password: mixed_proxy_auth_enabled + mixed_proxy_username + mixed_proxy_password
+# (verified in luci-app-forkop section.js). We build every SOCKS endpoint from
+# ip:port only, so turning auth on in LuCI made curl fail 407 on every tier and
+# the Telegram transport died with no hint as to why.
+#
+# Credentials are percent-encoded: a password with @ : / or # would otherwise
+# re-split the URL and silently point curl at the wrong host.
+_url_encode_cred() {
+    LC_ALL=C printf '%s' "$1" | LC_ALL=C awk '
+    BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+    { L = length($0)
+      for (i = 1; i <= L; i++) { c = substr($0, i, 1)
+        if (c ~ /[A-Za-z0-9._~-]/) printf "%s", c
+        else printf "%%%02X", ord[c] } }'
+}
+
+_mixed_proxy_auth() {
+    local _sec="$1" _en _u _p
+    [ -n "$_sec" ] || return 0
+    _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
+    [ "$_en" = "1" ] || return 0
+    _u=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_username" 2>/dev/null)
+    _p=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_password" 2>/dev/null)
+    [ -n "$_u" ] || return 0
+    printf '%s:%s@' "$(_url_encode_cred "$_u")" "$(_url_encode_cred "$_p")"
+}
+
 # _try_socks_tiers: attempt tier1 + all fallback_socks in order.
 # Sets ROUTE_KEY and ROUTE_NAME on success. Returns 0 on first success.
 # ROUTE_KEY: tier1 | tier2_1 | tier2_2 | ...
@@ -1399,7 +1427,7 @@ _try_socks_tiers() {
     local args="$1" max_time="$2" ct="$3"
     # tier1: primary Podkop SOCKS
     if [ "$_t_policy" != "direct" ]; then
-        if _try_curl "-x socks5h://${_t_ip}:${_t_port}" "$max_time" "$args" "$ct"; then
+        if _try_curl "-x socks5h://${_t_auth}${_t_ip}:${_t_port}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier1"
             ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
             return 0
@@ -1441,7 +1469,7 @@ _curl_via_best_socks() {
     # 2. tier1 — primary Podkop SOCKS
     if [ -n "$_t_ip" ] && [ -n "$_t_port" ] && [ "$_t_policy" != "direct" ]; then
         if curl -s --connect-timeout "$_ct" --max-time "$_max" \
-                -x "socks5h://${_t_ip}:${_t_port}" $_args 2>/dev/null; then
+                -x "socks5h://${_t_auth}${_t_ip}:${_t_port}" $_args 2>/dev/null; then
             _last_fetch_route="Podkop SOCKS (${_t_ip}:${_t_port})"
             logger -t podkop-bot "[GH fetch] via tier1 SOCKS ${_t_ip}:${_t_port}"
             return 0
@@ -1623,7 +1651,7 @@ run_github_health_check() {
     # api.github.com — via SOCKS
     if [ -n "$_t_ip" ] && [ -n "$_t_port" ]; then
         _out=$(curl -s -o /dev/null --connect-timeout 6 --max-time 10 \
-            -x "socks5h://${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_api_url" 2>/dev/null)
+            -x "socks5h://${_t_auth}${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_api_url" 2>/dev/null)
         _code=${_out%% *}; _tt=${_out##* }
         case "$_code" in 2*|3*) _ghc_api_socks="ok:$(_ghc_ms "$_tt")" ;;
                          "")    _ghc_api_socks="timeout" ;; esac
@@ -1641,7 +1669,7 @@ run_github_health_check() {
     # raw.githubusercontent.com — via SOCKS
     if [ -n "$_t_ip" ] && [ -n "$_t_port" ]; then
         _out=$(curl -s -o /dev/null --connect-timeout 6 --max-time 10 \
-            -x "socks5h://${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_raw_url" 2>/dev/null)
+            -x "socks5h://${_t_auth}${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_raw_url" 2>/dev/null)
         _code=${_out%% *}; _tt=${_out##* }
         case "$_code" in 2*|3*) _ghc_raw_socks="ok:$(_ghc_ms "$_tt")" ;;
                          "")    _ghc_raw_socks="timeout" ;; esac
@@ -1799,7 +1827,7 @@ _route_request() {
         case "$_last" in
             tier1)
                 [ "$_t_policy" != "direct" ] && \
-                _try_curl "-x socks5h://${_t_ip}:${_t_port}" "$_max" "$_args" "$_ct_sticky" && {
+                _try_curl "-x socks5h://${_t_auth}${_t_ip}:${_t_port}" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier1"; LAST_ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
                     _write_main_route "tier1" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier1"; return 0
@@ -2060,7 +2088,7 @@ probe_all_socks_write() {
     local lat out="ts=$(date +%s)"
 
     # tier1: primary Podkop SOCKS
-    lat=$(probe_socks_latency "socks5h://${_t_ip}:${_t_port}")
+    lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
     out="${out}\ntier1=${lat}"
     logger -t podkop-bot "[SOCKSProbe] Primary (${_t_ip}:${_t_port}): ${lat}"
 
@@ -2112,7 +2140,7 @@ api_document() {
     # diagnostics but does not influence FAST or POLL routing.
 
     if [ "$_t_policy" != "direct" ]; then
-        res=$(_do_curl_doc "-x socks5h://${_t_ip}:${_t_port}")
+        res=$(_do_curl_doc "-x socks5h://${_t_auth}${_t_ip}:${_t_port}")
         _is_telegram_response "$res" && {
             unset -f _do_curl_doc
             LAST_ROUTE_DOC="tier1"; return 0
@@ -3297,11 +3325,13 @@ safe_reload_podkop() {
 podkop_dns_check() {
     local delay="${1:-15}" result _dom _alt
     sleep "$delay"
-    # Forkop reads its FakeIP test domain from an env var with a hardcoded
-    # fallback that has differed across forkop builds/sources (fakeip.forkop.fyi
-    # vs fakeip.podkop.fyi). Rather than bet on one, probe the variant's primary
-    # domain and, if that doesn't resolve into the FakeIP range, try the other —
-    # either resolving through 198.18.x means the tunnel is routing.
+    # Forkop reads its FakeIP test domain from an env var, defaulting to
+    # fakeip.podkop.fyi — verified against the Forkop sources: core/constants.uc,
+    # singbox/constants.uc and diagnostics/runtime.uc all carry that value, and
+    # "fakeip.forkop.fyi" appears nowhere in the repository. We used to send the
+    # forkop.fyi name first, so the first probe always missed and the tunnel
+    # check only passed on the fallback. Both are still probed, because a router
+    # may run a build whose FAKEIP_TEST_DOMAIN env var points elsewhere.
     _dom="${PODKOP_FAKEIP_DOMAIN:-fakeip.podkop.fyi}"
     case "$_dom" in
         *forkop*) _alt="fakeip.podkop.fyi" ;;
@@ -5363,7 +5393,7 @@ EOF
                 text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Активная секция:</b> <code>${sec}</code>
+<b>Рабочая секция бота:</b> <code>${sec}</code>
 
 <i>Это единственная секция — переключаться не на что. При необходимости создайте дополнительные секции в LuCI.</i>
 EOF
@@ -5375,9 +5405,9 @@ EOF
             text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Активная секция:</b> <code>${sec}</code>
+<b>Рабочая секция бота:</b> <code>${sec}</code>
 
-<i>Выберите секцию для переключения:</i>
+<i>Выберите секцию — меню бота (прокси, списки, настройки) будет работать с ней. Сам Podkop не перезапускается: у него работают все включённые секции.</i>
 EOF
 )
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
@@ -5386,15 +5416,17 @@ EOF
         "do_set_sec_"*)
             local new_sec="${cmd#do_set_sec_}"
             echo "$new_sec" > "$ACTIVE_SECTION_FILE"
+            # Bot-menu context only: no variant's backend reads this file, so a
+            # Podkop reload here was pure noise (and on Forkop implied a false
+            # "activation" — all enabled rules run simultaneously there).
             build_all_caches
-            safe_reload_podkop "force"; sleep 1
             _handle_sections "sections_menu" "$mid"
             ;;
 
         "set_sec_"*)
             local new_sec="${cmd#set_sec_}"
             send_or_edit "$mid" \
-                "$(printf '%s Сделать секцию <code>%s</code> активной?\n\nPodkop будет перезапущен.' "$E_WARN" "$new_sec")" \
+                "$(printf '%s Переключить меню бота на секцию <code>%s</code>?\n\nМеняется только рабочая секция бота — Podkop не перезапускается.' "$E_CLIP" "$new_sec")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Да\",\"callback_data\":\"do_set_sec_${new_sec}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"sections_menu\"}]]}"
             ;;
     esac
@@ -5765,7 +5797,7 @@ EOF
             # URLTest mode: prepend Auto (best ping) button on its own row
             if [ "$proxy_mode_cur" = "proxy:urltest" ] && [ -n "$urltest_group" ]; then
                 if [ "${is_auto_mode:-0}" != "1" ]; then
-                    kb="${kb}[{\"text\":\"${E_SCAN} Автовыбор прокси\",\"callback_data\":\"do_px_auto_urltest\"}],"
+                    kb="${kb}[{\"text\":\"${E_SCAN} Автовыбор (URLTest)\",\"callback_data\":\"do_px_auto_urltest\"}],"
                 fi
                 # URLTest auto ✓ indicator shown in list text, no standalone button needed
             fi
@@ -6048,7 +6080,7 @@ EOF
             else
                 payload=$(jq -n -c --arg name "$urltest_grp" '{name:$name}')
                 if clash_request "/proxies/${selector}" "PUT" "$payload" >/dev/null 2>&1; then
-                    CB_ANSWER_TEXT="Автовыбор прокси включён"
+                    CB_ANSWER_TEXT="Автовыбор (URLTest) включён"
                     logger -t podkop-bot "Audit: ${audit_str} -> auto urltest via ${urltest_grp}"
                 else
                     CB_ANSWER_TEXT="Не удалось включить автоматический выбор прокси"
@@ -6268,7 +6300,7 @@ EOF
                     _f_url=$(uci -q get "${PODKOP_UCI}.${_f_child}.url" 2>/dev/null)
                     _f_label=$(printf '%s' "$_f_url" | sed 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s/[?].*$//' | cut -c1-32)
                     [ -n "$_f_label" ] || _f_label="источник ${_f_idx}"
-                    _f_rows="${_f_rows}[{\"text\":\"✏ ${_f_idx}. $(json_escape "$_f_label")\",\"callback_data\":\"edit_fsub_$(json_escape "$_f_child")\"}],"
+                    _f_rows="${_f_rows}[{\"text\":\"✏ ${_f_idx}. $(json_escape "$_f_label")\",\"callback_data\":\"edit_fsub_$(json_escape "$_f_child")\"},{\"text\":\"${E_SET}\",\"callback_data\":\"fk_sub_set_$(json_escape "$_f_child")\"}],"
                 done <<FSUBS
 $_f_children
 FSUBS
@@ -6953,8 +6985,11 @@ EOF
 
         "section_settings")
             rm -f "$STATE_FILE"
-            # Redirect zapret/byedpi sections to their own menu
-            if [ "$PODKOP_VARIANT" = "plus" ]; then
+            # Redirect zapret/byedpi sections to their own menu.
+            # NOTE: zapret2 intentionally NOT routed here — there is no
+            # zapret2_section_menu yet, and this handler would render it as
+            # ByeDPI with the wrong config fields. Tracked as debt.
+            if _variant_is_plus_like; then
                 local _sec_action; _sec_action=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null)
                 case "$_sec_action" in
                     zapret|byedpi)
@@ -7021,7 +7056,8 @@ EOF
             local _uf_btn=""
             [ "$PODKOP_VARIANT" = "plus" ] && [ "$proxy_mode" = "proxy:urltest" ] && _uf_btn="yes"
             kb="${kb}[{\"text\":\"${E_TGT} URLTest\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_NET} DNS-резолвер\",\"callback_data\":\"domain_resolver_settings\"}],"
-            [ -n "$_uf_btn" ] && kb="${kb}[{\"text\":\"🔬 Фильтры автовыбора\",\"callback_data\":\"urltest_filters_menu\"}],"
+            [ "$PODKOP_VARIANT" = "forkop" ] && kb="${kb}[{\"text\":\"${E_TGT} Условия\",\"callback_data\":\"fk_conds\"},{\"text\":\"${E_LINK} Через секцию\",\"callback_data\":\"fk_detour\"}],"
+            [ -n "$_uf_btn" ] && kb="${kb}[{\"text\":\"🔬 Фильтры URLTest\",\"callback_data\":\"urltest_filters_menu\"}],"
             kb="${kb}[{\"text\":\"${_sec_en_lbl}\",\"callback_data\":\"${_sec_en_cb}\"}],"
             kb="${kb}[{\"text\":\"${autostart_btn}\",\"callback_data\":\"${autostart_lbl}\"}],"
             kb="${kb}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
@@ -7110,14 +7146,14 @@ EOF
             ;;
 
         "do_dpi_toggle_"*)
-            # Toggle enabled for zapret/byedpi section: do_dpi_toggle_<sec>_<0|1>
-            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
+            # Toggle enabled for zapret/zapret2/byedpi section: do_dpi_toggle_<sec>_<0|1>
+            _variant_is_plus_like || { _handle_settings "section_settings" "$mid" "" ""; return; }
             local _dt="${cmd#do_dpi_toggle_}"
             local _dt_sec="${_dt%_[01]}" _dt_val="${_dt##*_}"
-            # Guard: only act if section really is zapret/byedpi
+            # Guard: only act if section really is zapret/zapret2/byedpi
             local _dta; _dta=$(uci -q get ${PODKOP_UCI}.${_dt_sec}.action 2>/dev/null)
             case "$_dta" in
-                zapret|byedpi) ;;
+                zapret|zapret2|byedpi) ;;
                 *) _handle_settings "section_settings" "$mid" "" ""; return ;;
             esac
             uci set ${PODKOP_UCI}.${_dt_sec}.enabled="$_dt_val"
@@ -7168,7 +7204,7 @@ EOF
             kb="${kb}[{\"text\":\"${quic} QUIC\",\"callback_data\":\"ask_toggle_quic\"},{\"text\":\"${excl_ntp} NTP в обход\",\"callback_data\":\"ask_toggle_ntp\"}],"
             kb="${kb}[{\"text\":\"${dl} Через прокси\",\"callback_data\":\"ask_toggle_dl\"},{\"text\":\"${wan} Контроль WAN\",\"callback_data\":\"ask_toggle_wan\"}],"
             kb="${kb}[{\"text\":\"${E_NET} DNS\",\"callback_data\":\"dns_settings\"},{\"text\":\"${E_STAT} YACD: $([ "$yacd_en" = "1" ] && echo "вкл." || echo "выкл.")\",\"callback_data\":\"ask_toggle_yacd\"}],"
-            kb="${kb}[{\"text\":\"${E_SCAN} Контроль WAN\",\"callback_data\":\"badwan_details\"}],"
+            kb="${kb}[{\"text\":\"${E_SCAN} Настройки контроля WAN\",\"callback_data\":\"badwan_details\"}],"
             kb="${kb}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -7179,22 +7215,26 @@ EOF
             local current_mode_short; current_mode_short="${current_mode#proxy:}"
             local pm_txt kb_pm
             local _pm_modes _pm_desc _pm_src_line=""
-            if [ "$PODKOP_VARIANT" = "plus" ]; then
+            if _variant_is_plus_like; then
                 _pm_modes="selector urltest"
-                # Plus: mode is the urltest_enabled flag, NOT get_section_type
-                # (which is overridden to 'subscription' when a sub URL exists).
-                # Without this the active button never gets a checkmark.
-                local _ut_flag; _ut_flag=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_enabled 2>/dev/null)
-                if [ "$_ut_flag" = "1" ]; then current_mode_short="urltest"; else current_mode_short="selector"; fi
+                # Plus: mode is the urltest_enabled flag; Forkop: a child urltest
+                # section. section_urltest_enabled handles both — a raw parent read
+                # would always show Selector on Forkop, and get_section_type is
+                # overridden to 'subscription' when a sub URL exists.
+                if section_urltest_enabled "$sec"; then current_mode_short="urltest"; else current_mode_short="selector"; fi
                 # Subscription is a SOURCE shown alongside the mode, not a mode itself.
                 if section_is_subscription "$sec"; then
                     local _pm_n; _pm_n=$(get_subscription_server_count "$sec")
                     _pm_src_line=$(printf '\n%s <b>Источник:</b> подписка (%s прокси)' "$E_LINK" "$_pm_n")
                 fi
-                _pm_desc="<b>Selector</b> — ручной выбор прокси\n<b>URLTest</b> — автоматический выбор прокси с наименьшей задержкой"
+                _pm_desc="<b>Selector</b> — ручной выбор прокси
+<b>URLTest</b> — автоматический выбор прокси с наименьшей задержкой"
             else
                 _pm_modes="url selector urltest outbound"
-                _pm_desc="<b>URL</b> — одна ссылка на прокси\n<b>Selector</b> — ручной выбор прокси\n<b>URLTest</b> — автоматический выбор прокси с наименьшей задержкой\n<b>JSON</b> — настройка прокси через LuCI или консоль"
+                _pm_desc="<b>URL</b> — одна ссылка на прокси
+<b>Selector</b> — ручной выбор прокси
+<b>URLTest</b> — автоматический выбор прокси с наименьшей задержкой
+<b>JSON</b> — настройка прокси через LuCI или консоль"
             fi
             local current_mode_label; current_mode_label=$(proxy_mode_short_label "$current_mode_short")
             pm_txt=$(printf '%s <b>Режим прокси</b> [<code>%s</code>]\n\nТекущий режим: <code>%s</code>%s\n\n%s' \
@@ -7382,8 +7422,10 @@ EOF
             # stale TAG_NAME_CACHE/UCI_LINKS_CACHE would show old proxy names.
             rm -f "$TAG_NAME_CACHE" "$UCI_LINKS_CACHE" "$TAG_URI_CACHE"
             send_or_edit "$mid" "$(printf '%s Выбран режим <code>%s</code>. Применяем изменения…' "$E_RST" "$target_mode")" ""
-            safe_reload_podkop "force"; sleep 1
+            # Render first (uci already committed — the screen shows the new mode),
+            # then reload; the old order blocked the redraw for the whole restart.
             _handle_settings "section_settings" "$mid" "" ""
+            safe_reload_podkop "force"
             ;;
 
         "set_update_int_"*) uci set ${PODKOP_UCI}.settings.update_interval="${cmd#set_update_int_}"; uci_commit_safe ${PODKOP_UCI}; _handle_settings "global_settings" "$mid" "" "" ;;
@@ -7445,7 +7487,7 @@ EOF
                 curr_ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null || echo "connection")
                 local ct_txt; ct_txt=$(printf '%s <b>Действие секции</b> [<code>%s</code>]\n\nТекущее действие: <code>%s</code>\n\n<b>connection</b> (Туннелировать) — направлять трафик секции через настроенный туннель\n<b>bypass</b> — направлять трафик в обход туннеля\n<b>block</b> — блокировать трафик\n<b>zapret / zapret2 / byedpi</b> — обрабатывать трафик средствами Forkop' "$E_SET" "$sec" "$curr_ct")
                 send_or_edit "$mid" "$ct_txt" \
-                    "{\"inline_keyboard\":[[{\"text\":\"Туннелировать\",\"callback_data\":\"do_set_conn_connection\"},{\"text\":\"Обход\",\"callback_data\":\"do_set_conn_bypass\"},{\"text\":\"Блокировка\",\"callback_data\":\"do_set_conn_block\"}],[{\"text\":\"Zapret\",\"callback_data\":\"do_set_conn_zapret\"},{\"text\":\"Zapret2\",\"callback_data\":\"do_set_conn_zapret2\"},{\"text\":\"ByeDPI\",\"callback_data\":\"do_set_conn_byedpi\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"Туннелировать\",\"callback_data\":\"do_set_conn_connection\"},{\"text\":\"В обход\",\"callback_data\":\"do_set_conn_bypass\"},{\"text\":\"Блокировка\",\"callback_data\":\"do_set_conn_block\"}],[{\"text\":\"Zapret\",\"callback_data\":\"do_set_conn_zapret\"},{\"text\":\"Zapret2\",\"callback_data\":\"do_set_conn_zapret2\"},{\"text\":\"ByeDPI\",\"callback_data\":\"do_set_conn_byedpi\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
                 return
             elif [ "$PODKOP_VARIANT" = "plus" ]; then
                 curr_ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null || echo "proxy")
@@ -7569,7 +7611,13 @@ _handle_section_extras() {
         # sees editable-looking fields and a misleading "URLTest proxies: 0 — won't
         # start" warning that doesn't apply to forkop's child model.
         case "$cmd" in
-            urltest_settings|domain_resolver_settings)
+            urltest_settings)
+                # Forkop: URLTest child editor (update-only) — fk_ut_menu shows the
+                # editor when a child exists, or the honest Selector notice.
+                _handle_forkop_ext "fk_ut_menu" "$mid" "" ""
+                return
+                ;;
+            domain_resolver_settings)
                 local _fk_ut _fk_cur=""
                 _fk_ut=$(forkop_urltest_children "$sec" 2>/dev/null)
                 if [ -n "$_fk_ut" ]; then
@@ -7583,7 +7631,7 @@ _handle_section_extras() {
         esac
         case "$cmd:$state" in
             STATE_INPUT:wait_urltest_*|STATE_INPUT:wait_dr_server|STATE_INPUT:wait_outbound_iface|STATE_INPUT:wait_vpn_iface|STATE_INPUT:wait_utl_link|\
-            cmd_set_ut_*:*|do_utfilter_*:*|urltest_filters_*:*|cmd_set_dr_server:*|do_toggle_dr:*|cmd_set_outbound_iface:*|cmd_clone_*:*|cmd_utl_add:*|ask_del_utl_*:*|do_del_utl_*:*)
+            cmd_set_ut_*:*|do_utfilter_*:*|urltest_filters_*:*|cmd_set_dr_server:*|do_toggle_dr:*|set_dr_type_*:*|cmd_set_outbound_iface:*|cmd_clone_*:*|cmd_utl_add:*|ask_del_utl_*:*|do_del_utl_*:*)
                 forkop_readonly_notice "$mid" "section_settings" "URLTest, DNS-резолвер и интерфейсы"
                 return
                 ;;
@@ -7978,8 +8026,8 @@ EOF
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"Режим: ${_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"},{\"text\":\"🌍 Страна: ${_dc_disp_ru}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],
                 [{\"text\":\"${_hide} Скрывать исключённые\",\"callback_data\":\"do_utfilter_toggle_hide\"}],
-                [{\"text\":\"${E_EDIT} Исключённые страны\",\"callback_data\":\"wait_utfilter_exc_${sec}\"},{\"text\":\"${E_EDIT} Разрешённые страны\",\"callback_data\":\"wait_utfilter_inc_${sec}\"}],
-                [{\"text\":\"${E_EDIT} Исключённые прокси\",\"callback_data\":\"wait_utfilter_excob_${sec}\"},{\"text\":\"${E_EDIT} Разрешённые прокси\",\"callback_data\":\"wait_utfilter_incob_${sec}\"}],
+                [{\"text\":\"${E_EDIT} Страны: искл.\",\"callback_data\":\"wait_utfilter_exc_${sec}\"},{\"text\":\"${E_EDIT} Страны: разреш.\",\"callback_data\":\"wait_utfilter_inc_${sec}\"}],
+                [{\"text\":\"${E_EDIT} Прокси: искл.\",\"callback_data\":\"wait_utfilter_excob_${sec}\"},{\"text\":\"${E_EDIT} Прокси: разреш.\",\"callback_data\":\"wait_utfilter_incob_${sec}\"}],
                 [{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -7988,8 +8036,11 @@ EOF
         "do_utfilter_mode_"*)
             [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
             uci set ${PODKOP_UCI}.${sec}.urltest_filter_mode="${cmd#do_utfilter_mode_}"
-            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"
-            _handle_section_extras "urltest_filters_menu" "$mid" "" "" ;;
+            uci_commit_safe ${PODKOP_UCI}
+            # Render first, reload after: podkop restart takes seconds on Plus and
+            # blocking before the redraw made every toggle feel frozen.
+            _handle_section_extras "urltest_filters_menu" "$mid" "" ""
+            safe_reload_podkop "force" ;;
 
         "do_utfilter_cycle_dc")
             [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
@@ -8006,14 +8057,20 @@ EOF
             else
                 uci set ${PODKOP_UCI}.${sec}.detect_server_country="$_next_dc"
             fi
-            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"
-            _handle_section_extras "urltest_filters_menu" "$mid" "" "" ;;
+            uci_commit_safe ${PODKOP_UCI}
+            # Render first, reload after: podkop restart takes seconds on Plus and
+            # blocking before the redraw made every toggle feel frozen.
+            _handle_section_extras "urltest_filters_menu" "$mid" "" ""
+            safe_reload_podkop "force" ;;
 
         "do_utfilter_toggle_hide")
             [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
             toggle_uci_bool "${PODKOP_UCI}.${sec}" "urltest_hide_filtered_outbounds"
-            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"
-            _handle_section_extras "urltest_filters_menu" "$mid" "" "" ;;
+            uci_commit_safe ${PODKOP_UCI}
+            # Render first, reload after: podkop restart takes seconds on Plus and
+            # blocking before the redraw made every toggle feel frozen.
+            _handle_section_extras "urltest_filters_menu" "$mid" "" ""
+            safe_reload_podkop "force" ;;
 
         "urltest_settings")
             rm -f "$STATE_FILE"
@@ -8449,6 +8506,923 @@ EOF
     return 0
 }
 
+# ------------------------------------------------------------------------------
+# 9.3b: Forkop MVP management (TZ_FORKOP_MVP): parent condition lists, detour,
+# subscription-child settings, urltest-child editor. All field names verified
+# against forkop source (connections.uc / validator.uc / generator.uc).
+# ------------------------------------------------------------------------------
+
+# Atomic-ish single set + commit with revert; returns non-zero on failure.
+_fk_set_commit() {
+    local _path="$1" _val="$2"
+    if ! uci set "${_path}=${_val}"; then
+        uci -q revert "${_path}" 2>/dev/null || true
+        return 1
+    fi
+    if ! uci_commit_safe "${PODKOP_UCI}"; then
+        uci -q revert "${_path}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+# Stage one uci set, aborting the whole staged change on failure. Compound
+# operations must use this: an unchecked set can leave a half-applied intent
+# that commits and reloads "successfully".
+_fk_stage_set() {
+    if ! uci set "${1}=${2}"; then
+        uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+# Delete an option only if it exists, and treat a real delete failure as fatal
+# (an ignored failure would leave the old values and duplicate the new ones).
+_fk_stage_delete() {
+    local _path="$1"
+    uci -q show "$_path" >/dev/null 2>&1 || return 0
+    if ! uci -q delete "$_path"; then
+        uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+# Transaction: snapshot /etc/config/forkop, commit staged changes, reload, and
+# roll the WHOLE file back if forkop's validator rejects the result.
+# Returns: 0 applied · 1 commit failed (staging reverted) · 2 reload rejected,
+# rollback OK · 3 snapshot failed (nothing committed) · 4 reload rejected AND
+# rollback failed (manual recovery needed). Never claims a restore it didn't do.
+_fk_txn_commit_reload() {
+    local _bak="/tmp/podkop_bot/fk_cfg_bak.$$"
+    if ! cp "/etc/config/${PODKOP_UCI}" "$_bak" 2>/dev/null || [ ! -s "$_bak" ]; then
+        uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
+        rm -f "$_bak"
+        return 3
+    fi
+    if ! uci_commit_safe "${PODKOP_UCI}"; then
+        uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
+        rm -f "$_bak"
+        return 1
+    fi
+    if ! safe_reload_podkop "force"; then
+        if cp "$_bak" "/etc/config/${PODKOP_UCI}" 2>/dev/null; then
+            uci -q commit "${PODKOP_UCI}" 2>/dev/null || true
+            safe_reload_podkop "force"
+            rm -f "$_bak"
+            return 2
+        fi
+        rm -f "$_bak"
+        return 4
+    fi
+    rm -f "$_bak"
+    return 0
+}
+
+# Send the honest per-status failure text for _fk_txn_commit_reload.
+_fk_txn_fail_msg() {
+    case "$1" in
+        1) printf '%s Не удалось сохранить изменения (uci commit) — конфигурация не тронута.' "$E_ERR" ;;
+        2) printf '%s Forkop отклонил изменение при перезапуске — конфигурация восстановлена из резервной копии.' "$E_WARN" ;;
+        3) printf '%s Не удалось создать резервную копию конфигурации — изменение НЕ выполнялось.' "$E_ERR" ;;
+        4) printf '%s Forkop отклонил изменение, и восстановить резервную копию НЕ удалось. Проверьте <code>/etc/config/%s</code> вручную.' "$E_ERR" "$PODKOP_UCI" ;;
+    esac
+}
+
+# Short toast for button paths. rc=4 is never toast-only — the caller must also
+# send the full _fk_txn_fail_msg, because it means the config is left changed.
+_fk_txn_toast() {
+    case "$1" in
+        1) printf 'Не удалось сохранить — конфигурация не изменена' ;;
+        2) printf 'Forkop отклонил — конфигурация восстановлена' ;;
+        3) printf 'Нет резервной копии — изменение не выполнялось' ;;
+        4) printf 'ОТКАТ НЕ УДАЛСЯ — проверьте /etc/config/'"$PODKOP_UCI" ;;
+    esac
+}
+
+# Report a failed transaction from a button path: toast always, plus a full
+# message when the config was left in a changed state (rc=4).
+_fk_txn_report() {
+    local _rc="$1" _mid="$2" _back="$3"
+    CB_ANSWER_TEXT="$(_fk_txn_toast "$_rc")"
+    [ "$_rc" = "4" ] && send_message "$(_fk_txn_fail_msg 4)" \
+        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"${_back}\"}]]}"
+}
+
+# ---- Conditions storage model (verified against luci-app-forkop section.js) --
+# domain / ip_cidr: ONE multiline scalar option. The domain scalar carries the
+# whole family inline — a bare line is a suffix match, prefixes full:/keyword:/
+# regex: select exact/keyword/regex. LuCI's afterWrite unsets the legacy
+# domain_suffix / domain_keyword / domain_regex lists and *_text fields.
+# ports / source_ip_cidr: real UCI lists.
+# Backend parses the scalar with text_list_values: split by newline, '//' and
+# '#' start comments.
+_fk_cond_is_scalar() { case "$1" in domain|ip_cidr) return 0 ;; *) return 1 ;; esac; }
+
+# Split a raw multiline value into entries (comments stripped).
+_fk_split_raw() {
+    printf '%s\n' "$1" | sed 's,//.*,,; s,#.*,,' | tr ', ' '\n' \
+        | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -v '^$'
+}
+
+# Print entries one per line, mirroring LuCI's loadCombinedDomainText:
+#   base text  = domain (scalar) or domain_suffix_text
+#   lists      = domain_suffix (bare) · domain_keyword (keyword:) · domain_regex (regex:)
+#   legacy text= domain_suffix_text (bare) · domain_text (FULL:) ·
+#                domain_keyword_text (keyword:) · domain_regex_text (regex:)
+# The prefix matters: domain_text means EXACT match, so importing it bare would
+# silently widen the rule to all subdomains.
+_fk_cond_read() {
+    local _sec="$1" _f="$2" _raw _k _pfx
+    {
+        if _fk_cond_is_scalar "$_f"; then
+            _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.${_f}" 2>/dev/null)
+            if [ -z "$_raw" ] && [ "$_f" = "domain" ]; then
+                _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.domain_suffix_text" 2>/dev/null)
+            fi
+            [ -n "$_raw" ] && _fk_split_raw "$_raw"
+            if [ "$_f" = "domain" ]; then
+                for _k in domain_suffix:"" domain_keyword:keyword: domain_regex:regex:; do
+                    _pfx="${_k#*:}"; _k="${_k%%:*}"
+                    _raw=$(uci -q show "${PODKOP_UCI}.${_sec}.${_k}" 2>/dev/null | cut -d= -f2- | tr -d "'")
+                    [ -n "$_raw" ] && _fk_split_raw "$_raw" | sed "s|^|${_pfx}|"
+                    _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.${_k}_text" 2>/dev/null)
+                    [ -n "$_raw" ] && _fk_split_raw "$_raw" | sed "s|^|${_pfx}|"
+                done
+                # domain_text is the EXACT-match legacy field → full:
+                _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.domain_text" 2>/dev/null)
+                [ -n "$_raw" ] && _fk_split_raw "$_raw" | sed 's|^|full:|'
+            else
+                _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.${_f}_text" 2>/dev/null)
+                [ -n "$_raw" ] && _fk_split_raw "$_raw"
+            fi
+        else
+            uci -q show "${PODKOP_UCI}.${_sec}.${_f}" 2>/dev/null | cut -d= -f2- | tr -d "'" \
+                | tr ' ' '\n' | grep -v '^$'
+        fi
+    } | awk '!seen[$0]++'
+}
+
+# Legacy fields that LuCI clears once the combined scalar is written.
+_fk_cond_legacy_fields() {
+    case "$1" in
+        domain) printf 'domain_suffix domain_suffix_text domain_suffix_text_mode domain_keyword domain_regex domain_text domain_keyword_text domain_regex_text domain_text_mode domain_keyword_text_mode domain_regex_text_mode' ;;
+        *)      printf '%s_text %s_text_mode' "$1" "$1" ;;
+    esac
+}
+
+# APPEND to a scalar field, keeping the user's original text (and its comments)
+# intact — a rebuild-from-parsed would silently drop '#'/'//' notes.
+_fk_cond_stage_append() {
+    local _sec="$1" _f="$2" _new_lines="$3" _raw _out _k _tmp
+    _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.${_f}" 2>/dev/null)
+    if [ -z "$_raw" ] && [ "$_f" = "domain" ]; then
+        _raw=$(uci -q get "${PODKOP_UCI}.${_sec}.domain_suffix_text" 2>/dev/null)
+    fi
+    _out=$(_fk_cond_read "$_sec" "$_f")
+    if [ -n "$_raw" ]; then
+        # Keep the user's raw text (with its comments) verbatim; append only the
+        # entries that came from legacy fields and aren't already in it.
+        _tmp="/tmp/podkop_bot/fk_raw.$$"
+        mkdir -p /tmp/podkop_bot 2>/dev/null
+        _fk_split_raw "$_raw" > "$_tmp"
+        _out=$(printf '%s\n' "$_out" | grep -vxF -f "$_tmp" 2>/dev/null)
+        rm -f "$_tmp"
+        if [ -n "$_out" ]; then _out="${_raw}
+${_out}"; else _out="$_raw"; fi
+    fi
+    if [ -n "$_out" ]; then _out="${_out}
+${_new_lines}"; else _out="$_new_lines"; fi
+    _fk_stage_set "${PODKOP_UCI}.${_sec}.${_f}" "$_out" || return 1
+    for _k in $(_fk_cond_legacy_fields "$_f"); do
+        _fk_stage_delete "${PODKOP_UCI}.${_sec}.${_k}" || return 1
+    done
+    return 0
+}
+
+# Stage the full entry set back (used for delete and for list fields).
+# Scalar: write one multiline option + clear legacy (mirrors LuCI afterWrite).
+# List: delete + re-add. Every uci step is checked.
+_fk_cond_stage_write() {
+    local _sec="$1" _f="$2" _lines="$3" _k _line
+    if _fk_cond_is_scalar "$_f"; then
+        if [ -z "$_lines" ]; then
+            _fk_stage_delete "${PODKOP_UCI}.${_sec}.${_f}" || return 1
+        else
+            _fk_stage_set "${PODKOP_UCI}.${_sec}.${_f}" "$_lines" || return 1
+        fi
+        for _k in $(_fk_cond_legacy_fields "$_f"); do
+            _fk_stage_delete "${PODKOP_UCI}.${_sec}.${_k}" || return 1
+        done
+    else
+        _fk_stage_delete "${PODKOP_UCI}.${_sec}.${_f}" || return 1
+        while IFS= read -r _line; do
+            [ -z "$_line" ] && continue
+            if ! uci add_list "${PODKOP_UCI}.${_sec}.${_f}=${_line}"; then
+                uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
+                return 1
+            fi
+        done <<EOF
+$_lines
+EOF
+    fi
+    return 0
+}
+
+# Child-UPDATE slice of the CRUD layer: verify the child exists, has the
+# expected type, AND belongs to the given parent section — a stale button must
+# not edit another section's child. No create/delete.
+_fk_child_type() {
+    uci -q show "${PODKOP_UCI}.${1}" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'"
+}
+_fk_child_owned() {
+    local _child="$1" _type="$2" _parent="$3"
+    [ "$(_fk_child_type "$_child")" = "$_type" ] || return 1
+    [ "$(uci -q get "${PODKOP_UCI}.${_child}.section" 2>/dev/null)" = "$_parent" ]
+}
+_fk_child_set() {
+    local _child="$1" _type="$2" _parent="$3" _key="$4" _val="$5" _wl=""
+    [ "$PODKOP_VARIANT" = "forkop" ] || return 1
+    _fk_child_owned "$_child" "$_type" "$_parent" || return 1
+    case "$_type" in
+        subscription_url) _wl=" subscription_update_enabled subscription_update_interval download_via_proxy_enabled download_via_proxy_section show_dashboard_metadata prefix_nodes node_prefix user_agent auto_user_agent hwid auto_hwid " ;;
+        urltest)          _wl=" testing_url check_interval tolerance interrupt_exist_connections " ;;
+        *) return 1 ;;
+    esac
+    case "$_wl" in *" $_key "*) ;; *) return 1 ;; esac
+    _fk_stage_set "${PODKOP_UCI}.${_child}.${_key}" "$_val" || return 1
+    _fk_txn_commit_reload
+}
+
+# Detour target must currently be valid: exists, not self, enabled, tunnel-class
+# action. Re-checked at WRITE time, not only when the picker was rendered.
+_fk_detour_target_ok() {
+    local _self="$1" _tgt="$2" _act _en
+    [ -n "$_tgt" ] && [ "$_tgt" != "$_self" ] || return 1
+    _act=$(uci -q get "${PODKOP_UCI}.${_tgt}.action" 2>/dev/null)
+    case "$_act" in connection|proxy|outbound|vpn) ;; *) return 1 ;; esac
+    _en=$(uci -q get "${PODKOP_UCI}.${_tgt}.enabled" 2>/dev/null); [ -z "$_en" ] && _en=1
+    [ "$_en" = "1" ]
+}
+
+# Cycle check mirroring forkop semantics: walk ACTIVE detours only (a hop with
+# detour disabled ends the chain), visited-set instead of a hop cap.
+_fk_detour_cycle() {
+    local _self="$1" _cur="$2" _seen=" " _en
+    while [ -n "$_cur" ]; do
+        [ "$_cur" = "$_self" ] && return 0                 # cycle back to source
+        case "$_seen" in *" $_cur "*) return 0 ;; esac      # loop not through self
+        _seen="${_seen}${_cur} "
+        _en=$(uci -q get "${PODKOP_UCI}.${_cur}.outbound_detour_enabled" 2>/dev/null)
+        [ "$_en" = "1" ] || return 1                        # chain ends here
+        _cur=$(uci -q get "${PODKOP_UCI}.${_cur}.outbound_detour_section" 2>/dev/null)
+    done
+    return 1
+}
+
+# Index-based callback mapping: section IDs may contain '_', so never encode two
+# UCI ids in one callback and split on the separator. Store id pairs in a file
+# and pass the row number instead.
+_fk_map_key() { printf 'vs_%s_%s' "${TARGET_CHAT_ID:-0}" "${1:-0}"; }
+_fk_map_write() {
+    mkdir -p /tmp/podkop_bot 2>/dev/null
+    printf '%s' "$1" > "/tmp/podkop_bot/fk_map_$2"
+    # Keep the directory from growing without bound.
+    ls -1t /tmp/podkop_bot/fk_map_* 2>/dev/null | tail -n +21 | while IFS= read -r _old; do rm -f "$_old"; done
+}
+_fk_map_get() {
+    sed -n "$(( $2 + 1 ))p" "/tmp/podkop_bot/fk_map_$1" 2>/dev/null
+}
+
+# sing-box duration: one or more <num><unit> tokens (validator.uc:817).
+_fk_valid_duration() {
+    printf '%s' "$1" | grep -qE '^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h|d))+$'
+}
+
+# Ports: N or N-M (dash — rule.uc:251 normalizes dash input; colon input is
+# invalid), both within 1..65535, N<=M.
+_fk_valid_port() {
+    local _v="$1" _a _b
+    case "$_v" in
+        *-*)
+            _a="${_v%%-*}"; _b="${_v#*-}" ;;
+        *)
+            _a="$_v"; _b="$_v" ;;
+    esac
+    case "$_a$_b" in *[!0-9]*|"") return 1 ;; esac
+    [ "$_a" -ge 1 ] && [ "$_a" -le 65535 ] && [ "$_b" -ge 1 ] && [ "$_b" -le 65535 ] && [ "$_a" -le "$_b" ]
+}
+
+# Bare domain (suffix/full match): dot somewhere, no leading/trailing dot,
+# no '..', only host characters.
+_fk_valid_domain() {
+    case "$1" in
+        .*|*.|*..*|*[!A-Za-z0-9._-]*) return 1 ;;
+        *.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# http(s) URL with a real host: scheme, non-empty host, no '?'/'#'/'@' inside
+# the host part, numeric port in range if present.
+_fk_valid_url() {
+    local _u="$1" _rest _host _port
+    case "$_u" in
+        http://?*)  _rest="${_u#http://}" ;;
+        https://?*) _rest="${_u#https://}" ;;
+        *) return 1 ;;
+    esac
+    _host="${_rest%%/*}"
+    case "$_host" in ''|*'?'*|*'#'*|*'@'*|*' '*) return 1 ;; esac
+    case "$_host" in
+        *:*)
+            _port="${_host##*:}"; _host="${_host%%:*}"
+            case "$_port" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ] || return 1 ;;
+    esac
+    case "$_host" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    return 0
+}
+
+# Per-field validation for condition entries. For the domain scalar the prefix
+# decides: bare/full: → domain syntax, keyword: → non-empty token, regex: → any
+# non-empty pattern.
+_fk_cond_valid() {
+    local _f="$1" _v="$2"
+    case "$_v" in *" "*|"") return 1 ;; esac
+    case "$_f" in
+        ip_cidr|source_ip_cidr) validate_ip_or_cidr "$_v" ;;
+        ports) _fk_valid_port "$_v" ;;
+        domain)
+            case "$_v" in
+                full:?*)    _fk_valid_domain "${_v#full:}" ;;
+                keyword:?*) case "${_v#keyword:}" in *[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac ;;
+                regex:?*)   return 0 ;;
+                *)          _fk_valid_domain "$_v" ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+_fk_cond_human() {
+    case "$1" in
+        domain) printf 'Домены' ;;
+        ip_cidr) printf 'IP и подсети' ;;
+        ports) printf 'Порты' ;;
+        source_ip_cidr) printf 'Устройства (source IP)' ;;
+    esac
+}
+
+_handle_forkop_ext() {
+    local cmd="$1" mid="$2" text="$3" state="$4"
+    local sec=$(get_active_section)
+    if [ "$PODKOP_VARIANT" != "forkop" ]; then
+        _handle_settings "section_settings" "$mid" "" ""
+        return
+    fi
+
+    if [ "$cmd" = "STATE_INPUT" ]; then
+        case "$text" in
+            "🏠 Меню"|"/menu") rm -f "$STATE_FILE"; delete_message "$mid"; _handle_bot "/menu" "" "" ""; return ;;
+        esac
+        case "$state" in
+            wait_fkc_*)
+                # Add entries. domain/ip_cidr are ONE multiline scalar (LuCI canon;
+                # the domain scalar carries full:/keyword:/regex: prefixes inline),
+                # ports/source_ip_cidr are UCI lists. Build the full new set, then
+                # stage+commit+reload as one transaction with rollback.
+                local _f="${state#wait_fkc_}" _res="" _added=0 _line _v _cur _new _adds="" _rc
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                _cur=$(_fk_cond_read "$sec" "$_f")
+                _new="$_cur"
+                while IFS= read -r _line || [ -n "$_line" ]; do
+                    # Trim edges only — an inner space is an error, not something
+                    # to silently glue ("keyword:google ai" != "keyword:googleai").
+                    _v=$(printf '%s' "$_line" | sed 's/\r$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+                    [ -z "$_v" ] && continue
+                    case "$_v" in *[[:space:]]*)
+                        _res="${_res}$(printf '%s %s — пробел внутри значения' "$E_ERR" "$_v")
+"
+                        continue ;;
+                    esac
+                    if ! _fk_cond_valid "$_f" "$_v"; then
+                        _res="${_res}$(printf '%s %s — неверный формат' "$E_ERR" "$_v")
+"
+                        continue
+                    fi
+                    if printf '%s\n' "$_new" | grep -qxF "$_v"; then
+                        _res="${_res}$(printf '%s %s — уже есть' "$E_WARN" "$_v")
+"
+                        continue
+                    fi
+                    if [ -z "$_new" ]; then _new="$_v"; else _new="${_new}
+${_v}"; fi
+                    if [ -z "$_adds" ]; then _adds="$_v"; else _adds="${_adds}
+${_v}"; fi
+                    _res="${_res}$(printf '%s %s' "$E_OK" "$_v")
+"
+                    _added=$((_added + 1))
+                done <<EOF
+$(printf '%s' "$text" | tr -d '\r')
+EOF
+                if [ "$_added" -eq 0 ]; then
+                    send_message "$(printf '%s Ничего не добавлено.\n<pre>%s</pre>' "$E_WARN" "$(html_escape "${_res:-—}")")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                if _fk_cond_is_scalar "$_f"; then
+                    # Append to the raw text so user comments survive.
+                    _fk_cond_stage_append "$sec" "$_f" "$_adds"; _rc=$?
+                else
+                    _fk_cond_stage_write "$sec" "$_f" "$_new"; _rc=$?
+                fi
+                if [ "$_rc" -ne 0 ]; then
+                    send_message "$(printf '%s Ошибка записи uci — изменения отменены целиком.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                _fk_txn_commit_reload; _rc=$?
+                if [ "$_rc" -ne 0 ]; then
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                send_message "$(printf '<b>Добавлено и применено</b>\n<pre>%s</pre>' "$(html_escape "$_res")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                return ;;
+            wait_fkcd_*)
+                # Delete entry by index from the merged set, then rewrite the whole
+                # field (scalar or list) in one transaction.
+                local _f="${state#wait_fkcd_}" _idx _i=0 _val="" _line _new="" _rc
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                _idx=$(printf '%s' "$text" | tr -d ' \r\n')
+                case "$_idx" in ''|*[!0-9]*)
+                    send_message "$(printf '%s Введите номер строки.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return ;; esac
+                while IFS= read -r _line; do
+                    [ -z "$_line" ] && continue
+                    if [ "$_i" -eq "$_idx" ]; then
+                        _val="$_line"
+                    else
+                        if [ -z "$_new" ]; then _new="$_line"; else _new="${_new}
+${_line}"; fi
+                    fi
+                    _i=$((_i + 1))
+                done <<EOF
+$(_fk_cond_read "$sec" "$_f")
+EOF
+                if [ -z "$_val" ]; then
+                    send_message "$(printf '%s Строки с номером %s нет (всего: %s).' "$E_ERR" "$_idx" "$_i")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                if ! _fk_cond_stage_write "$sec" "$_f" "$_new"; then
+                    send_message "$(printf '%s Ошибка записи uci — изменения отменены.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                _fk_txn_commit_reload; _rc=$?
+                if [ "$_rc" -ne 0 ]; then
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+                    return
+                fi
+                send_message "$(printf '%s Удалено и применено: <code>%s</code>' "$E_OK" "$(html_escape "$_val")")" ""
+                sleep 1
+                _handle_forkop_ext "fk_c_${_f}" "" "" ""
+                return ;;
+            wait_fkss_i_*)
+                local _ch="${state#wait_fkss_i_}" _v _rc
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                _v=$(printf '%s' "$text" | tr -d ' \r\n')
+                if ! _fk_valid_duration "$_v"; then
+                    send_message "$(printf '%s Формат интервала — sing-box duration: <code>12h</code>, <code>1d</code>, <code>30m</code>, <code>1h30m</code>.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+                    return
+                fi
+                _fk_child_set "$_ch" "subscription_url" "$sec" "subscription_update_interval" "$_v"; _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    _handle_forkop_ext "fk_sub_set_${_ch}" "" "" ""
+                else
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+                fi
+                return ;;
+            wait_fkss_px_*)
+                local _ch="${state#wait_fkss_px_}" _v _rc
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                _v=$(printf '%s' "$text" | tr -d '\r' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                # LC_ALL=C makes cut count BYTES — truncating could split a UTF-8
+                # sequence. Reject an over-long prefix instead of mangling it.
+                if [ "$(printf '%s' "$_v" | wc -c)" -gt 32 ]; then
+                    send_message "$(printf '%s Префикс слишком длинный (максимум 32 байта).' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+                    return
+                fi
+                # Prefix text and the prefix_nodes flag are one intent — stage both,
+                # apply as a single transaction. An empty submission means "no
+                # prefix", so the flag has to follow the text down to 0: leaving
+                # prefix_nodes=1 with an empty node_prefix is a state the UI shows
+                # as "on" while the backend has nothing to prepend.
+                if ! _fk_child_owned "$_ch" "subscription_url" "$sec"; then
+                    send_message "$(printf '%s Источник не принадлежит текущей секции — откройте список заново.' "$E_WARN")" ""
+                    return
+                fi
+                if ! _fk_stage_set "${PODKOP_UCI}.${_ch}.node_prefix" "$_v"; then
+                    send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return
+                fi
+                if ! _fk_stage_set "${PODKOP_UCI}.${_ch}.prefix_nodes" "$([ -n "$_v" ] && echo 1 || echo 0)"; then
+                    send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return
+                fi
+                _fk_txn_commit_reload; _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    _handle_forkop_ext "fk_sub_set_${_ch}" "" "" ""
+                else
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+                fi
+                return ;;
+            wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*)
+                local _ch _key _v _rc
+                case "$state" in
+                    wait_fkut_u_*) _ch="${state#wait_fkut_u_}"; _key="testing_url" ;;
+                    wait_fkut_i_*) _ch="${state#wait_fkut_i_}"; _key="check_interval" ;;
+                    wait_fkut_t_*) _ch="${state#wait_fkut_t_}"; _key="tolerance" ;;
+                esac
+                rm -f "$STATE_FILE"; delete_message "$mid"
+                _v=$(printf '%s' "$text" | tr -d ' \r\n')
+                case "$_key" in
+                    testing_url)
+                        if ! _fk_valid_url "$_v"; then
+                            send_message "$(printf '%s Нужен корректный URL: <code>https://хост[:порт]/путь</code>.' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"; return
+                        fi ;;
+                    check_interval)
+                        if ! _fk_valid_duration "$_v"; then
+                            send_message "$(printf '%s Формат — sing-box duration: <code>3m</code>, <code>180s</code>, <code>1h</code>.' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"; return
+                        fi ;;
+                    tolerance)
+                        case "$_v" in ''|*[!0-9]*)
+                            send_message "$(printf '%s Допуск — число 0–10000 (мс).' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"; return ;; esac
+                        if [ "$_v" -gt 10000 ]; then
+                            send_message "$(printf '%s Forkop принимает допуск 0–10000 мс.' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"; return
+                        fi ;;
+                esac
+                _fk_child_set "$_ch" "urltest" "$sec" "$_key" "$_v"; _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    _handle_forkop_ext "fk_ut_menu" "" "" ""
+                else
+                    send_message "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
+                fi
+                return ;;
+        esac
+        rm -f "$STATE_FILE"
+        return
+    fi
+
+    case "$cmd" in
+        # ---------- Блок 1: условия секции ----------
+        "fk_conds")
+            rm -f "$STATE_FILE"
+            local _cnt_d _cnt_i _cnt_p _cnt_s
+            _cnt_d=$(_fk_cond_read "$sec" "domain" | grep -c .)
+            _cnt_i=$(_fk_cond_read "$sec" "ip_cidr" | grep -c .)
+            _cnt_p=$(_fk_cond_read "$sec" "ports" | grep -c .)
+            _cnt_s=$(_fk_cond_read "$sec" "source_ip_cidr" | grep -c .)
+            send_or_edit "$mid" "$(printf '%s <b>Условия секции</b> [<code>%s</code>]\n\nЧто попадает под действие секции. Пустые условия = вся секция без ограничений.\n\nДомены: <b>%s</b> · IP: <b>%s</b> · Порты: <b>%s</b> · Устройства: <b>%s</b>' "$E_TGT" "$sec" "$_cnt_d" "$_cnt_i" "$_cnt_p" "$_cnt_s")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Домены (${_cnt_d})\",\"callback_data\":\"fk_c_domain\"},{\"text\":\"IP (${_cnt_i})\",\"callback_data\":\"fk_c_ip_cidr\"}],[{\"text\":\"Порты (${_cnt_p})\",\"callback_data\":\"fk_c_ports\"},{\"text\":\"Устройства (${_cnt_s})\",\"callback_data\":\"fk_c_source_ip_cidr\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+            ;;
+        "fk_c_"*)
+            rm -f "$STATE_FILE"
+            local _f="${cmd#fk_c_}" _human _rows="" _i=0 _line _note=""
+            _human=$(_fk_cond_human "$_f")
+            [ -n "$_human" ] || { _handle_forkop_ext "fk_conds" "$mid" "" ""; return; }
+            while IFS= read -r _line; do
+                [ -z "$_line" ] && continue
+                _rows="${_rows}$(printf '[%s] %s' "$_i" "$_line")
+"
+                _i=$((_i + 1))
+            done <<EOF
+$(_fk_cond_read "$sec" "$_f")
+EOF
+            if [ "$_f" = "domain" ]; then
+                _note=$(printf '\n<i>Голая строка — домен и поддомены. Префиксы: <code>full:</code> точное совпадение, <code>keyword:</code> по слову, <code>regex:</code> регулярное выражение.</i>')
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>%s</b> [<code>%s</code>]\n<b>Записей:</b> %s\n\n<pre>%s</pre>%s' "$E_TGT" "$_human" "$sec" "$_i" "$(html_escape "${_rows:-—}")" "$_note")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Добавить\",\"callback_data\":\"fkc_add_${_f}\"},{\"text\":\"${E_DEL} Удалить №\",\"callback_data\":\"fkc_del_${_f}\"}]$( [ "$_f" = "source_ip_cidr" ] && printf ',[{\\"text\\":\\"📱 Из списка DHCP\\",\\"callback_data\\":\\"fk_dev_list\\"}]' ),[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_conds\"}]]}"
+            ;;
+        "fkc_add_"*)
+            local _f="${cmd#fkc_add_}" _hint
+            case "$_f" in
+                domain) _hint="домены (по одному в строке): <code>example.com</code> — домен и поддомены; <code>full:example.com</code> — точное совпадение; <code>keyword:google</code> — по слову; <code>regex:^api[0-9]+</code> — регулярное выражение" ;;
+                ip_cidr) _hint="IP или CIDR (по одному в строке), например <code>1.2.3.4</code> или <code>10.0.0.0/8</code>" ;;
+                ports) _hint="порты или диапазоны через дефис (по одному в строке): <code>443</code> или <code>1000-2000</code>" ;;
+                source_ip_cidr) _hint="IP устройств (по одному в строке); проще — кнопкой «Из списка DHCP»" ;;
+            esac
+            echo "wait_fkc_${_f}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Добавить: %s</b>\n\nОтправьте %s.' "$E_EDIT" "$(_fk_cond_human "$_f")" "$_hint")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+            ;;
+        "fkc_del_"*)
+            local _f="${cmd#fkc_del_}"
+            echo "wait_fkcd_${_f}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Удалить из: %s</b>\n\nОтправьте номер строки из списка (начиная с 0).' "$E_DEL" "$(_fk_cond_human "$_f")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_c_${_f}\"}]]}"
+            ;;
+        "fk_dev_list")
+            rm -f "$STATE_FILE"
+            local _rows="" _n=0 _ip _host
+            while read -r _ _ _ip _host _; do
+                [ -z "$_ip" ] && continue
+                [ "$_host" = "*" ] && _host="$_ip"
+                _rows="${_rows}[{\"text\":\"$(json_escape "$_host") (${_ip})\",\"callback_data\":\"fk_dev_a_${_ip}\"}],"
+                _n=$((_n + 1))
+                [ "$_n" -ge 20 ] && break
+            done < /tmp/dhcp.leases 2>/dev/null
+            if [ "$_n" -eq 0 ]; then
+                send_or_edit "$mid" "$(printf '%s DHCP-клиентов не найдено (/tmp/dhcp.leases пуст).' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_source_ip_cidr\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Устройства из DHCP</b>\n\nНажмите, чтобы добавить в условия секции (source IP). «Весь трафик устройства» — отдельная, более сильная настройка: %s → IP через туннель.' "$E_NET" "Маршрутизация")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_c_source_ip_cidr\"}]]}"
+            ;;
+        "fk_dev_a_"*)
+            local _ip="${cmd#fk_dev_a_}"
+            if ! validate_ip_or_cidr "$_ip"; then
+                CB_ANSWER_TEXT="Некорректный IP"
+                return
+            fi
+            if _fk_cond_read "$sec" "source_ip_cidr" | grep -qxF "$_ip"; then
+                CB_ANSWER_TEXT="Уже в списке"
+                return
+            fi
+            local _cur _rc
+            _cur=$(_fk_cond_read "$sec" "source_ip_cidr")
+            if [ -z "$_cur" ]; then _cur="$_ip"; else _cur="${_cur}
+${_ip}"; fi
+            if ! _fk_cond_stage_write "$sec" "source_ip_cidr" "$_cur"; then
+                CB_ANSWER_TEXT="Ошибка записи"
+                return
+            fi
+            _fk_txn_commit_reload; _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                CB_ANSWER_TEXT="Добавлено: ${_ip}"
+                _handle_forkop_ext "fk_c_source_ip_cidr" "$mid" "" ""
+            else
+                _fk_txn_report "$_rc" "$mid" "fk_c_source_ip_cidr"
+            fi
+            ;;
+        # ---------- Блок 2: detour ----------
+        "fk_detour")
+            rm -f "$STATE_FILE"
+            local _en _tgt _lbl
+            _en=$(uci -q get "${PODKOP_UCI}.${sec}.outbound_detour_enabled" 2>/dev/null)
+            _tgt=$(uci -q get "${PODKOP_UCI}.${sec}.outbound_detour_section" 2>/dev/null)
+            [ "$_en" = "1" ] && _lbl="${E_ON} Включено" || _lbl="${E_OFF} Выключено"
+            send_or_edit "$mid" "$(printf '%s <b>Подключение через другую секцию</b> [<code>%s</code>]\n\nТрафик этой секции пойдёт через подключение выбранной секции (каскад, например VLESS через WARP).\n\n<b>Состояние:</b> %s\n<b>Секция-транспорт:</b> <code>%s</code>' "$E_LINK" "$sec" "$_lbl" "${_tgt:-не выбрана}")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_lbl}\",\"callback_data\":\"fkd_t_$( [ "$_en" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"${E_EDIT} Выбрать секцию\",\"callback_data\":\"fkd_pick\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+            ;;
+        "fkd_t_"*)
+            local _nv="${cmd#fkd_t_}" _tgt0 _rc
+            _tgt0=$(uci -q get "${PODKOP_UCI}.${sec}.outbound_detour_section" 2>/dev/null)
+            if [ "$_nv" = "1" ]; then
+                # Re-validate the stored target at ENABLE time: it may have been
+                # deleted/disabled/re-actioned since it was picked.
+                if [ -z "$_tgt0" ] || ! _fk_detour_target_ok "$sec" "$_tgt0"; then
+                    CB_ANSWER_TEXT="Выберите действующую секцию-транспорт"
+                    _handle_forkop_ext "fkd_pick" "$mid" "" ""
+                    return
+                fi
+                if _fk_detour_cycle "$sec" "$_tgt0"; then
+                    CB_ANSWER_TEXT="Нельзя: цепочка detour замыкается"
+                    return
+                fi
+            fi
+            if ! _fk_stage_set "${PODKOP_UCI}.${sec}.outbound_detour_enabled" "$_nv"; then
+                CB_ANSWER_TEXT="Ошибка записи"; return
+            fi
+            _fk_txn_commit_reload; _rc=$?
+            if [ "$_rc" -ne 0 ]; then _fk_txn_report "$_rc" "$mid" "fk_detour"; fi
+            _handle_forkop_ext "fk_detour" "$mid" "" ""
+            ;;
+        "fkd_pick")
+            rm -f "$STATE_FILE"
+            local _rows="" _s _act _en2
+            for _s in $(uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F'[.=]' '$3=="action"{print $2}' | sort -u); do
+                [ "$_s" = "$sec" ] && continue
+                _act=$(uci -q get "${PODKOP_UCI}.${_s}.action" 2>/dev/null)
+                _en2=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_en2" ] && _en2=1
+                case "$_act" in connection|proxy|outbound|vpn) ;; *) continue ;; esac
+                [ "$_en2" = "1" ] || continue
+                _rows="${_rows}[{\"text\":\"${_s}\",\"callback_data\":\"fkd_s_${_s}\"}],"
+            done
+            if [ -z "$_rows" ]; then
+                send_or_edit "$mid" "$(printf '%s Нет подходящих секций (нужна включённая секция с действием «Туннелировать»).' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_detour\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Секция-транспорт</b>\n\nЧерез какое подключение пустить трафик секции <code>%s</code>:' "$E_LINK" "$sec")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_detour\"}]]}"
+            ;;
+        "fkd_s_"*)
+            local _tgt="${cmd#fkd_s_}" _rc
+            if ! _fk_detour_target_ok "$sec" "$_tgt"; then
+                CB_ANSWER_TEXT="Секция недоступна (удалена/выключена?) — обновите список"
+                _handle_forkop_ext "fkd_pick" "$mid" "" ""
+                return
+            fi
+            if _fk_detour_cycle "$sec" "$_tgt"; then
+                CB_ANSWER_TEXT="Нельзя: получится цикл detour"
+                return
+            fi
+            if ! _fk_stage_set "${PODKOP_UCI}.${sec}.outbound_detour_section" "$_tgt"; then
+                CB_ANSWER_TEXT="Ошибка записи"; return
+            fi
+            _fk_txn_commit_reload; _rc=$?
+            if [ "$_rc" -ne 0 ]; then _fk_txn_report "$_rc" "$mid" "fk_detour"; fi
+            _handle_forkop_ext "fk_detour" "$mid" "" ""
+            ;;
+        # ---------- Блок 3: настройки источника подписки ----------
+        "fk_sub_set_"*)
+            rm -f "$STATE_FILE"
+            local _ch="${cmd#fk_sub_set_}"
+            if ! _fk_child_owned "$_ch" "subscription_url" "$sec"; then
+                send_or_edit "$mid" "$(printf '%s Источник не принадлежит текущей секции — откройте список заново.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_proxy_menu\"}]]}"
+                return
+            fi
+            local _upd _int _vp _vps _md _pf _px _url
+            _url=$(uci -q get "${PODKOP_UCI}.${_ch}.url" 2>/dev/null | cut -c1-60)
+            _upd=$(uci -q get "${PODKOP_UCI}.${_ch}.subscription_update_enabled" 2>/dev/null); [ -z "$_upd" ] && _upd=1
+            _int=$(uci -q get "${PODKOP_UCI}.${_ch}.subscription_update_interval" 2>/dev/null)
+            _vp=$(uci -q get "${PODKOP_UCI}.${_ch}.download_via_proxy_enabled" 2>/dev/null); [ -z "$_vp" ] && _vp=0
+            _vps=$(uci -q get "${PODKOP_UCI}.${_ch}.download_via_proxy_section" 2>/dev/null)
+            _md=$(uci -q get "${PODKOP_UCI}.${_ch}.show_dashboard_metadata" 2>/dev/null); [ -z "$_md" ] && _md=1
+            _pf=$(uci -q get "${PODKOP_UCI}.${_ch}.prefix_nodes" 2>/dev/null); [ -z "$_pf" ] && _pf=0
+            _px=$(uci -q get "${PODKOP_UCI}.${_ch}.node_prefix" 2>/dev/null)
+            send_or_edit "$mid" "$(printf '%s <b>Настройки источника</b> [<code>%s</code>]\n<code>%s</code>\n\nАвтообновление: %s · Интервал: <code>%s</code>\nЧерез прокси: %s <code>%s</code> · Метаданные: %s\nПрефикс узлов: %s <code>%s</code>' "$E_SET" "$_ch" "$(html_escape "$_url")" "$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_int:-по умолчанию}" "$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_vps:-—}" "$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$(html_escape "${_px:-—}")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Автообновление\",\"callback_data\":\"fkss_u_${_ch}_$( [ "$_upd" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkss_i_${_ch}\"}],[{\"text\":\"$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Через прокси\",\"callback_data\":\"fkss_v_${_ch}_$( [ "$_vp" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Метаданные\",\"callback_data\":\"fkss_m_${_ch}_$( [ "$_md" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Префикс узлов\",\"callback_data\":\"fkss_p_${_ch}_$( [ "$_pf" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Текст префикса\",\"callback_data\":\"fkss_px_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_proxy_menu\"}]]}"
+            ;;
+        "fkss_u_"*|"fkss_v_"*|"fkss_m_"*|"fkss_p_"*)
+            local _rest _ch _nv _key _rc
+            case "$cmd" in
+                fkss_u_*) _rest="${cmd#fkss_u_}"; _key="subscription_update_enabled" ;;
+                fkss_v_*) _rest="${cmd#fkss_v_}"; _key="download_via_proxy_enabled" ;;
+                fkss_m_*) _rest="${cmd#fkss_m_}"; _key="show_dashboard_metadata" ;;
+                fkss_p_*) _rest="${cmd#fkss_p_}"; _key="prefix_nodes" ;;
+            esac
+            _ch="${_rest%_[01]}"; _nv="${_rest##*_}"
+            # Enabling via-proxy without a transport section is meaningless (LuCI
+            # forces the pick) — route to the picker; both fields land in one txn.
+            if [ "$_key" = "download_via_proxy_enabled" ] && [ "$_nv" = "1" ] &&                [ -z "$(uci -q get "${PODKOP_UCI}.${_ch}.download_via_proxy_section" 2>/dev/null)" ]; then
+                _handle_forkop_ext "fkss_vp_${_ch}" "$mid" "" ""
+                return
+            fi
+            # Enabling the prefix with no prefix text — ask for the text; the flag
+            # is set together with the text in one txn.
+            if [ "$_key" = "prefix_nodes" ] && [ "$_nv" = "1" ] &&                [ -z "$(uci -q get "${PODKOP_UCI}.${_ch}.node_prefix" 2>/dev/null)" ]; then
+                _handle_forkop_ext "fkss_px_${_ch}" "$mid" "" ""
+                return
+            fi
+            _fk_child_set "$_ch" "subscription_url" "$sec" "$_key" "$_nv"; _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                _handle_forkop_ext "fk_sub_set_${_ch}" "$mid" "" ""
+            else
+                _fk_txn_report "$_rc" "$mid" "fk_sub_set_${_ch}"
+            fi
+            ;;
+        "fkss_vp_"*)
+            # Pick the download-via-proxy transport section for a subscription child.
+            local _ch="${cmd#fkss_vp_}" _rows="" _s _map="" _mi=0
+            _fk_child_owned "$_ch" "subscription_url" "$sec" || { CB_ANSWER_TEXT="Источник не текущей секции"; return; }
+            # Section ids may contain '_', so the callback carries a row index into
+            # a mapping file instead of two concatenated UCI ids.
+            for _s in $(uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F'[.=]' '$3=="action"{print $2}' | sort -u); do
+                [ "$_s" = "$sec" ] && continue
+                _fk_detour_target_ok "$sec" "$_s" || continue
+                _map="${_map}${_ch}|${_s}
+"
+                _rows="${_rows}[{\"text\":\"${_s}\",\"callback_data\":\"fkss_vs_${_mi}\"}],"
+                _mi=$((_mi + 1))
+            done
+            # Scope the table to this chat+message: a stale button from an older
+            # card must not read a table a newer picker overwrote.
+            _fk_map_write "$_map" "$(_fk_map_key "$mid")"
+            if [ -z "$_rows" ]; then
+                send_or_edit "$mid" "$(printf '%s Нет подходящих секций-транспортов (нужна другая включённая секция с действием «Туннелировать»).' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Через какую секцию загружать подписку</b>' "$E_LINK")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+            ;;
+        "fkss_vs_"*)
+            # fkss_vs_<child>_<section>: set transport AND enable in one txn.
+            local _row _ch _tsec _rc
+            _row=$(_fk_map_get "$(_fk_map_key "$mid")" "${cmd#fkss_vs_}")
+            [ -n "$_row" ] || { CB_ANSWER_TEXT="Список устарел — откройте заново"; return; }
+            _ch="${_row%%|*}"; _tsec="${_row#*|}"
+            _fk_child_owned "$_ch" "subscription_url" "$sec" || { CB_ANSWER_TEXT="Источник не текущей секции"; return; }
+            _fk_detour_target_ok "$sec" "$_tsec" || { CB_ANSWER_TEXT="Секция недоступна — обновите список"; return; }
+            if ! _fk_stage_set "${PODKOP_UCI}.${_ch}.download_via_proxy_section" "$_tsec" || \
+               ! _fk_stage_set "${PODKOP_UCI}.${_ch}.download_via_proxy_enabled" "1"; then
+                CB_ANSWER_TEXT="Ошибка записи"; return
+            fi
+            _fk_txn_commit_reload; _rc=$?
+            if [ "$_rc" -ne 0 ]; then _fk_txn_report "$_rc" "$mid" "fk_sub_set_${_ch}"; fi
+            _handle_forkop_ext "fk_sub_set_${_ch}" "$mid" "" ""
+            ;;
+        "fkss_i_"*)
+            local _ch="${cmd#fkss_i_}"
+            echo "wait_fkss_i_${_ch}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Интервал автообновления</b>\n\nОтправьте интервал: <code>12h</code>, <code>1d</code>, <code>30m</code>.' "$E_EDIT")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+            ;;
+        "fkss_px_"*)
+            local _ch="${cmd#fkss_px_}"
+            echo "wait_fkss_px_${_ch}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Префикс узлов</b>\n\nОтправьте префикс (до 32 символов), который будет добавлен к именам узлов этого источника.' "$E_EDIT")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
+            ;;
+        # ---------- Блок 4: редактор существующего URLTest ----------
+        "fk_ut_menu")
+            rm -f "$STATE_FILE"
+            local _ch _cnt _rows _c2
+            _cnt=$(forkop_urltest_children "$sec" 2>/dev/null | grep -c .)
+            if [ "${_cnt:-0}" -eq 0 ]; then
+                forkop_readonly_notice "$mid" "section_settings" "URLTest" "URLTest-секций (child) нет — режим Selector. Создание — в LuCI."
+                return
+            fi
+            if [ "$_cnt" -gt 1 ]; then
+                # Several URLTest children: never silently edit "the first" —
+                # let the user pick which one.
+                _rows=""
+                for _c2 in $(forkop_urltest_children "$sec" 2>/dev/null); do
+                    # Escape the child name: it is a UCI section name, so in
+                    # practice it is safe, but every other keyboard builder here
+                    # (see fk_dev_list) escapes its labels and one stray quote
+                    # would break the whole inline_keyboard JSON.
+                    _rows="${_rows}[{\"text\":\"$(json_escape "$_c2")\",\"callback_data\":\"fk_ut_ed_$(json_escape "$_c2")\"}],"
+                done
+                send_or_edit "$mid" "$(printf '%s <b>URLTest-секции</b> [<code>%s</code>] — %s шт.\n\nВыберите, какую настраивать:' "$E_TGT" "$sec" "$_cnt")" \
+                    "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+                return
+            fi
+            _ch=$(forkop_urltest_children "$sec" 2>/dev/null | head -1)
+            _handle_forkop_ext "fk_ut_ed_${_ch}" "$mid" "" ""
+            return
+            ;;
+        "fk_ut_ed_"*)
+            rm -f "$STATE_FILE"
+            local _ch="${cmd#fk_ut_ed_}"
+            if ! _fk_child_owned "$_ch" "urltest" "$sec"; then
+                send_or_edit "$mid" "$(printf '%s URLTest-секция не принадлежит текущей секции — откройте заново.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
+                return
+            fi
+            local _turl _tint _ttol _tie
+            _turl=$(uci -q get "${PODKOP_UCI}.${_ch}.testing_url" 2>/dev/null)
+            [ -z "$_turl" ] && _turl=$(uci -q get "${PODKOP_UCI}.${_ch}.urltest_testing_url" 2>/dev/null)
+            _tint=$(uci -q get "${PODKOP_UCI}.${_ch}.check_interval" 2>/dev/null)
+            [ -z "$_tint" ] && _tint=$(uci -q get "${PODKOP_UCI}.${_ch}.urltest_check_interval" 2>/dev/null)
+            _ttol=$(uci -q get "${PODKOP_UCI}.${_ch}.tolerance" 2>/dev/null)
+            [ -z "$_ttol" ] && _ttol=$(uci -q get "${PODKOP_UCI}.${_ch}.urltest_tolerance" 2>/dev/null)
+            _tie=$(uci -q get "${PODKOP_UCI}.${_ch}.interrupt_exist_connections" 2>/dev/null); [ -z "$_tie" ] && _tie=1
+            send_or_edit "$mid" "$(printf '%s <b>Настройки URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Адрес проверки:</b> <code>%s</code>\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск задержки:</b> <code>%s</code> мс\n<b>Разрывать соединения при переключении:</b> %s' "$E_TGT" "$sec" "$_ch" "$(html_escape "${_turl:-gstatic (по умолчанию)}")" "${_tint:-3m}" "${_ttol:-50}" "$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"fkut_u_${_ch}\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkut_i_${_ch}\"}],[{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"fkut_t_${_ch}\"},{\"text\":\"$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkut_e_${_ch}_$( [ "$_tie" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+            ;;
+        "fkut_u_"*|"fkut_i_"*|"fkut_t_"*)
+            local _ch _st _what
+            case "$cmd" in
+                fkut_u_*) _ch="${cmd#fkut_u_}"; _st="wait_fkut_u_${_ch}"; _what="адрес проверки (URL, например <code>https://www.gstatic.com/generate_204</code>)" ;;
+                fkut_i_*) _ch="${cmd#fkut_i_}"; _st="wait_fkut_i_${_ch}"; _what="интервал проверки: <code>3m</code>, <code>180s</code>, <code>1h</code>" ;;
+                fkut_t_*) _ch="${cmd#fkut_t_}"; _st="wait_fkut_t_${_ch}"; _what="допуск задержки в мс, например <code>50</code>" ;;
+            esac
+            _fk_child_owned "$_ch" "urltest" "$sec" || { CB_ANSWER_TEXT="URLTest не текущей секции"; return; }
+            echo "$_st" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s Отправьте %s.' "$E_EDIT" "$_what")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
+            ;;
+        "fkut_e_"*)
+            local _rest="${cmd#fkut_e_}" _ch _nv _rc
+            _ch="${_rest%_[01]}"; _nv="${_rest##*_}"
+            _fk_child_set "$_ch" "urltest" "$sec" "interrupt_exist_connections" "$_nv"; _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                _handle_forkop_ext "fk_ut_ed_${_ch}" "$mid" "" ""
+            else
+                _fk_txn_report "$_rc" "$mid" "fk_ut_ed_${_ch}"
+            fi
+            ;;
+    esac
+}
+
 _handle_dns() {
     local cmd="$1" mid="$2" text="$3" state="$4"
 
@@ -8658,6 +9632,10 @@ EOF
 
         elif [ "$state" = "wait_excl_ip" ]; then
             delete_message "$mid"
+            if [ "$PODKOP_VARIANT" = "forkop" ]; then
+                forkop_readonly_notice "" "community_lists" "Глобальные IP-исключения (Forkop использует Bypass-секции)"
+                return
+            fi
             local _res="" _added=0 _line _ip
             while IFS= read -r _line || [ -n "$_line" ]; do
                 _ip=$(printf "%s" "$_line" | tr -d '\t \r')
@@ -8704,8 +9682,11 @@ EOF
                 return
             fi
             if [ "$state" = "wait_remote_domain" ]; then
-                # Plus: write to domain_ip_lists (what LuCI uses); original: remote_domain_lists
-                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                # Plus-like (Plus, Forkop) bind domain_ip_lists in their LuCI UI.
+                # Forkop's backend also still imports the legacy remote_domain_lists,
+                # so writing there isn't lost — but it wouldn't show up in LuCI,
+                # so keep bot and LuCI on the same field.
+                if _variant_is_plus_like; then
                     uci add_list ${PODKOP_UCI}.${sec}.domain_ip_lists="$safe_link"
                 else
                     uci add_list ${PODKOP_UCI}.${sec}.remote_domain_lists="$safe_link"
@@ -8909,9 +9890,11 @@ EOF
             cd_count=$(_user_list_count "$sec" "user_domains" "user_domain_list_type")
             sn_count=$(_user_list_count "$sec" "user_subnets" "user_subnet_list_type")
             fr_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.fully_routed_ips=")
-            # Plus: LuCI writes combined lists to domain_ip_lists; legacy remote_domain/subnet_lists also read
+            # Plus-like (Plus, Forkop): LuCI writes combined lists to domain_ip_lists;
+            # legacy remote_domain/subnet_lists are also read. Must match the write
+            # gate above, or entries added on Forkop wouldn't be counted here.
             local _dip_count=0
-            if [ "$PODKOP_VARIANT" = "plus" ]; then
+            if _variant_is_plus_like; then
                 _dip_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.domain_ip_lists=")
             fi
             r_dom_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.remote_domain_lists=")
@@ -8947,11 +9930,12 @@ EOF
             # Use safe_set_args for list parsing (glob-safe; uci get N broken on BusyBox)
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
-                # Merge remote_domain_lists + domain_ip_lists (Plus)
+                # Merge remote_domain_lists + domain_ip_lists (Plus-like)
                 local _rdl_raw _dip_raw
                 _rdl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
                 _dip_raw=""
-                [ "$PODKOP_VARIANT" = "plus" ] &&                     _dip_raw=$(uci -q show ${PODKOP_UCI}.${sec}.domain_ip_lists 2>/dev/null | cut -d= -f2-)
+                _variant_is_plus_like && \
+                    _dip_raw=$(uci -q show ${PODKOP_UCI}.${sec}.domain_ip_lists 2>/dev/null | cut -d= -f2-)
                 raw=$(printf '%s
 %s' "$_rdl_raw" "$_dip_raw" | grep -v "^[[:space:]]*$")
                 [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
@@ -9151,6 +10135,15 @@ EOF
 
         "excl_ips_edit")
             rm -f "$STATE_FILE"
+            if [ "$PODKOP_VARIANT" = "forkop" ]; then
+                # Forkop removed settings.routing_excluded_ips (its migration even
+                # deletes the option); exclusions are Bypass sections/rules there.
+                local _fk_ex
+                _fk_ex=$(uci -q show ${PODKOP_UCI}.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2- | tr -d "'")
+                [ -z "$_fk_ex" ] && _fk_ex="__EMPTY__"
+                forkop_readonly_notice "$mid" "community_lists" "Глобальные IP-исключения (Forkop использует Bypass-секции)" "$_fk_ex"
+                return
+            fi
             local rows="" ip raw text kb excl_count=0
             raw=$(uci -q show ${PODKOP_UCI}.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
             [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
@@ -9170,6 +10163,10 @@ EOF
             ;;
 
         "del_excl_"*)
+            if [ "$PODKOP_VARIANT" = "forkop" ]; then
+                forkop_readonly_notice "$mid" "community_lists" "Глобальные IP-исключения (Forkop использует Bypass-секции)"
+                return
+            fi
             local ip="${cmd#del_excl_}"
             if ! validate_ip_or_cidr "$ip"; then
                 send_or_edit "$mid" "$(printf '%s Некорректный IP.' "$E_ERR")" ""; return
@@ -9325,6 +10322,10 @@ EOF
             ;;
 
         "cmd_add_excl_ip")
+            if [ "$PODKOP_VARIANT" = "forkop" ]; then
+                forkop_readonly_notice "$mid" "community_lists" "Глобальные IP-исключения (Forkop использует Bypass-секции)"
+                return
+            fi
             echo "wait_excl_ip" > "$STATE_FILE"
             send_or_edit "$mid" "$(printf '%s <b>Добавить IP-исключение маршрутизации</b>\n\nОтправьте IP или CIDR.\nЭтот IP всегда будет направляться в обход туннеля.\nПример: <code>10.0.0.0/8</code>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"excl_ips_edit\"}]]}"
@@ -9640,7 +10641,7 @@ _handle_fallback_socks() {
                     echo "timeout"
                 fi
             }
-            local lat; lat=$(_probe_fast "socks5h://${_t_ip}:${_t_port}")
+            local lat; lat=$(_probe_fast "socks5h://${_t_auth}${_t_ip}:${_t_port}")
             case "$lat" in timeout|fail) result_text="${result_text}${E_ERR} Основной Podkop: <code>$lat</code>\n" ;;
                 *) result_text="${result_text}${E_ON} Основной Podkop: <code>$lat</code>\n" ;; esac
             for _fb in $_t_fb_socks; do
@@ -9902,14 +10903,19 @@ EOF
             proxies=$(clash_request "/proxies")
             active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             # Truncate proxy display for Status (full URI in Runtime Info).
-            # POSIX/BusyBox-safe: do not use ${var:0:N}; some OpenWrt ash builds
-            # abort with "bad substitution" at runtime, which killed cmd_status.
-            if [ "$(printf '%s' "$active_proxy_display" | wc -c | tr -d ' ')" -gt 40 ]; then
-                # For "subscription · urltest → Node (tag)" — strip (tag) part first,
-                # then truncate at 38 chars if still too long
-                active_proxy_display=$(printf '%s' "$active_proxy_display" | sed 's/ ([^)]*)$//')
-                if [ "$(printf '%s' "$active_proxy_display" | wc -c | tr -d ' ')" -gt 38 ]; then
-                    active_proxy_display="$(printf '%s' "$active_proxy_display" | cut -c1-36)…"
+            # Counted in CHARACTERS, not bytes — see _utf8_head. The old byte
+            # budget of 40 cut a country flag in half (the reported "◆" glyph)
+            # and clipped Cyrillic names at ~20 letters.
+            if [ "$(_utf8_len "$active_proxy_display")" -gt 56 ]; then
+                # For "Node (tag)" — drop the "(tag)" part first. Strip from the
+                # FIRST " (" (%% = longest suffix): subscription tags routinely
+                # contain their own parentheses, and stripping from the last " ("
+                # would cut inside the tag and leave an unbalanced bracket.
+                case "$active_proxy_display" in
+                    *' ('*')') active_proxy_display="${active_proxy_display%% (*}" ;;
+                esac
+                if [ "$(_utf8_len "$active_proxy_display")" -gt 56 ]; then
+                    active_proxy_display="$(_utf8_head "$active_proxy_display" 54)…"
                 fi
             fi
             pub_ip_display=$(get_public_ip_display)
@@ -11285,7 +12291,7 @@ EOF
                 echo "Podkop: ${p_ver:-неизвестно}"
                 echo "sing-box: ${sb_ver}"
                 echo ""
-                echo "=== Активная секция ==="
+                echo "=== Рабочая секция бота ==="
                 echo "$sec"
                 echo ""
                 echo "=== Состояние Podkop ==="
@@ -11506,6 +12512,17 @@ EOF
 
         "cmd_check_update")
             local p_ver latest text kb
+            # Podkop Plus has migrated to Forkop upstream: ushan0v/podkop-plus is a
+            # renamed repo (API answers 301; raw serves Forkop's installer). There
+            # will be no further Plus releases, and "updating" from that repo would
+            # actually run Forkop's installer — a package/UCI-namespace migration,
+            # not an update. Say so honestly instead of "GitHub недоступен", and
+            # never offer a one-click "update" that is really a migration.
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Podkop Plus переехал в Forkop.</b>\n\nРепозиторий <code>ushan0v/podkop-plus</code> переименован в <code>ushan0v/forkop</code>; новых релизов Plus не будет.\n\nПереход на Forkop — это миграция (другой пакет и конфигурация <code>forkop</code>), а не обновление. Выполняйте её осознанно по инструкции Forkop; после миграции перезапустите бота: <code>/etc/init.d/podkop_bot restart</code> — он определит Forkop автоматически.' "$E_IDEA")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_maintenance\"}]]}"
+                return
+            fi
             send_or_edit "$mid" "$(printf '%s Проверяем доступность GitHub…' "$E_TIME")" ""
             p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
@@ -11578,6 +12595,16 @@ EOF
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
+            # Safety: on Plus, the renamed podkop-plus repo now serves Forkop's
+            # installer over raw (HTTP 200, no visible redirect). Running it would
+            # silently migrate the router to a different package/UCI namespace.
+            # A stale "Установить обновление" button must not do that.
+            if [ "$PODKOP_VARIANT" = "plus" ] && grep -q 'REPO_NAME="forkop"' "$_upd_tmp" 2>/dev/null; then
+                rm -f "$_upd_tmp"
+                send_or_edit "$mid" "$(printf '%s <b>Это установщик Forkop, а не обновление Plus.</b>\n\nPodkop Plus переехал в Forkop; репозиторий отдаёт установщик Forkop. Переход — это миграция (другой пакет и конфигурация), выполняйте её осознанно по инструкции Forkop, не через кнопку обновления.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_maintenance\"}]]}"
+                return
+            fi
             # Pre-flight "проверятор": confirm (over forced IPv4) that the feed
             # and GitHub raw are reachable. If they aren't even with -4, it's a
             # real egress block — tell the user instead of letting opkg/apk hang.
@@ -11603,21 +12630,46 @@ EOF
             # at public IPv4 DNS for the install; restore on exit (subshell trap
             # keeps the parent's traps untouched and guarantees restore).
             #
-            # Some forks' install.sh (observed: NetShift migrating a leftover
-            # podkop config/package remnant) ask an interactive (yes/no)
-            # confirmation before proceeding. Invoked from the bot there's no
-            # attached terminal — stdin is empty/closed, the read gets EOF,
-            # and the script treats that as "no" and exits (exit 1, no actual
-            # error, just an unanswerable prompt). The user already opted into
-            # "update podkop" by tapping the button, so auto-confirm: feed an
-            # endless "yes" stream into stdin. Portable to plain BusyBox ash
-            # (no dependency on the external `yes` applet, which may be
-            # trimmed out of a minimal build) — the loop dies on SIGPIPE the
-            # moment the script stops reading (finishes or never prompts).
+            # Some forks' install.sh ask interactive (yes/no) confirmations.
+            # Invoked from the bot there is no attached terminal, so we feed an
+            # answer stream into stdin. That answer is "n", NOT "yes".
+            #
+            # Auto-"yes" was actively dangerous — verified against all three
+            # upstream installers. podkop and netshift use a bare `read -r`
+            # with no tty check, so our stream IS their answer:
+            #   * "Continue? (yes/no)" on a pre-0.7.0 (podkop) / pre-0.8.0
+            #     (netshift) config → moves /etc/config/<pkg> aside and pulls
+            #     the default one. The installer warns the user will have to
+            #     reconfigure from scratch; "yes" confirmed that silently.
+            #   * "https-dns-proxy detected. Remove?" → uninstalled a
+            #     third-party package without asking anyone.
+            #   * netshift only: "Continue migration to NetShift?" whenever a
+            #     podkop artifact is present → removed podkop and swapped the
+            #     routing backend.
+            #   * The Russian-translation prompt accepts ONLY `y` or `n`. The
+            #     string "yes" matched neither, hit `*)`, printed a hint and
+            #     looped — forever, appending to a log in /tmp, i.e. router RAM.
+            #
+            # "n" is safe everywhere: the destructive prompts take their `*)`
+            # branch (`msg "Exit"; exit 1` — update aborts, nothing destroyed)
+            # and the translation prompt takes `n)` and continues. A routine
+            # update asks nothing at all and is unaffected. If a prompt does
+            # fire, the update stops with a non-zero exit and the log tail below
+            # shows the installer's own "Exit" line, so the user is told rather
+            # than having the decision made for them.
+            #
+            # Do NOT replace this with </dev/null: `read` returns empty at EOF,
+            # which lands in the same `*)` branch and re-loops. The stream stays
+            # infinite for that reason; it is written as a loop rather than the
+            # `yes` applet, which minimal BusyBox builds may omit, and it dies
+            # on SIGPIPE as soon as the installer stops reading.
+            #
+            # ushan0v/forkop is unaffected either way — every prompt there is
+            # guarded by `[ ! -t 0 ]` and self-answers when stdin is not a tty.
             (
                 trap '_resolv_v4_restore' EXIT INT TERM
                 _resolv_v4_override
-                { while :; do printf 'yes\n'; done; } | sh "$_upd_tmp"
+                { while :; do printf 'n\n'; done; } | sh "$_upd_tmp"
             ) >"$_upd_log" 2>&1
             local _exit=$?
             _resolv_v4_restore   # belt-and-suspenders if the subshell was killed
@@ -11937,6 +12989,8 @@ handle_command() {
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_url_link)
                 _handle_url_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
+            wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*)
+                _handle_forkop_ext "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fully_routed_ip|wait_excl_ip|wait_remote_domain|wait_remote_subnet|\
             wait_user_domain_add|wait_user_domain_del|wait_user_subnet_add|wait_user_subnet_del|\
             wait_utfilter_exc_*|wait_utfilter_inc_*|wait_dpi_strategy_*)
@@ -11999,6 +13053,12 @@ handle_command() {
         urltest_links_menu|urltest_links_p_*|cmd_utl_add|ask_del_utl_*|do_del_utl_*|\
         cmd_clone_sel_to_utl|cmd_clone_utl_to_sel|\
         cmd_set_mixed_port|cmd_set_outbound_iface|\
+        fk_conds|fk_c_*|fkc_add_*|fkc_del_*|fk_dev_list|fk_dev_a_*|\
+        fk_detour|fkd_t_*|fkd_pick|fkd_s_*|\
+        fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
+        fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*)
+            _handle_forkop_ext "$cmd" "$mid" "" "" ;;
+
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
             _handle_section_extras "$cmd" "$mid" "" "" ;;

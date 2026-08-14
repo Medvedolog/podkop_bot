@@ -1,14 +1,12 @@
-# 🤖 podkop_bot v0.18.1
+# 🤖 podkop_bot v0.19.2
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
 Поддерживает варианты podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus (новый пакет/сервис/UCI namespace `forkop`). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
 
-С 0.18.x верии интерфейс бота - на русском языке. 
+> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант — детект (перед `plus`), пути/пакет/repo `forkop`, домен FakeIP-проверки `fakeip.podkop.fyi` (канон в исходниках Forkop; проверяются оба домена, т.к. его можно переопределить через `FAKEIP_TEST_DOMAIN`). Мониторинг и диагностика — наравне с Plus. Управление: замена URL подписки и действие секции (`connection`/`bypass`/`block`/`zapret`) — нативно; структурные операции (создание/удаление дочерних секций URLTest, правки подсетей через rule-модель) — пока read-only с честным показом текущего конфига и отсылкой в LuCI. После ручной миграции Plus→Forkop во время работы бота перезапустите его: `/etc/init.d/podkop_bot restart`.
 
-> **Forkop (переезд Podkop Plus → Forkop):** поддерживается как отдельный вариант-форк. 
-
-> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, удобное администрирование бота через веб и тестирование активных маршрутов.  Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
+> 🖥️ **Веб-интерфейс:** есть отдельный пакет **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)** — LuCI-панель для настройки бота (токен, admin_ids, транспорт, алерты, расписания) и просмотра Runtime Info в браузере, для тех, кто предпочитает веб вместо Telegram. Ставится тем же `install.sh` (флаг `--with-luci`). Подробнее — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md) (English: [CHANGELOG.md](CHANGELOG.md))
 
@@ -80,31 +78,41 @@ Telegram-бот для удалённого управления [podkop](https:
 
 ## 🔀 Поддержка форков podkop
 
-| Функция | original | evolution / netshift | plus |
-|---------|:--------:|:--------------------:|:----:|
-| Управление сервисом (старт/стоп/reload) | ✅ | ✅ | ✅ |
-| Outbound Selector — просмотр и переключение | ✅ | ✅ | ✅ |
-| Добавление / удаление ссылок | ✅ | ✅ | ✅ |
-| Single URL (proxy_string) | ✅ | ✅ | ✅ |
-| Subscription URL (просмотр, замена) | ❌ | ✅ | ✅ |
-| Ручные ссылки в subscription-секции | ❌ | ❌ | ✅ |
-| URLTest Filters (страна, regex) | ❌ | ❌ | ✅ |
-| Трафик и срок подписки | ❌ | ❌ | ✅ |
-| Zapret / ByeDPI секции | ❌ | ❌ | ✅ |
-| Close All Connections | ❌ | ❌ | ✅ |
-| Service Lists (готовые наборы) | ✅ | ✅ | ✅ |
-| Domain/Subnet List URLs | ✅ | ✅ | ✅ |
-| My Domains / My Subnets | ✅ | ✅ | ✅ |
-| Rule Sets (rule_set, rule_set_with_subnets) | ❌ | ❌ | 👁 только просмотр |
-| Версии zapret / byedpi в Status | ❌ | ❌ | ✅ |
-| Версия Zapret2 в Maintenance | ❌ | ❌ | ✅ |
-| Server Instances (live статус серверов) | ❌ | ❌ | ✅ |
-| Ежедневный отчёт | ✅ | ✅ | ✅ |
-| Watchdog и Tunnel Health | ✅ | ✅ | ✅ |
-| Diagnostics / Support Bundle | ✅ | ✅ | ✅ |
-| NetShift selector_text / urltest_text | ❌ | 👁 read-only | ❌ |
-| NetShift multi-subscription URL (list) | ❌ | ✅ | ❌ |
+| Функция | original | evolution / netshift | plus | forkop |
+|---------|:--------:|:--------------------:|:----:|:------:|
+| Управление сервисом (старт/стоп/reload) | ✅ | ✅ | ✅ | ✅ |
+| Outbound Selector — просмотр и переключение | ✅ | ✅ | ✅ | ✅ |
+| Добавление / удаление ссылок | ✅ | ✅ | ✅ | 👁 read-only |
+| Single URL (proxy_string) | ✅ | ✅ | ✅ | 👁 read-only |
+| Subscription URL (просмотр, замена) | ❌ | ✅ | ✅ | ✅ дочерние секции |
+| Ручные ссылки в subscription-секции | ❌ | ❌ | ✅ | 👁 read-only |
+| Действие секции (туннель/обход/блок/DPI) | ✅ | ✅ | ✅ | ✅ |
+| URLTest Filters (страна, regex) | ❌ | ❌ | ✅ | ❌ до проверки на железе |
+| Трафик и срок подписки | ❌ | ❌ | ✅ | ✅ |
+| Zapret / ByeDPI секции | ❌ | ❌ | ✅ | ✅ |
+| Zapret2 секции (своё меню) | ❌ | ❌ | ❌ | ❌ в планах |
+| Close All Connections | ❌ | ❌ | ✅ | ✅ |
+| Service Lists (готовые наборы) | ✅ | ✅ | ✅ | ✅ |
+| Domain/Subnet List URLs | ✅ | ✅ | ✅ | ✅ |
+| My Domains / My Subnets | ✅ | ✅ | ✅ | 👁 read-only |
+| Переключение режима Selector ↔ URLTest | ✅ | ✅ | ✅ | 👁 read-only |
+| Настройки URLTest (существующей) | ✅ | ✅ | ✅ | ✅ редактор child |
+| Настройки DNS-резолвера / интерфейсов | ✅ | ✅ | ✅ | 👁 read-only |
+| Условия секции (домены/IP/порты/устройства) | ❌ | ❌ | ❌ | ✅ |
+| Каскад через другую секцию (detour) | ❌ | ❌ | ❌ | ✅ |
+| Настройки источника подписки (интервал и пр.) | ❌ | ❌ | ❌ | ✅ |
+| Rule Sets (rule_set, rule_set_with_subnets) | ❌ | ❌ | 👁 только просмотр | ❌ пока нет |
+| Версии zapret / byedpi в Status | ❌ | ❌ | ✅ | ✅ |
+| Версия Zapret2 в Maintenance | ❌ | ❌ | ✅ | ✅ |
+| Server Instances (live статус серверов) | ❌ | ❌ | ✅ | ✅ |
+| Ежедневный отчёт | ✅ | ✅ | ✅ | ✅ |
+| Watchdog и Tunnel Health | ✅ | ✅ | ✅ | ✅ |
+| Diagnostics / Support Bundle | ✅ | ✅ | ✅ | ✅ |
+| NetShift selector_text / urltest_text | ❌ | 👁 read-only | ❌ | ❌ |
+| NetShift multi-subscription URL (list) | ❌ | ✅ | ❌ | ❌ |
 
+
+> **Forkop:** мониторинг и диагностика — наравне с Plus. Подписки редактируются нативно через дочерние секции (`config subscription_url`), действие секции пишется в `action`. Операции, помеченные 👁, требуют создания/удаления дочерних секций или правил Forkop — бот показывает текущее состояние конфига и отправляет в LuCI, вместо записи в поля, которые backend игнорирует.
 
 > **NetShift:** базовое управление полностью поддерживается. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, `selector_text`/`urltest_text` режимы) — отображаются read-only, редактируются в LuCI. После обновления с podkop-evolution на NetShift бот автоматически переключает runtime.
 
@@ -117,7 +125,7 @@ wget -O /tmp/install_podkop_bot.sh https://raw.githubusercontent.com/Medvedolog/
 ash /tmp/install_podkop_bot.sh
 ```
 
-Установщик автоматически определяет вариант podkop (original / evolution / netshift / plus), устанавливает зависимости (`curl`, `jq`) и поддерживает **4 интерактивных режима**:
+Установщик автоматически определяет вариант podkop (original / evolution / netshift / plus / forkop), устанавливает зависимости (`curl`, `jq`) и поддерживает **4 интерактивных режима**:
 
 1. **Update** — обновить скрипт, сохранить конфиг
 2. **Reinstall** — переустановить с новыми настройками
@@ -187,7 +195,7 @@ ash install.sh --unattended --action update-luci
 ## 📋 Требования
 
 * OpenWrt 24.x / 25.x или ImmortalWrt
-* Установленный и настроенный podkop (original, netshift/evolution или plus) 0.7.x с включённым Mixed Proxy Port
+* Установленный и настроенный podkop (original, netshift/evolution, plus или forkop) 0.7.x с включённым Mixed Proxy Port
 * Пакеты: `curl`, `jq` (устанавливаются автоматически)
 * Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
 * TG User ID администратора(-ов) — например через [@Getmyid_Work_Bot](https://t.me/Getmyid_Work_Bot)
@@ -459,7 +467,7 @@ MIT
 
 ## 🇬🇧 Summary
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all three podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), and [plus](https://github.com/ushan0v/podkop-plus) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus; structural edits that require creating or removing Forkop child sections are read-only and direct you to LuCI.
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
@@ -467,6 +475,6 @@ The installer auto-detects the podkop variant, supports unattended mode (`--unat
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
 
-v0.15.7 adds **Weekly Report** (scheduled weekly digest with stability aggregates, traffic delta, subscription warnings, versions with mtime/hash, and bot config snapshot), **Upload Bot Script** (install bot updates via Telegram document — for testing patches without GitHub and routers behind ISP blocks), **Quiet Hours** (suppress watchdog alerts during configurable time range with overnight support), **Broadcast Alerts** / **RAM Alert** toggles, and 5-source public IP detection including Russian services for Crimea/RF. v0.15.5 adds **Server Instances** (Plus only) — live UCI-based status of sing-box server-mode inbounds with TCP+UDP port check — and **Daily Report** — a configurable scheduled Telegram digest with system stats, WAN/IP, TG connectivity, active outbound with country flag and last-switch info, sing-box restarts, traffic, bot transport chain, and Plus subscription data.
+v0.19.0 adds the **Forkop management MVP** — native writes for section conditions (domains/IPs/ports/devices), cascade **detour**, and **subscription source** settings, plus a **URLTest filter editor**, all guarded by transactional UCI writes (snapshot → commit → validate → automatic rollback on rejection). v0.19.2 is a P0 fix release: it eliminates a hang where the installer's endless prompt-filler could get stuck against a Russian-language y/n prompt during podkop self-update, and fixes UTF-8-safe truncation of country-flag emoji, mixed-proxy-auth transport on Forkop/Plus, and the FakeIP probe domain.
 
 Full [changelog](CHANGELOG.md) available.

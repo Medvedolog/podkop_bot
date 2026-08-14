@@ -2,6 +2,99 @@
 
 ---
 
+## v0.19.2
+
+- **FIXED (P0): endless "yes" piped into the fork installer.** Updating Podkop
+  from the bot fed the installer an endless `yes` stream. Verified against all
+  three upstream installers: `itdoginfo/podkop` and `yandexru45/netshift` read
+  stdin with a bare `read -r` and no tty check, so our stream was their answer.
+  "Continue? (yes/no)" on a pre-0.7.0/0.8.0 config silently moved
+  `/etc/config/<pkg>` aside and pulled the default one — the installer itself
+  warns the user will have to reconfigure from scratch. "https-dns-proxy
+  detected. Remove?" silently uninstalled a third-party package. NetShift's
+  "Continue migration to NetShift?" removed podkop and swapped the routing
+  backend whenever any podkop artifact was present. And the Russian-translation
+  prompt accepts ONLY `y` or `n`: the string "yes" matched neither, hit `*)`,
+  printed a hint and looped forever, appending to a log in /tmp — router RAM.
+  The stream is now `n`: destructive prompts take their `*)` branch
+  (`msg "Exit"; exit 1`, update aborts, nothing destroyed) and the translation
+  prompt takes `n)` and continues. Routine updates prompt for nothing and are
+  unaffected. `ushan0v/forkop` is unaffected either way — its prompts are
+  guarded by `[ ! -t 0 ]`. `</dev/null` is not a fix: `read` returns empty at
+  EOF and lands in the same `*)` branch, looping again.
+
+- **FIXED: the country flag was mangled in the status card.** The active-proxy
+  line was truncated by BYTES (`cut -c`) on a 40-byte budget. A flag such as 🇫🇮
+  is 8 bytes (two 4-byte regional indicators), so the cut landed inside the
+  sequence and rendered as a replacement glyph. The same byte budget also fired
+  far too early — 40 bytes is only ~20 Cyrillic letters. Added `_utf8_len` /
+  `_utf8_head`, which count characters and treat a regional-indicator pair as one
+  indivisible unit; the limit is now 56 characters. The trailing "(tag)" is now
+  stripped from the FIRST " (", because subscription tags contain their own
+  parentheses and the old regex silently failed on them.
+- **FIXED: local mixed-proxy authentication broke the transport.** Forkop and
+  Plus can put the local mixed/SOCKS inbound behind a login and password
+  (`mixed_proxy_auth_enabled`, `mixed_proxy_username`, `mixed_proxy_password` —
+  verified in `luci-app-forkop/.../section.js`). Every SOCKS endpoint was built
+  from ip:port only, so enabling auth in LuCI killed the Telegram transport on
+  all tiers with no usable diagnosis. Credentials are now read and inserted into
+  all 8 tier1 call sites and into auto-derived fallbacks, percent-encoded — a
+  password containing `@`, `:`, `/` or `#` would otherwise re-split the URL.
+- **FIXED: FakeIP probe domain for Forkop.** The primary was `fakeip.forkop.fyi`,
+  which appears nowhere in the Forkop repository; the canonical value is
+  `fakeip.podkop.fyi` (`core/constants.uc`, `singbox/constants.uc`,
+  `diagnostics/runtime.uc`). The first probe therefore always missed and the
+  tunnel check only passed on the fallback. The earlier claim that this was
+  "verified against core/constants.uc" was wrong. Both domains are still probed,
+  since `FAKEIP_TEST_DOMAIN` can override it.
+- **Minor review follow-ups (no version bump — 0.19.2 was never published):**
+  an empty submission in the node-prefix editor now clears `prefix_nodes`
+  (previously the flag stayed `1` with an empty `node_prefix`, so the UI read
+  "on" while the backend had nothing to prepend); the URLTest child name in the
+  picker keyboard is escaped with `json_escape`, matching every other keyboard
+  builder.
+
+## v0.19.1
+
+- **FIXED: the installer pointed at the relocated Podkop Plus repository.** The
+  "podkop is not installed" menu (`install.sh`, `INSTALLER_VERSION` 2.6.0 →
+  2.6.1) told a fresh router to install from `ushan0v/podkop-plus`, the
+  repository that was renamed to `forkop`. That contradicted the installer's own
+  logic (`detect_podkop_variant()` checks Forkop **before** Plus) and the bot,
+  which in 0.19.0 deliberately refuses to let an "update" silently migrate a
+  Plus box to Forkop. The menu now offers Forkop at
+  `https://raw.githubusercontent.com/ushan0v/forkop/refs/heads/main/install.sh`.
+  Detection is unchanged: an existing Podkop Plus install is still detected as
+  `plus` and fully supported — only the fresh-install recommendation moved. The
+  `podkop_variant_plus_line` string is kept and reworded for existing systems.
+
+## v0.19.0
+
+Forkop management MVP — per TZ_FORKOP_MVP, every field verified against forkop source.
+
+- **NEW: Section conditions (Forkop).** "Условия" screen: parent lists `domain` / `ip_cidr` / `ports` / `source_ip_cidr` — view, multiline add with per-type validation, delete by index. Devices are added from the DHCP client list with one tap. The text part of conditions (`*_text`) is shown read-only (the backend merges list and text; text is edited in LuCI). Writes run in the current shell, every `add_list` is checked, commit with revert.
+- **NEW: Cascade connection (Forkop).** "Через секцию": `outbound_detour_enabled` + pick `outbound_detour_section` among enabled sections with the tunnel action (current excluded), with a cycle check up to 8 hops.
+- **NEW: Subscription source settings (Forkop).** A ⚙ button per source: auto-update, interval, download via proxy, metadata, node prefix. This is a whitelisted child-UPDATE of an existing section — the first slice of the CRUD layer; creating/removing sources stays in LuCI.
+- **NEW: URLTest editor (Forkop).** "Настройки URLTest" instead of read-only: testing URL, interval, tolerance, interrupt-connections (canonical child option names). No create/delete/filters/Priority; with no child present, an honest "Selector mode" notice.
+- **HARDENING (0.19.0 review, source-verified): transactions, ownership, validation.** Every new write goes through a transaction: snapshot `/etc/config/forkop` → commit → reload; if Forkop's validator rejects the change the config is restored from the snapshot and reloaded again — the user sees an honest failure, not "saved". Child edits verify ownership (`option section` == active section), so a stale button can't modify another section's source/URLTest. "Домены" now follow the LuCI model: a bare line = `domain_suffix`, `full:` / `keyword:` / `regex:` prefixes route to their lists. Ports — `443` or `1000-2000` (dash, 1–65535). Intervals — full sing-box duration (`1h30m`); URLTest tolerance 0–10000. Subscription "via proxy" can only be enabled together with a transport pick (both options in one txn), same for the node prefix with its text. Detour re-validates the target at write time and walks ACTIVE detours with a visited set (no 8-hop cap). Multiple URLTest children get a picker instead of a silent first. A technical failure in batch add aborts the whole batch.
+- **FIXED (review 2, verified against LuCI's write path): "Conditions" moved to Forkop's canonical model.** LuCI stores domains and IPs as ONE multiline scalar (`option domain` with inline `full:`/`keyword:`/`regex:` prefixes, `option ip_cidr`) and unsets the legacy `domain_suffix`/`domain_keyword`/`domain_regex` lists and `*_text` on save. The bot previously wrote lists — the next LuCI save would have wiped them. Now reads merge scalar plus legacy leftovers, writes go to the scalar and clear legacy exactly as LuCI does; `ports` and `source_ip_cidr` remain UCI lists. The "Домены" counter covers all entry kinds.
+- **FIXED: the transaction no longer claims a restore that didn't happen.** Snapshot and rollback results are now checked and distinguished: applied · commit failed (config untouched) · Forkop rejected, rollback OK · snapshot failed (nothing was attempted) · Forkop rejected and rollback failed (message asks for manual inspection).
+- **FIXED: compound operations check every `uci set`.** Via-proxy + transport section, prefix + text, detour + target all go through a shared staging helper: a failure at any step drops the whole set before commit, so a half-applied intent can no longer "succeed".
+- **FIXED: transport picker broke on section names containing `_`.** The callback no longer concatenates two UCI ids — it carries a row index into a temporary mapping table.
+- **FIXED: strict URL validation** for the URLTest testing URL (scheme, non-empty host, no `?`/`#`/`@` in the host, port 1–65535) and validation of prefixed values (`full:` as a domain, `keyword:` charset).
+- **FIXED (review 3): legacy `domain_text` no longer widens the rule.** In Forkop that field means EXACT match and LuCI prefixes it with `full:` when combining. The bot imported it bare, silently extending the rule to every subdomain. The mapping now mirrors `loadCombinedDomainText`: `domain_text` → `full:`, `domain_keyword_text` → `keyword:`, `domain_regex_text` → `regex:`, base is the `domain` scalar or `domain_suffix_text`, duplicates removed.
+- **FIXED: `uci delete` is checked inside the transaction.** A failed delete of the old value used to be ignored, so the new set was appended to the old one while the bot reported success. Delete now distinguishes "option absent" from a real failure and aborts the whole operation.
+- **FIXED: transaction codes reach the UI.** Every button path reports the actual status instead of a blanket "Forkop rejected". Code 4 (rollback failed) additionally sends a full message asking the user to inspect the config — previously the UI claimed a rollback that hadn't happened.
+- **FIXED: the transport-picker mapping table is scoped to chat and message.** A shared file was overwritten by the next picker, so a stale button could select a different section than its own label.
+- **FIXED: comments in conditions survive.** Adding entries appends to the field's raw text instead of rebuilding it from parsed values, so `#` and `//` notes are kept.
+- **FIXED: an inner space is rejected, not glued.** `keyword:google ai` used to become `keyword:googleai`; only the edges are trimmed now.
+- **FIXED: node prefix is no longer cut mid-UTF-8.** Under `LC_ALL=C` truncation counted bytes and could split a character; an over-long value is now rejected with a clear message.
+- Rejected from the proposal: `sort_by_latency` — the field didn't exist in Forkop as of 0.19.0 (0 backend hits); it exists in current Forkop (`form.Flag`, `depends action=connection`) and display support is planned — the toggle would have been fake-success at the time.
+
+⚠ All four blocks are the bot's first writes into Forkop structures. Live-router validation is mandatory before release.
+
+---
+
 ## v0.18.1
 
 Polish release over the 0.18.0 RC — navigation, Forkop read-only correctness, and user-list write safety.
@@ -13,6 +106,19 @@ Polish release over the 0.18.0 RC — navigation, Forkop read-only correctness, 
 - **CHANGED: user-list writes are atomic.** Add/delete of domains/subnets go through a single writer that checks every `uci add_list`/`set`/`commit` result and reverts on any failure — no partial list left behind, no false "saved" + reload on error. Out-of-range delete indices are rejected; input that's all duplicates/invalid reports "nothing added" without a needless restart.
 - **FIXED: Forkop write-path guards cover the side doors.** Read-only guards on Forkop now cover the correct command names (`ask/do_del_ul_*`), the list menus and pagination, and the add/delete/download forms and state handlers — a stale or direct callback can no longer reach a legacy write on Forkop.
 - **CHANGED: "Action" button renamed for clarity.** The section-action `connection` button/label is now "Туннелировать" (tunnel the traffic); the config value `connection` is unchanged. "Готовые списки" replaces the machine-translated "Сообщества".
+- **FIXED: Forkop parity gaps where the variant was still compared to `plus` literally.** Each one degraded silently on Forkop: domain-list URLs were written to a legacy field that Forkop's LuCI doesn't bind (now `domain_ip_lists`, the field LuCI shows — write, count and viewer moved together); the Zapret/ByeDPI section menus and their enable toggle were unreachable on Forkop even though it ships those providers; the mode menu offered Forkop `url`/`outbound` modes it doesn't have and read the current mode from the parent flag instead of the child section.
+- **FIXED: multiline IP add moved to the safe write pattern.** `wait_fully_routed_ip` / `wait_excl_ip` no longer use a pipe-subshell (which makes `uci` staging unreliable in ash): the loop runs in the current shell, every `add_list` is checked, only real additions are counted, and the commit is verified with a revert on failure — no false "added" and no needless reload.
+- **FIXED: `sed -E` replaced with POSIX BRE** in proxy credential masking. BusyBox on some OpenWrt builds lacks `-E`, which made the masked address render empty in the transport chain, Tunnel Health and the startup notification.
+- **FIXED (source-verified audit): Podkop Plus repository migration.** `ushan0v/podkop-plus` was renamed to `forkop`: the update check on Plus no longer reports a false "GitHub unavailable" and instead explains the migration honestly; the "Install update" button (including a stale one from old messages) refuses to run an installer that identifies itself as Forkop — an "update" can no longer silently migrate the router to a different package.
+- **FIXED: global IP exclusions on Forkop are read-only.** `routing_excluded_ips` is dead in Forkop (its migration deletes the option): the screen, add form, input state and delete now show the leftover value and point to Bypass sections in LuCI instead of writing an ignored field. `fully_routed_ips` is live in Forkop and keeps working.
+- **FIXED: forkop-guard side doors.** `set_dr_type_*` (DNS resolver type) added to the read-only mask; child-section discovery tolerates uci builds that quote the section type.
+- **CHANGED: single source of variant environment.** The startup block duplicated `_apply_variant_env()`; startup now calls the function, so values can't drift after a same-session migration.
+- **FIXED: "active section" no longer lies or restarts Podkop.** Selecting a section only ever changed the bot's menu context (a /tmp file), yet promised to "activate" it and reloaded Podkop — on Forkop that implied an activation that doesn't exist (all enabled rules run simultaneously there). It is now "Рабочая секция бота": an honest confirmation and no reload.
+- **FIXED (from hardware, Plus): literal `\\n` regression in the proxy-mode card** — mode descriptions rendered with a literal `\\n` instead of a line break (introduced by the parity edit in this same version, caught on a live router).
+- **FIXED: URLTest filter buttons were truncated** — two-per-row labels now fit («Страны: искл./разреш.», «Прокси: искл./разреш.»).
+- **FIXED: filter/mode toggles felt frozen** — the redraw waited for the full Podkop restart (seconds on Plus); the screen now updates first, the reload runs after.
+- **CHANGED: URLTest terminology unified.** "Фильтры автовыбора" → "Фильтры URLTest" (matching the screen's own title), "Автовыбор прокси" → "Автовыбор (URLTest)".
+- **FIXED: two buttons shared one label.** In global settings the button opening the WAN-monitoring screen was labelled the same as the toggle — now "Настройки контроля WAN". The `bypass` label on Forkop is unified with the others.
 
 ---
 
