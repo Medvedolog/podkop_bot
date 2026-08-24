@@ -2,7 +2,121 @@
 
 ---
 
+## v0.19.9
+
+- **Stale URLTest drafts no longer overwrite parallel LuCI changes.** Both Podkop Plus and Forkop draft/apply editors now perform an optimistic-concurrency check immediately before staging a list replacement: the draft's saved base must still match live UCI. If the list changed in LuCI or another session, Apply is blocked, the stale draft is discarded, and the user is asked to reopen the editor.
+- **Podkop Plus URLTest picker from 0.19.8 is retained as the release baseline.** Countries and exact proxies use outbound metadata, draft checkboxes, a single validated reload and read-back verification; `disabled` / `exclude` / `include` / `mixed` and upstream country-detection semantics remain supported.
+- **Persistent traffic statistics from 0.19.8 are retained.** RAM remains the high-frequency accumulator while `podkop_bot.stats` stores six-hour checkpoints plus Daily/Weekly baselines across router reboots; manual reports do not move scheduled windows.
+- Version sources are synchronized to **0.19.9** for normal version-gated updates.
+
+## v0.19.8
+
+- **Podkop Plus URLTest filters now use the Forkop-style picker UX.** Countries and explicit proxies are selected with draft checkboxes and one Apply/reload. The primary source is native Plus outbound metadata (`outboundMetadata.names` / `get_outbound_metadata`), the same source used by LuCI; Clash API is fallback only. UCI lists are read back after reload for verification. All four upstream filter modes (`disabled`, `exclude`, `include`, `mixed`) are exposed, and country detection follows upstream `flag_emoji` / `country_is` semantics with `flag_emoji` as the default.
+- **Traffic statistics survive router reboots.** The high-frequency accumulator remains in `/tmp`, while a dedicated `podkop_bot.stats` UCI section stores a six-hour checkpoint plus Daily/Weekly baselines and last-report timestamps. Existing RAM baselines are migrated on upgrade. Manual Daily/Weekly reports are now read-only snapshots and do not move scheduled windows; the scheduled Weekly report also closes the skipped Daily window on its report day.
+- **Forkop: dedicated `action=dns` menu.** DNS routing sections no longer fall through to the generic proxy screen. The bot edits `dns_type` and `dns_server`, keeps conditions available, and deliberately leaves complex `dns_detour_*` editing to LuCI.
+- **Forkop: Priority Groups MVP.** `action=connection` sections can create `priority_group` children, add country (`flag_emoji`), Direct and catch-all fallback levels, reorder levels, and toggle `pick_fastest`, `switch_to_faster_same_priority`, and `interrupt_exist_connections`.
+- **Forkop: global DNS is now an ordered list.** `dns_server` and `bootstrap_dns_server` support add/delete/move operations with the same primary-to-backup ordering used by Forkop LuCI.
+- **Forkop: DNS input validation now mirrors upstream `validateDNS`.** Global DNS, Bootstrap DNS and `action=dns` reject malformed host/port/path values before staging or reload; accepted forms include IPv4/IPv6, domains, optional valid ports and DoH-style paths. Plain-text DNS messages are also deleted through `CALLBACK_MSG_ID`, so the intended cleanup works for text input.
+- **Forkop: `label` and `sort_by_latency`.** Section labels are read/edited and shown in the section picker; latency sorting is exposed for connection sections.
+- Includes the stabilized 0.19.7 hotfix line: native URLTest exclusions, safe two-phase Tailscale enrollment with wizard recovery/custom hostname/duplicate guard, and text-input return-to-menu UX fixes.
+- Scope stays intentionally compact: generic child CRUD, complex detour graphs, Rule Sets and JSON outbound editing remain in LuCI.
+
+## v0.19.7
+
+- **NEW: native Forkop URLTest exclusions from Telegram.** The bot now edits the
+  existing `urltest` child instead of reusing Podkop Plus parent fields. The
+  first practical slice supports `exclude_countries` and `exclude_outbounds`.
+- Proxy choices come from `/var/run/forkop/section-cache/<section>.json` →
+  `outboundMetadata.names`, the same source used by Forkop LuCI. Telegram
+  callbacks carry an index rather than arbitrary proxy names, so emoji, spaces
+  and long labels are safe; the picker is paginated.
+- Country choices use Forkop's `detect_server_country=flag_emoji` behaviour and
+  show only countries actually present among current URLTest candidates, with
+  per-country counts. A non-flag detection method is never overwritten silently.
+- The first exclusion promotes `filter_mode=disabled` to `exclude`. `mixed` is
+  preserved and only its exclude half is changed. Writes are blocked in
+  `include`, where Forkop does not apply `exclude_*`, avoiding a false-success UI.
+- Every child write re-checks ownership and uses the existing Forkop
+  snapshot/commit/reload/rollback transaction.
+- The public version jumps directly to **0.19.7** because 0.19.4–0.19.6 had
+  already existed as interim artifacts and must not be reused.
+
+## v0.19.3
+
+- **Diagnostics for Tailscale creation.** The bot stayed silent after the auth
+  key was submitted, and three code-level fixes did not help — static analysis
+  did not find the cause. The creation path now logs a breadcrumb to syslog at
+  every step: dispatcher state, branch entry, message deletion, URL recovered
+  from state, key length, section name, write call, transaction result.
+  No behaviour change; the goal is to locate where it stops.
+
+  To collect: submit the key, then run `logread | grep '\[ts\]' | tail -20`.
+
+- **FIXED (critical): adding a Tailscale node could wedge the bot completely.**
+  `safe_reload_podkop` called `${PODKOP_INIT} reload` with **no timeout**, and the
+  bot is single-threaded: a reload that never returns stopped the polling loop
+  entirely, so the bot answered no commands at all and the change could not be
+  undone from chat — only over SSH. The stall source: an enabled Tailscale
+  endpoint makes sing-box log in to its control server during startup, and if
+  that login hangs the backend start hangs with it — while the bot's own path to
+  Telegram runs through that same backend.
+  - `reload` is now bounded by `timeout 120` (falling back to a direct call where
+    `timeout` is unavailable). The timeout cannot fix the reload, but it hands
+    control back so the bot stays reachable and can report the failure.
+  - **The node is now created DISABLED.** Creation is a config-only step that does
+    not touch the network. Starting it is a separate, explicit action from the
+    card, with a warning that connectivity may drop.
+  - The card gained an enable/disable toggle for the node.
+
+- **FIXED: the Tailscale auth key was not deleted from the chat.** For plain text
+  the dispatcher deliberately passes an EMPTY `mid` (so `send_or_edit` never tries
+  to edit the user's own message), and `delete_message` silently no-ops on an
+  empty argument — the deletion was a no-op. It now uses `CALLBACK_MSG_ID`, which
+  carries `.message.message_id` for plain messages too.
+- **FIXED: the key was written to syslog.** The audit line logged the full message
+  body, so the pre-auth key persisted in the system log — which outlives the chat
+  message we delete. With state `wait_ts_key` the audit log and last-command file
+  now record `<secret redacted>`.
+- **FIXED: silence while applying.** `_fk_txn_commit_reload` restarts the routing
+  backend and this bot reaches Telegram through it (tier1 is the local mixed
+  proxy), so the transport is down between reload and confirmation. An
+  acknowledgement is now sent BEFORE the transaction.
+- **On numbering.** The 0.19.3–0.19.5 fixes were released under separate numbers
+  but never reached the repository, so they are collapsed into a single **0.19.3**.
+  Note: `_ver_is_newer` requires a strictly greater version
+  (`[ "$_o" = "$_n" ] && return 1`), so a router already running an interim 0.19.4
+  build will NOT accept this release via the update button — install it through
+  "install from local .sh file", which does not compare versions.
+
 ## v0.19.2
+
+
+- **NEW: adding a Tailscale server from the bot (Forkop).** Read-only rendering
+  already existed; this adds the write path. The wizard asks for the minimum —
+  control-plane URL, pre-auth key, exit-node flag — and lets Forkop default the
+  rest via `server_default_set_option`. The URL is asked for even though it has a
+  default, because that default points at Tailscale's cloud: on a self-hosted
+  control plane (Headscale, ionscale, …) silently accepting it would register the
+  node with the wrong network.
+  - **Gated before any write** by `singbox_supports_tailscale`, mirroring Forkop's
+    `sing_box_supports_tailscale` (`singbox/runtime.uc`): an `extended` build, or
+    the `with_tailscale` tag. This matters because Forkop rejects the WHOLE config
+    when a tailscale section exists on an unsupported build — a blind write would
+    take routing down, not merely fail to start the node. The button is hidden
+    where it could not work.
+  - **The key is a credential.** Its message is deleted BEFORE any validation, so
+    an early return cannot leave it in the chat history, and it never reaches the
+    status card, logs or diagnostics — `tailscale_auth_key` appears exactly twice
+    in the source: the UCI write and a comment.
+  - Key format is not validated: Headscale and ionscale keys are not `tskey-auth-*`
+    and Forkop itself only requires non-empty. The URL is checked the way LuCI
+    does (`validateHttpUrl`): http/https only.
+  - The node card gained "exit node" and "accept routes" toggles
+    (`tailscale_advertise_exit_node`, `tailscale_accept_routes`), written through
+    the same snapshot/rollback transaction.
+  - The confirmation says the exit node is "advertised", not "working": the
+    advertisement still has to be approved on the control server, which the bot
+    cannot see.
 
 - **FIXED (P0): endless "yes" piped into the fork installer.** Updating Podkop
   from the bot fed the installer an endless `yes` stream. Verified against all
@@ -89,7 +203,7 @@ Forkop management MVP — per TZ_FORKOP_MVP, every field verified against forkop
 - **FIXED: comments in conditions survive.** Adding entries appends to the field's raw text instead of rebuilding it from parsed values, so `#` and `//` notes are kept.
 - **FIXED: an inner space is rejected, not glued.** `keyword:google ai` used to become `keyword:googleai`; only the edges are trimmed now.
 - **FIXED: node prefix is no longer cut mid-UTF-8.** Under `LC_ALL=C` truncation counted bytes and could split a character; an over-long value is now rejected with a clear message.
-- Rejected from the proposal: `sort_by_latency` — the field didn't exist in Forkop as of 0.19.0 (0 backend hits); it exists in current Forkop (`form.Flag`, `depends action=connection`) and display support is planned — the toggle would have been fake-success at the time.
+- Rejected from the proposal: `sort_by_latency` — no such field exists in forkop (0 backend hits); the toggle would have been fake-success.
 
 ⚠ All four blocks are the bot's first writes into Forkop structures. Live-router validation is mandatory before release.
 

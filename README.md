@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.2
+# 🤖 podkop_bot 0.19.9
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.2-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.19.9-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -23,7 +23,11 @@
 
 > 🇷🇺 **Интерфейс бота — русский.** Начиная с v0.18.x все кнопки, карточки и уведомления переведены; переключателя языка нет, английской версии интерфейса тоже. Английскими остаются только технические термины, которые переводить и не стоит: названия протоколов, поля UCI, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`. Старые английские команды (`Menu`, `Status`) бот по-прежнему понимает — если у вас в чате осталась клавиатура от прежней версии, она не сломается.
 
-> **Forkop — что уже умеет бот.** Мониторинг и диагностика работают наравне с Plus. Нативно, прямо из Telegram, редактируются: URL подписки, действие секции (`connection`/`bypass`/`block`/`zapret`), условия секции (домены, IP, порты, устройства), каскад через другую секцию (detour), настройки источника подписки и параметры существующей URLTest. Всё остальное — то, что требует создавать или удалять дочерние секции и править правила по rule-модели, — бот пока честно показывает как есть и отправляет доделать в LuCI: писать в поля, которые backend всё равно проигнорирует, смысла нет.
+> **Forkop — что уже умеет бот.** Мониторинг и диагностика работают наравне с Plus. Нативно, прямо из Telegram, редактируются: URL подписки, действие секции (`connection`/`bypass`/`block`/`zapret`), условия секции (домены, IP, порты, устройства), каскад через другую секцию (detour), настройки источника подписки и параметры существующей URLTest.
+>
+> С 0.19.7 добавились штатные исключения из ротации существующей child-секции `urltest` — по странам и по конкретным прокси. В 0.19.8 к этому прибавились: отдельное меню для секций `action=dns`, глобальный DNS в виде упорядоченного списка (верхний основной, ниже резервные), метка секции `label`, переключатель `sort_by_latency` для connection-секций и компактный Priority Groups MVP — уровни по странам, Direct и финальный fallback «остальные».
+>
+> Всё остальное — то, что требует создавать или удалять дочерние секции и править правила по rule-модели, — бот пока честно показывает как есть и отправляет доделать в LuCI: писать в поля, которые backend всё равно проигнорирует, смысла нет.
 >
 > Вариант `forkop` проверяется раньше, чем `plus` — иначе после переезда бот принял бы новый пакет за старый. FakeIP-проверка ходит на `fakeip.podkop.fyi` (канон из исходников Forkop), но домен можно переопределить через `FAKEIP_TEST_DOMAIN`, поэтому проверяются оба. Если мигрировали с Plus на Forkop вручную, не останавливая бота, — перезапустите его: `/etc/init.d/podkop_bot restart`.
 
@@ -147,7 +151,7 @@
 | URL подписки (просмотр, замена) | ❌ | ✅ | ✅ | ✅ дочерние секции |
 | Свои ссылки в секции подписки | ❌ | ❌ | ✅ | 👁 только просмотр |
 | Действие секции (туннель / обход / блок / DPI) | ✅ | ✅ | ✅ | ✅ |
-| 🔬 Фильтры URLTest (страна, регулярка) | ❌ | ❌ | ✅ | ❌ до проверки на железе |
+| 🔬 Фильтры URLTest (страна, регулярка) | ❌ | ❌ | ✅ | 🧪 c 0.19.7: страны и прокси |
 | Трафик и срок подписки | ❌ | ❌ | ✅ | ✅ |
 | Секции Zapret / ByeDPI | ❌ | ❌ | ✅ | ✅ |
 | Секции Zapret2 (своё меню) | ❌ | ❌ | ❌ | ❌ в планах |
@@ -300,7 +304,7 @@ ash install.sh --unattended --action update-luci
 * **Защита при переключении в URL-режим** — бот удерживает reload до получения ссылки
 * **Auto-assign порта Mixed Proxy** при включении
 * URLTest: testing URL, интервал проверки, допуск задержки, список ссылок
-* **URLTest Filters** (только Plus): режим фильтрации, определение страны, скрытие отфильтрованных, списки исключений по стране и имени outbound
+* **🔬 Фильтры URLTest**: на Plus — полный редактор (режим фильтрации, определение страны, скрытие отфильтрованных, списки исключений по стране и имени прокси); на Forkop — штатное исключение стран и конкретных прокси из child-секции `urltest` через `exclude_countries` / `exclude_outbounds`. Выбор собирается черновиком и применяется одной кнопкой, а не перезагружает sing-box на каждый клик
 * Domain Resolver: включение, тип DNS, сервер — для каждой секции отдельно
 * Outbound Interface: привязка секции к конкретному интерфейсу
 
@@ -375,7 +379,8 @@ ash install.sh --unattended --action update-luci
 * Поддерживаемые протоколы: **VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale**
 * Для каждого инстанса: протокол, порт, публичный хост, режим безопасности (Reality/TLS/none) + SNI, режим маршрутизации
 * Статус порта: 🟢 слушает (TCP+UDP) · 🟡 включено в UCI, порт не обнаружен · ⚫ выключено
-* Tailscale: статус через sing-box процесс + state directory; IP — в панели Tailscale
+* Tailscale: статус через процесс sing-box и state directory; IP смотрите в панели Tailscale
+* **Добавление узла Tailscale прямо из бота (только Forkop)** — спрашивает адрес контрол-сервера, pre-auth ключ и нужен ли выходной узел; на карточке появляются тумблеры «выходной узел» и «принимать маршруты». Требуется сборка sing-box `extended` либо собранная с тегом `with_tailscale`: бот проверяет это до записи и просто не показывает кнопку там, где она не сработает. Адрес контрол-сервера спрашивается всегда — по умолчанию он ведёт в облако Tailscale, а так же работает и свой сервер (Headscale, ionscale). Узел создаётся **выключенным**: включение — отдельное осознанное действие, потому что поднятие Tailscale-endpoint заставляет sing-box логиниться на контрол-сервер при старте и может временно оставить вас без связи
 * Статистика соединений из Clash API (кол-во, ↓↑ трафик) при наличии
 * Кнопка в главном меню видна только на Podkop Plus
 
@@ -527,7 +532,7 @@ MIT
 
 > ⚠️ **The bot's interface is Russian only.** Every button, card and alert has been in Russian since v0.18.x — there is no language switch and no English UI. Only technical terms stay in English (protocol names, UCI fields, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`). This documentation and the changelog are bilingual; the bot itself is not.
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour and subscription-source settings; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour, subscription-source settings, existing URLTest child exclusions by country and proxy, ordered global DNS, `action=dns` sections, `label`, `sort_by_latency` and priority groups; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
@@ -535,6 +540,8 @@ The installer auto-detects the podkop variant, supports unattended mode (`--unat
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Меню | 📊 Статус`) is available at all times including during watchdog alerts.
 
-v0.19.0 adds the **Forkop management MVP** — native writes for section conditions (domains/IPs/ports/devices), cascade **detour**, and **subscription source** settings, plus a **URLTest filter editor**, all guarded by transactional UCI writes (snapshot → commit → validate → automatic rollback on rejection). v0.19.2 is a P0 fix release: it eliminates a hang where the installer's endless prompt-filler could get stuck against a Russian-language y/n prompt during podkop self-update, and fixes UTF-8-safe truncation of country-flag emoji, mixed-proxy-auth transport on Forkop/Plus, and the FakeIP probe domain.
+v0.19.0 introduced the **Forkop management MVP** — native writes for section conditions, cascade **detour** and **subscription source** settings, all guarded by transactional UCI writes (snapshot → commit → validate → automatic rollback on rejection). v0.19.7 added native **URLTest exclusions** for Forkop by country and by individual proxy, and v0.19.8 brought the same draft-and-apply picker to Podkop Plus, a dedicated menu for `action=dns` sections, ordered multi-DNS, `label`, `sort_by_latency`, a compact **Priority Groups** MVP, and traffic statistics that survive a reboot via a low-frequency UCI checkpoint (at most four flash writes a day). v0.19.9 protects that picker against concurrent edits: before applying, the draft's saved base is compared with current UCI, so a stale selection can no longer overwrite changes made meanwhile in LuCI.
+
+Adding a **Tailscale node from Telegram** is supported on Forkop, on sing-box builds that carry Tailscale support. The node is created disabled on purpose — bringing a Tailscale endpoint up makes sing-box log in to its control server during start, and the bot's own path to Telegram runs through that same backend.
 
 Full [changelog](CHANGELOG.md) available.
