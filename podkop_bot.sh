@@ -3055,10 +3055,45 @@ get_selector_link_by_index() {
 }
 
 # Atomic UCI commit with optional flock to prevent concurrent writes
+# UCI stages changes in a shared area, and `uci commit <pkg>` flushes everything
+# staged for that package — no matter which process staged it. Locking only the
+# commit therefore left the set→commit window open: a second writer committing in
+# the middle publishes our half-finished state. That is not theoretical here, the
+# same package is written by three processes: this loop, the watchdog daemon (the
+# 6-hourly stats checkpoint) and the LuCI rpcd backend. The list rewrites are the
+# sharp edge — delete the whole list, add entries back one by one — where an
+# outside commit lands a truncated list in the config.
+#
+# uci_txn_begin/uci_txn_end hold the lock across a whole sequence. The LuCI
+# backend takes the same file, otherwise half the writers ignore the lock.
+UCI_LOCK_FILE="/tmp/podkop_uci.lock"
+_UCI_TXN=0
+uci_txn_begin() {
+    command -v flock >/dev/null 2>&1 || return 0
+    exec 8>>"$UCI_LOCK_FILE" 2>/dev/null || return 0
+    # Bounded wait: a stuck holder must never freeze the polling loop. On timeout
+    # we proceed unlocked — a rare interleave beats a bot that stops answering.
+    if ! flock -x -w 10 8 2>/dev/null; then
+        exec 8>&- 2>/dev/null
+        logger -t podkop-bot "[UCI] Config lock busy for 10s; writing without it."
+        return 1
+    fi
+    _UCI_TXN=1
+    return 0
+}
+uci_txn_end() {
+    _UCI_TXN=0
+    exec 8>&- 2>/dev/null
+    return 0
+}
 uci_commit_safe() {
     local rc
-    if command -v flock >/dev/null 2>&1; then
-        ( flock -x 9; uci commit "$1"; exit $? ) 9>/tmp/podkop_uci.lock
+    if [ "${_UCI_TXN:-0}" = "1" ]; then
+        # Already inside a transaction; taking the lock again from a subshell
+        # would block on our own hold.
+        uci commit "$1"; rc=$?
+    elif command -v flock >/dev/null 2>&1; then
+        ( flock -x -w 10 9 || exit 1; uci commit "$1"; exit $? ) 9>>"$UCI_LOCK_FILE"
         rc=$?
     else
         uci commit "$1"; rc=$?
@@ -3940,8 +3975,15 @@ _traffic_checkpoint_maybe() {
         _age=$(( _now - _last ))
         [ "$_age" -lt "$TRAFFIC_CHECKPOINT_INTERVAL" ] 2>/dev/null && return 0
     fi
-    _traffic_stage_checkpoint || return 0
-    uci_commit_safe podkop_bot >/dev/null 2>&1 || true
+    # Runs in the watchdog daemon — a different process from the one handling
+    # commands. Its five `uci set` calls and the commit must not interleave with a
+    # settings edit happening in the main loop, or either side gets published
+    # half-done.
+    uci_txn_begin
+    if _traffic_stage_checkpoint; then
+        uci_commit_safe podkop_bot >/dev/null 2>&1 || true
+    fi
+    uci_txn_end
 }
 
 # Persist the baseline only for automatic reports. Manual reports are snapshots
@@ -13003,11 +13045,16 @@ _handle_fallback_socks() {
                         [ "$_nc" -eq "$_fb_edit_idx" ] && _ne="$safe_fb"
                         _newlist="${_newlist} ${_ne}"
                     done
+                    # Under one lock: between the delete and the last add_list the
+                    # list does not exist in full, and any other writer committing
+                    # this package would publish exactly that state.
+                    uci_txn_begin
                     uci -q delete podkop_bot.settings.fallback_socks 2>/dev/null
                     for _ne in $_newlist; do
                         uci add_list podkop_bot.settings.fallback_socks="$_ne"
                     done
                     uci_commit_safe podkop_bot
+                    uci_txn_end
                     _handle_fallback_socks "net_proxies_menu" "" "" ""
                 else
                     uci add_list podkop_bot.settings.fallback_socks="$safe_fb"
@@ -13287,6 +13334,10 @@ _handle_fallback_socks() {
                     n=$((n + 1))
                 done
                 if [ -n "$_del_val" ]; then
+                    # Delete, read back and (if needed) rebuild all under one lock:
+                    # the read-back is a decision point, and another writer landing
+                    # between it and the rebuild would make that decision stale.
+                    uci_txn_begin
                     uci del_list podkop_bot.settings.fallback_socks="$_del_val"
                     uci_commit_safe podkop_bot
                     # Verify — if del_list failed, rebuild without the index
@@ -13301,6 +13352,7 @@ _handle_fallback_socks() {
                         done
                         uci_commit_safe podkop_bot
                     fi
+                    uci_txn_end
                 fi
             fi
             _handle_fallback_socks "fallback_socks_menu" "$mid" "" ""

@@ -2,6 +2,11 @@
 
 ---
 ## v0.19.11
+- **FIXED: config edits from the bot and from the web panel could overwrite each other.** The `flock` on `/tmp/podkop_uci.lock` wrapped only `uci commit`, and the LuCI backend took no lock at all — so it protected the bot from itself, and only partly.
+
+  UCI stages changes in a shared area, and `uci commit <pkg>` flushes everything staged for that package regardless of who staged it. The window between `uci set` and `uci commit` was therefore open: another writer committing in the middle publishes our half-finished state. Three processes write `podkop_bot`: the bot's command loop, its watchdog (the 6-hourly stats checkpoint) and the LuCI rpcd backend.
+
+  List rebuilds are the sharp edge — both sides rewrite `fallback_socks` by deleting the list and adding entries back one at a time, so a commit landing in between leaves a truncated list in the config. `uci_txn_begin` / `uci_txn_end` now hold the lock across the whole sequence, and LuCI takes the same lock file. The wait is capped at 10 seconds: a stuck holder must not stall Telegram polling, so on timeout the write proceeds unlocked and says so in the log.
 - **FIXED: the Bot Settings card and the button counter ignored auto-added channels.** Both read the `fallback_socks` UCI list directly, but mixed proxies of other podkop sections are appended to the chain at runtime and never appear in that list. On a router with a `backup` section the bot had three channels, listed two, and labelled the button "· 1" — while actually routing through the tier it failed to mention. Both now read the same chain the transport walks, with podkop sections marked apart from the operator's own fallback SOCKS.
 
 - **FIXED: the URLTest filters card on Podkop Plus was unreadable.** It ended with a paragraph of release notes — "now selected as in Forkop", "the list comes from outbound metadata", "Clash API is only a fallback". That explains the change to someone who read the changelog; it tells someone configuring a filter nothing. Removed from the UI.
