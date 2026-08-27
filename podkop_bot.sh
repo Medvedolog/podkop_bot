@@ -14458,6 +14458,9 @@ EOF
             # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3, tier4, tier5.
             local tr_chain="" _tier=1 _fb_raw _fb _tier_key _tier_line
             _active_tier="$LAST_ROUTE_FAST"
+            # Unconditionally: the chain block below is skipped in "direct" mode,
+            # but the button counter further down needs _t_fb_socks either way.
+            _load_transport_ctx
 
             _fmt_tier() {
                 local _key="$1" _label="$2"
@@ -14472,17 +14475,30 @@ EOF
                 _mip_esc=$(html_escape "$m_ip")
                 tr_chain=$(_fmt_tier "tier1" "SOCKS5 (${_mip_esc}:${m_port})")
                 _tier=$((_tier + 1))
+                # Walk the chain the transport actually uses, not the raw UCI list.
+                # mixed_proxy of other podkop sections is auto-added as tier2 at
+                # runtime, so reading fallback_socks alone left those channels out
+                # of this list entirely — the bot would route through a tier the
+                # card never mentioned.
+                local _fb_explicit=0
                 _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_fb_raw" ]; then
                     { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
-                    local _fn=1
-                    for _fb in "$@"; do
-                        _fb_esc=$(html_escape "$(_proxy_display "$_fb")")
+                    _fb_explicit=$#
+                fi
+                local _fn=0
+                for _fb in $_t_fb_socks; do
+                    _fn=$((_fn + 1))
+                    _fb_esc=$(html_escape "$(_proxy_display "$_fb")")
+                    if [ "$_fn" -le "$_fb_explicit" ]; then
                         tr_chain="${tr_chain}
 $(_fmt_tier "tier2_${_fn}" "Резервный SOCKS (${_fb_esc})")"
-                        _tier=$((_tier + 1)); _fn=$((_fn + 1))
-                    done
-                fi
+                    else
+                        tr_chain="${tr_chain}
+$(_fmt_tier "tier2_${_fn}" "Секция podkop (${_fb_esc})")"
+                    fi
+                    _tier=$((_tier + 1))
+                done
             fi
             if [ "$cp" != "Not set" ]; then
                 _cp_esc=$(html_escape "$cp")
@@ -14555,11 +14571,14 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             # three separate rows here; they are one list now, so this is one entry
             # point. The suffix shows how many channels the chain has beyond tier1,
             # which is what the separate rows were really communicating.
-            local cp_sfx="" _cp_n=0
-            _cp_n=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | grep -c . )
-            case "$_cp_n" in ''|*[!0-9]*) _cp_n=0 ;; esac
+            # Count the channels that can actually carry traffic, which is what the
+            # screen behind this button lists: tier1, every tier2 (explicit AND the
+            # ones auto-added from other podkop sections), and the bot proxy.
+            # Counting only the raw UCI list said "1" on a router running three.
+            local cp_sfx="" _cp_n=1 _cp_fb
+            for _cp_fb in $_t_fb_socks; do _cp_n=$((_cp_n + 1)); done
             [ "$cp" != "Not set" ] && _cp_n=$((_cp_n + 1))
-            [ "$_cp_n" -gt 0 ] 2>/dev/null && cp_sfx=" · ${_cp_n}"
+            cp_sfx=" · ${_cp_n}"
             [ "$bi" = "Not set" ]                 && bi_btn="{\"text\":\"${E_ADD} Привязать интерфейс\",\"callback_data\":\"cmd_bind_iface\"}"                 || bi_btn="{\"text\":\"${E_DEL} Отвязать интерфейс\",\"callback_data\":\"cmd_clear_bind_iface\"}"
             [ "$st" = "1" ] && st_icon="$E_ON" || st_icon="$E_OFF"
             [ "$al" = "1" ] && al_icon="$E_ON" || al_icon="$E_OFF"

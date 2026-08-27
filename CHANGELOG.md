@@ -2,6 +2,7 @@
 
 ---
 ## v0.19.11
+- **FIXED: the Bot Settings card and the button counter ignored auto-added channels.** Both read the `fallback_socks` UCI list directly, but mixed proxies of other podkop sections are appended to the chain at runtime and never appear in that list. On a router with a `backup` section the bot had three channels, listed two, and labelled the button "· 1" — while actually routing through the tier it failed to mention. Both now read the same chain the transport walks, with podkop sections marked apart from the operator's own fallback SOCKS.
 
 - **FIXED: the URLTest filters card on Podkop Plus was unreadable.** It ended with a paragraph of release notes — "now selected as in Forkop", "the list comes from outbound metadata", "Clash API is only a fallback". That explains the change to someone who read the changelog; it tells someone configuring a filter nothing. Removed from the UI.
 - Every counter printed unconditionally, so an ordinary setup showed three rows of zeros. A row now appears only when it holds something, and when nothing is selected the card says plainly that the filter has no effect.
