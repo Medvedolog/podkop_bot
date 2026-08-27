@@ -1,6 +1,13 @@
 # Changelog
 
 ---
+## v0.19.11
+
+- **FIXED: the URLTest filters card on Podkop Plus was unreadable.** It ended with a paragraph of release notes — "now selected as in Forkop", "the list comes from outbound metadata", "Clash API is only a fallback". That explains the change to someone who read the changelog; it tells someone configuring a filter nothing. Removed from the UI.
+- Every counter printed unconditionally, so an ordinary setup showed three rows of zeros. A row now appears only when it holds something, and when nothing is selected the card says plainly that the filter has no effect.
+- The mode line now states what the mode does. The name alone ("исключение", "смешанный") does not say which proxies end up in the rotation, which is the only reason to open this screen.
+- `mixed` and `country_is` were printed verbatim in Latin script inside Russian text; they are now translated.
+
 ## v0.19.10
 
 Transport diagnostics. When the bot dropped to a direct connection, the support report gave no way to tell what had happened to the fallback proxy. Found on a live Forkop router.

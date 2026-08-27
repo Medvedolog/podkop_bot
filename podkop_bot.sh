@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.10
+# Podkop Telegram Bot v0.19.11
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.10"
+BOT_VERSION="0.19.11"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -8581,11 +8581,26 @@ EOF
                 disabled) _fm_disp="выключен"; _next_fm="exclude" ;;
                 exclude)  _fm_disp="исключение"; _next_fm="include" ;;
                 include)  _fm_disp="только выбранные"; _next_fm="mixed" ;;
-                mixed)    _fm_disp="mixed"; _next_fm="disabled" ;;
+                mixed)    _fm_disp="смешанный"; _next_fm="disabled" ;;
                 *)        _fm_disp="$_fm"; _next_fm="disabled" ;;
             esac
+            # What the mode actually does, in one line. The name alone
+            # ("исключение", "смешанный") does not say which proxies end up in
+            # the rotation, and that is the only thing this screen is about.
+            local _fm_hint
+            case "$_fm" in
+                disabled) _fm_hint="в ротации участвуют все прокси" ;;
+                exclude)  _fm_hint="участвуют все, кроме выбранных ниже" ;;
+                include)  _fm_hint="участвуют только выбранные ниже" ;;
+                mixed)    _fm_hint="сначала отбираются выбранные, затем из них убираются исключённые" ;;
+                *)        _fm_hint="" ;;
+            esac
             _dc=$(uci -q get "${PODKOP_UCI}.${sec}.detect_server_country" 2>/dev/null)
-            case "$_dc" in ''|flag_emoji|1) _dc_disp="по флагу" ;; country_is) _dc_disp="country_is" ;; *) _dc_disp="$_dc" ;; esac
+            case "$_dc" in
+                ''|flag_emoji|1) _dc_disp="по флагу" ;;
+                country_is)      _dc_disp="по названию страны" ;;
+                *)               _dc_disp="$_dc" ;;
+            esac
             _hide=$(get_uci_bool_emoji "${PODKOP_UCI}.${sec}" "urltest_hide_filtered_outbounds")
             _ec=$(_plus_urltest_list_read "$sec" urltest_exclude_countries | grep -c .); _ic=$(_plus_urltest_list_read "$sec" urltest_include_countries | grep -c .)
             _eo=$(_plus_urltest_list_read "$sec" urltest_exclude_outbounds | grep -c .); _io=$(_plus_urltest_list_read "$sec" urltest_include_outbounds | grep -c .)
@@ -8594,7 +8609,26 @@ EOF
             case "$_eo" in ''|*[!0-9]*) _eo=0 ;; esac; case "$_io" in ''|*[!0-9]*) _io=0 ;; esac
             case "$_er" in ''|*[!0-9]*) _er=0 ;; esac; case "$_ir" in ''|*[!0-9]*) _ir=0 ;; esac
             _token=$(_plus_urltest_token "$sec"); _plus_urltest_ctx_write "$_token" "$sec"
-            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n\n<b>Режим:</b> <code>%s</code>\n<b>Определение страны:</b> <code>%s</code>\n<b>Исключения:</b> страны %s · прокси %s\n<b>Только выбранные:</b> страны %s · прокси %s\n<b>Regex:</b> исключение %s · разрешение %s\n<b>Скрывать исключённые:</b> %s\n\n<i>Страны и прокси теперь выбираются как в Forkop: галочки меняют черновик, затем один «Применить» и один reload. Источник списка прокси — outbound metadata Podkop Plus, тот же, что использует LuCI; Clash API только fallback.</i>' "$E_TGT" "$sec" "$_fm_disp" "$_dc_disp" "$_ec" "$_eo" "$_ic" "$_io" "$_er" "$_ir" "$_hide")" \
+            # Only lines that carry information. The card used to print every
+            # category unconditionally, so a normal setup showed three rows of
+            # zeros, and closed with a paragraph of release notes explaining the
+            # implementation ("as in Forkop", "outbound metadata", "Clash API
+            # fallback") — none of which helps anyone choosing what to filter.
+            local _f_lines=""
+            if [ "${_ec:-0}" -gt 0 ] 2>/dev/null || [ "${_eo:-0}" -gt 0 ] 2>/dev/null; then
+                _f_lines="${_f_lines}$(printf '\n<b>Исключено:</b> стран %s · прокси %s' "$_ec" "$_eo")"
+            fi
+            if [ "${_ic:-0}" -gt 0 ] 2>/dev/null || [ "${_io:-0}" -gt 0 ] 2>/dev/null; then
+                _f_lines="${_f_lines}$(printf '\n<b>Только выбранные:</b> стран %s · прокси %s' "$_ic" "$_io")"
+            fi
+            if [ "${_er:-0}" -gt 0 ] 2>/dev/null || [ "${_ir:-0}" -gt 0 ] 2>/dev/null; then
+                _f_lines="${_f_lines}$(printf '\n<b>Regex:</b> исключение %s · разрешение %s' "$_er" "$_ir")"
+            fi
+            if [ -z "$_f_lines" ]; then
+                _f_lines=$(printf '\n<i>Ничего не выбрано — фильтр ни на что не влияет.</i>')
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>Отбирает прокси перед тем, как URLTest начнёт мерить задержку.</i>\n\n<b>Режим:</b> <code>%s</code>%s\n<b>Определение страны:</b> <code>%s</code>\n%s\n\n<b>Скрывать исключённые:</b> %s' \
+                "$E_TGT" "$sec" "$_fm_disp" "${_fm_hint:+$(printf ' — %s' "$_fm_hint")}" "$_dc_disp" "$_f_lines" "$_hide")" \
                 "{\"inline_keyboard\":[[{\"text\":\"Режим: ${_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"},{\"text\":\"🌍 ${_dc_disp}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],[{\"text\":\"🌍 Исключить страны\",\"callback_data\":\"puuc_${_token}_ec\"},{\"text\":\"🌍 Только страны\",\"callback_data\":\"puuc_${_token}_ic\"}],[{\"text\":\"🖥 Исключить прокси\",\"callback_data\":\"puuo_${_token}_eo_0\"},{\"text\":\"🖥 Только прокси\",\"callback_data\":\"puuo_${_token}_io_0\"}],[{\"text\":\"${_hide} Скрывать исключённые\",\"callback_data\":\"do_utfilter_toggle_hide\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
