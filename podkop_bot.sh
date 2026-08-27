@@ -8592,7 +8592,7 @@ EOF
                 disabled) _fm_hint="в ротации участвуют все прокси" ;;
                 exclude)  _fm_hint="участвуют все, кроме выбранных ниже" ;;
                 include)  _fm_hint="участвуют только выбранные ниже" ;;
-                mixed)    _fm_hint="сначала отбираются выбранные, затем из них убираются исключённые" ;;
+                mixed)    _fm_hint="берутся только выбранные, а из них убираются исключённые" ;;
                 *)        _fm_hint="" ;;
             esac
             _dc=$(uci -q get "${PODKOP_UCI}.${sec}.detect_server_country" 2>/dev/null)
@@ -8627,7 +8627,7 @@ EOF
             if [ -z "$_f_lines" ]; then
                 _f_lines=$(printf '\n<i>Ничего не выбрано — фильтр ни на что не влияет.</i>')
             fi
-            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>Отбирает прокси перед тем, как URLTest начнёт мерить задержку.</i>\n\n<b>Режим:</b> <code>%s</code>%s\n<b>Определение страны:</b> <code>%s</code>\n%s\n\n<b>Скрывать исключённые:</b> %s' \
+            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>URLTest ищет самый быстрый прокси — здесь вы решаете, среди каких.</i>\n\n<b>Режим:</b> <code>%s</code>%s\n<b>Определение страны:</b> <code>%s</code>\n%s\n\n<b>Скрывать исключённые:</b> %s' \
                 "$E_TGT" "$sec" "$_fm_disp" "${_fm_hint:+$(printf ' — %s' "$_fm_hint")}" "$_dc_disp" "$_f_lines" "$_hide")" \
                 "{\"inline_keyboard\":[[{\"text\":\"Режим: ${_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"},{\"text\":\"🌍 ${_dc_disp}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],[{\"text\":\"🌍 Исключить страны\",\"callback_data\":\"puuc_${_token}_ec\"},{\"text\":\"🌍 Только страны\",\"callback_data\":\"puuc_${_token}_ic\"}],[{\"text\":\"🖥 Исключить прокси\",\"callback_data\":\"puuo_${_token}_eo_0\"},{\"text\":\"🖥 Только прокси\",\"callback_data\":\"puuo_${_token}_io_0\"}],[{\"text\":\"${_hide} Скрывать исключённые\",\"callback_data\":\"do_utfilter_toggle_hide\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
             ;;
@@ -13130,7 +13130,7 @@ _handle_fallback_socks() {
             [ "${LAST_ROUTE:-}" = "$_np_tier" ] && _np_active=$(printf '\n%s <b>Сейчас активен</b>' "$E_PLAY")
             local _np_edit_cb; [ "$_np_id" = "bot" ] && _np_edit_cb="cmd_custom_proxy" || _np_edit_cb="np_edit_${_np_id}"
             send_or_edit "$mid" \
-                "$(printf '%s <b>%s</b> [<code>%s</code>]%s\n\n<b>Адрес:</b> <code>%s</code>%s\n<b>Задержка:</b> <code>%s</code>\n\n<i>Проверка подтверждает, что канал жив, но не что через него доступен Telegram.</i>' \
+                "$(printf '%s <b>%s</b> [<code>%s</code>]%s\n\n<b>Адрес:</b> <code>%s</code>%s\n<b>Задержка:</b> <code>%s</code>\n\n<i>Проверка говорит только о том, что канал живой. Пройдёт ли через него Telegram — вопрос отдельный.</i>' \
                     "$E_NET" "$_np_kind" "$_np_tier" "$_np_active" \
                     "$(html_escape "$(_mask_proxy "$_np_ep")")" \
                     "${_np_mn:+$(printf '\n<b>Имя:</b> %s' "$(html_escape "$_np_mn")")}" \
@@ -13353,7 +13353,7 @@ _handle_fallback_socks() {
             unset -f _probe_fast
             [ -z "$result_text" ] && result_text="<i>Узлы не настроены.</i>"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>(gstatic 204, тайм-аут 3 с — проверяет, что канал жив, но не что через него доступен Telegram)</i>\n\n%b' "$E_TEST" "$result_text")" \
+                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>(gstatic 204, тайм-аут 3 с. Показывает, что канал живой; пройдёт ли через него Telegram — вопрос отдельный)</i>\n\n%b' "$E_TEST" "$result_text")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Проверить снова\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fallback_socks_menu\"}]]}"
             ;;
 
