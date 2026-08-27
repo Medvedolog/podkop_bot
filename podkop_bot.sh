@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.11
+# Podkop Telegram Bot v0.19.12
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.11"
+BOT_VERSION="0.19.12"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -1398,6 +1398,23 @@ _resolve_primary_section() {
 #                    credentials preserved — the bot needs them to connect).
 # _proxy_mnemonic  — everything after the first '#', or '' if none.
 # _mask_proxy      — hide the password for logs/UI: user:pass@ -> user:***@
+# _ru_plural COUNT ONE FEW MANY — Russian numeral agreement.
+# "1 страна", "2 страны", "5 стран". Printing the noun unchanged after a number
+# reads as machine translation, and it is the first thing a Russian reader trips
+# over. 11-14 are the exception that a naive last-digit rule gets wrong.
+_ru_plural() {
+    local _n="$1" _one="$2" _few="$3" _many="$4" _t _h
+    case "$_n" in ''|*[!0-9]*) printf '%s' "$_many"; return ;; esac
+    _h=$(( _n % 100 ))
+    if [ "$_h" -ge 11 ] && [ "$_h" -le 14 ]; then printf '%s' "$_many"; return; fi
+    _t=$(( _n % 10 ))
+    case "$_t" in
+        1) printf '%s' "$_one" ;;
+        2|3|4) printf '%s' "$_few" ;;
+        *) printf '%s' "$_many" ;;
+    esac
+}
+
 _proxy_endpoint() { printf '%s' "${1%%#*}"; }
 _proxy_mnemonic() { case "$1" in *#*) printf '%s' "${1#*#}";; *) printf '';; esac; }
 _mask_proxy() { printf '%s' "$1" | sed 's|\(://[^:@/]*:\)[^@/]*@|\1***@|'; }
@@ -3071,11 +3088,20 @@ _UCI_TXN=0
 uci_txn_begin() {
     command -v flock >/dev/null 2>&1 || return 0
     exec 8>>"$UCI_LOCK_FILE" 2>/dev/null || return 0
-    # Bounded wait: a stuck holder must never freeze the polling loop. On timeout
-    # we proceed unlocked — a rare interleave beats a bot that stops answering.
+    # Bounded wait: a stuck holder must never freeze the polling loop. Failing to
+    # lock is not fatal — we go ahead unlocked, because a rare interleave beats
+    # both a frozen bot and a dropped write.
+    #
+    # Do not claim the lock was "busy": some BusyBox builds reject `-w` outright,
+    # so this returns instantly with no contention at all. Retry once without the
+    # timeout flag before giving up, and let the message cover both causes.
     if ! flock -x -w 10 8 2>/dev/null; then
+        if flock -x -n 8 2>/dev/null; then
+            _UCI_TXN=1
+            return 0
+        fi
         exec 8>&- 2>/dev/null
-        logger -t podkop-bot "[UCI] Config lock busy for 10s; writing without it."
+        logger -t podkop-bot "[UCI] Could not take the config lock (busy, or flock lacks -w); writing without it."
         return 1
     fi
     _UCI_TXN=1
@@ -3093,7 +3119,14 @@ uci_commit_safe() {
         # would block on our own hold.
         uci commit "$1"; rc=$?
     elif command -v flock >/dev/null 2>&1; then
-        ( flock -x -w 10 9 || exit 1; uci commit "$1"; exit $? ) 9>>"$UCI_LOCK_FILE"
+        # Serialise when possible, but NEVER skip the commit. The previous
+        # `|| exit 1` dropped the write whenever the lock could not be taken —
+        # and on BusyBox builds whose flock rejects `-w` that happened instantly,
+        # every time, so settings changes vanished with a misleading "commit
+        # failed" in the log. Losing a write is far worse than a rare interleave.
+        ( flock -x -w 10 9 2>/dev/null || \
+            logger -t podkop-bot "[UCI] Lock unavailable — committing '$1' anyway."
+          uci commit "$1"; exit $? ) 9>>"$UCI_LOCK_FILE"
         rc=$?
     else
         uci commit "$1"; rc=$?
@@ -8616,7 +8649,7 @@ EOF
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
                 return
             fi
-            local _fm _fm_disp _next_fm _dc _dc_disp _hide _token
+            local _fm _fm_disp _next_fm _next_fm_disp _dc _dc_disp _hide _token
             local _ec _ic _eo _io _er _ir
             _fm=$(_plus_urltest_filter_mode "$sec")
             case "$_fm" in
@@ -8626,16 +8659,25 @@ EOF
                 mixed)    _fm_disp="смешанный"; _next_fm="disabled" ;;
                 *)        _fm_disp="$_fm"; _next_fm="disabled" ;;
             esac
-            # What the mode actually does, in one line. The name alone
-            # ("исключение", "смешанный") does not say which proxies end up in
-            # the rotation, and that is the only thing this screen is about.
-            local _fm_hint
+            # The button carries where the tap leads, not just where we are. A
+            # cycling button labelled only with its current value leaves the reader
+            # guessing whether pressing it keeps or changes that value.
+            case "$_next_fm" in
+                disabled) _next_fm_disp="выключить" ;;
+                exclude)  _next_fm_disp="исключение" ;;
+                include)  _next_fm_disp="только выбранные" ;;
+                mixed)    _next_fm_disp="смешанный" ;;
+                *)        _next_fm_disp="$_next_fm" ;;
+            esac
+            # Which list buttons the backend actually honours in this mode. Showing
+            # all four regardless was the real defect: in "exclude" the two include
+            # lists do nothing, so the card offered controls that silently have no
+            # effect while its own text said only the excluded ones matter.
+            local _show_exc=0 _show_inc=0
             case "$_fm" in
-                disabled) _fm_hint="в ротации участвуют все прокси" ;;
-                exclude)  _fm_hint="участвуют все, кроме выбранных ниже" ;;
-                include)  _fm_hint="участвуют только выбранные ниже" ;;
-                mixed)    _fm_hint="берутся только выбранные, а из них убираются исключённые" ;;
-                *)        _fm_hint="" ;;
+                exclude) _show_exc=1 ;;
+                include) _show_inc=1 ;;
+                mixed)   _show_exc=1; _show_inc=1 ;;
             esac
             _dc=$(uci -q get "${PODKOP_UCI}.${sec}.detect_server_country" 2>/dev/null)
             case "$_dc" in
@@ -8656,22 +8698,59 @@ EOF
             # zeros, and closed with a paragraph of release notes explaining the
             # implementation ("as in Forkop", "outbound metadata", "Clash API
             # fallback") — none of which helps anyone choosing what to filter.
-            local _f_lines=""
-            if [ "${_ec:-0}" -gt 0 ] 2>/dev/null || [ "${_eo:-0}" -gt 0 ] 2>/dev/null; then
-                _f_lines="${_f_lines}$(printf '\n<b>Исключено:</b> стран %s · прокси %s' "$_ec" "$_eo")"
-            fi
-            if [ "${_ic:-0}" -gt 0 ] 2>/dev/null || [ "${_io:-0}" -gt 0 ] 2>/dev/null; then
-                _f_lines="${_f_lines}$(printf '\n<b>Только выбранные:</b> стран %s · прокси %s' "$_ic" "$_io")"
-            fi
+            # The body says only what a button cannot: the effect in words, and how
+            # much is currently selected. Repeating "Режим", "Определение страны"
+            # and "Скрывать исключённые" as text above the very buttons that carry
+            # those values was pure duplication — which is why the previous pass,
+            # despite dropping the zero rows, still read as noise.
+            local _body=""
+            case "$_fm" in
+                disabled)
+                    _body="Фильтр выключен: URLTest перебирает все прокси секции." ;;
+                exclude)
+                    if [ "${_ec:-0}" -gt 0 ] 2>/dev/null || [ "${_eo:-0}" -gt 0 ] 2>/dev/null; then
+                        _body=$(printf 'Из перебора убрано: <b>%s</b> %s и <b>%s</b> прокси.\nОстальные участвуют.' \
+                            "$_ec" "$(_ru_plural "$_ec" страна страны стран)" "$_eo")
+                    else
+                        _body="Пока ничего не убрано, поэтому участвуют все. Выберите страны или прокси кнопками ниже."
+                    fi ;;
+                include)
+                    if [ "${_ic:-0}" -gt 0 ] 2>/dev/null || [ "${_io:-0}" -gt 0 ] 2>/dev/null; then
+                        _body=$(printf 'В переборе участвуют только: <b>%s</b> %s и <b>%s</b> прокси.\nВсе прочие исключены.' \
+                            "$_ic" "$(_ru_plural "$_ic" страна страны стран)" "$_io")
+                    else
+                        _body="Ничего не выбрано — при этом режиме в переборе не останется ни одного прокси. Выберите страны или прокси кнопками ниже."
+                    fi ;;
+                mixed)
+                    _body=$(printf 'Сначала берутся только выбранные (<b>%s</b> %s, <b>%s</b> прокси), затем из них убираются исключённые (<b>%s</b> %s, <b>%s</b> прокси).' \
+                        "$_ic" "$(_ru_plural "$_ic" страна страны стран)" "$_io" \
+                        "$_ec" "$(_ru_plural "$_ec" страна страны стран)" "$_eo") ;;
+                *)
+                    _body="Режим не распознан — задайте его кнопкой ниже." ;;
+            esac
+            # Regex lists cannot be edited here; mention them only if they exist,
+            # so the counts on screen add up to what the backend actually applies.
             if [ "${_er:-0}" -gt 0 ] 2>/dev/null || [ "${_ir:-0}" -gt 0 ] 2>/dev/null; then
-                _f_lines="${_f_lines}$(printf '\n<b>Regex:</b> исключение %s · разрешение %s' "$_er" "$_ir")"
+                _body="${_body}$(printf '\n\n<i>Плюс шаблоны regex (%s исключающих, %s разрешающих) — правятся в LuCI.</i>' "$_er" "$_ir")"
             fi
-            if [ -z "$_f_lines" ]; then
-                _f_lines=$(printf '\n<i>Ничего не выбрано — фильтр ни на что не влияет.</i>')
+
+            local _kb_lists=""
+            if [ "$_show_exc" = "1" ] && [ "$_show_inc" = "1" ]; then
+                _kb_lists="[{\"text\":\"🌍 Исключить страны\",\"callback_data\":\"puuc_${_token}_ec\"},{\"text\":\"🌍 Только страны\",\"callback_data\":\"puuc_${_token}_ic\"}],[{\"text\":\"🖥 Исключить прокси\",\"callback_data\":\"puuo_${_token}_eo_0\"},{\"text\":\"🖥 Только прокси\",\"callback_data\":\"puuo_${_token}_io_0\"}],"
+            elif [ "$_show_exc" = "1" ]; then
+                _kb_lists="[{\"text\":\"🌍 Исключить страны\",\"callback_data\":\"puuc_${_token}_ec\"},{\"text\":\"🖥 Исключить прокси\",\"callback_data\":\"puuo_${_token}_eo_0\"}],"
+            elif [ "$_show_inc" = "1" ]; then
+                _kb_lists="[{\"text\":\"🌍 Только страны\",\"callback_data\":\"puuc_${_token}_ic\"},{\"text\":\"🖥 Только прокси\",\"callback_data\":\"puuo_${_token}_io_0\"}],"
             fi
-            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>URLTest ищет самый быстрый прокси — здесь вы решаете, среди каких.</i>\n\n<b>Режим:</b> <code>%s</code>%s\n<b>Определение страны:</b> <code>%s</code>\n%s\n\n<b>Скрывать исключённые:</b> %s' \
-                "$E_TGT" "$sec" "$_fm_disp" "${_fm_hint:+$(printf ' — %s' "$_fm_hint")}" "$_dc_disp" "$_f_lines" "$_hide")" \
-                "{\"inline_keyboard\":[[{\"text\":\"Режим: ${_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"},{\"text\":\"🌍 ${_dc_disp}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],[{\"text\":\"🌍 Исключить страны\",\"callback_data\":\"puuc_${_token}_ec\"},{\"text\":\"🌍 Только страны\",\"callback_data\":\"puuc_${_token}_ic\"}],[{\"text\":\"🖥 Исключить прокси\",\"callback_data\":\"puuo_${_token}_eo_0\"},{\"text\":\"🖥 Только прокси\",\"callback_data\":\"puuo_${_token}_io_0\"}],[{\"text\":\"${_hide} Скрывать исключённые\",\"callback_data\":\"do_utfilter_toggle_hide\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+            # Country detection and "hide filtered" only bite when a list is in
+            # play; with the filter off they are dead controls.
+            local _kb_extra=""
+            if [ "$_show_exc" = "1" ] || [ "$_show_inc" = "1" ]; then
+                _kb_extra="[{\"text\":\"🌍 Страны определять: ${_dc_disp}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],[{\"text\":\"${_hide} Скрывать отфильтрованные\",\"callback_data\":\"do_utfilter_toggle_hide\"}],"
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>URLTest сам выбирает самый быстрый прокси. Здесь — из каких он выбирает.</i>\n\n%s' \
+                "$E_TGT" "$sec" "$_body")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Режим: ${_fm_disp} ▸ ${_next_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"}],${_kb_lists}${_kb_extra}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "do_utfilter_mode_"*)

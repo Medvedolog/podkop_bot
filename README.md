@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.11
+# 🤖 podkop_bot 0.19.12
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.11-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.19.12-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -74,7 +74,7 @@
 ```text
 🖥️ Управление Podkop
 Устройство: AX6000
-Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.11
+Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.12
 Секция: main
 Активный прокси: 🇳🇱 NL-vless-reality (main-1-out)
 Подключение бота: Podkop (SOCKS5:192.168.2.1:2080)

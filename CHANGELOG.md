@@ -1,6 +1,17 @@
 # Changelog
 
 ---
+## v0.19.12
+
+- **FIXED (critical, 0.19.11 regression): settings could fail to save at all.** The shared UCI lock added in 0.19.11 **skipped the commit** whenever the lock could not be taken — `uci_commit_safe` had `flock … || exit 1`. The journal showed `uci commit failed (RC=1)`, implying the commit ran and failed, when in fact it never ran and the change was silently lost.
+
+  On BusyBox builds whose `flock` rejects `-w`, this happened **every time**: the lock failed instantly rather than after a timeout. On such a router no setting made from the bot had reached the config since 0.19.11 was installed.
+
+  The commit now runs whatever the lock does: losing a write is worse than an occasional interleave. Failure to lock is logged and the write proceeds. Before giving up, a second attempt is made without `-w`, so builds lacking that option still get the lock. The message no longer claims the lock was "busy for 10s" — an unsupported option looks identical.
+- **FIXED: the URLTest filters card offered buttons that do nothing.** In "exclude" mode, under text reading "everything participates except those selected below", sat four list buttons — two of which the backend does not apply in that mode at all. Only the lists the current mode honours are shown now: two in exclude, the other two in include, all four in mixed, none when the filter is off.
+- **FIXED: the card text duplicated its own buttons.** The "Режим", "Определение страны" and "Скрывать исключённые" lines repeated, word for word, the three buttons beneath them — in Telegram a button showing its state *is* the indicator. Only what a button cannot show remains: what is selected and what that leads to. The mode button now names what tapping switches **to**, not just where it is.
+- Russian numerals agree with their nouns now; the count was previously printed with one fixed form.
+
 ## v0.19.11
 - **FIXED: config edits from the bot and from the web panel could overwrite each other.** The `flock` on `/tmp/podkop_uci.lock` wrapped only `uci commit`, and the LuCI backend took no lock at all — so it protected the bot from itself, and only partly.
 
