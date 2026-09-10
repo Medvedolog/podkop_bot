@@ -1,6 +1,16 @@
 # Changelog
 
 ---
+## v0.19.15
+
+- **FIXED (critical): full Outbound probe no longer hangs forever at step 3/4.** `probe_services()` used a bare `wait` after its 12 parallel service workers. In the main bot shell that also waited for the long-lived health/watchdog daemon, so the function could never return. It now kills/reaps only the PIDs created by the service probe.
+- **RESPONSIVENESS:** the full Outbound probe now runs in a background worker. The Telegram long-poll loop remains free, so `/start` and other commands continue to be processed while the 20–60 second diagnostic is running.
+- **DIAGNOSTICS:** syslog now records probe start/context, each of the four stages, all 12 service outcomes (`status`, HTTP code, latency and optional geo hint), throughput result and final completion. Built-in journal event text is English only; localized route labels remain in the UI. Telegram bot tokens are never logged.
+
+## v0.19.14
+
+- **FIXED:** the Status button for the full Outbound probe is routed into the existing `ask_probe_outbound` / `cmd_probe_outbound_back_*` flow instead of falling through to the generic `ask_*` confirmation handler.
+
 ## v0.19.13
 
 - **FIXED (transport-state): FAST and POLL no longer share authoritative route state.** `getUpdates` writes `poll_route*`; short Bot API calls write `fast_route*`. Watchdog degradation/recovery decisions use POLL only, so sending its own alert cannot manufacture a Direct → recovered pair. Legacy `main_route*` mirrors POLL for compatibility.

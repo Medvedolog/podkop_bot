@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.14
+# Podkop Telegram Bot v0.19.15
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.14"
+BOT_VERSION="0.19.15"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -2068,7 +2068,7 @@ _route_request() {
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] Recovered from Direct. Active route: ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Direct. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
                         return 0
                     fi
                 fi
@@ -2101,7 +2101,7 @@ _route_request() {
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] Recovered from Emergency IP. Active route: ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Emergency IP. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
                         return 0
                     fi
                 fi
@@ -2145,10 +2145,10 @@ _route_request() {
         _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
-            logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Connection recovered. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
             _set_recovery_mode "$_ROUTE_PROFILE" 0
         elif [ "$_prev_name" != "$ROUTE_NAME" ]; then
-            logger -t podkop-bot "[Transport] Route: ${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Route changed. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
         fi
         return 0
     fi
@@ -2195,7 +2195,7 @@ api_request_fast() {
             # FAST recovery is independent of POLL. Step its own recovery window
             # down after a successful short request; POLL state is untouched.
             FAST_RECOVERY_MODE=$((FAST_RECOVERY_MODE > 1 ? FAST_RECOVERY_MODE - 1 : 0))
-            logger -t podkop-bot "[Transport] Fast recovery: connected via ${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Fast recovery: route=${ROUTE_KEY} profile=fast"
             _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
         else
             logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
@@ -2230,7 +2230,7 @@ api_poll_long() {
             LAST_ROUTE_POLL="$ROUTE_KEY"
             _write_route_state "poll" "$ROUTE_KEY" "$ROUTE_NAME"
             [ "$_prev" = "fail" ] && \
-                logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
+                logger -t podkop-bot "[Transport] Connection recovered. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
             return 0
         fi
         # SOCKS still down in recovery — fall through to full cascade
@@ -3774,6 +3774,8 @@ probe_services() {
         printf '%s|%s|%s|%s' "$_pt_stat" "${_pt_code:-000}" "${_pt_ms:-0}" "$_pt_detail" > "$_svc_dir/TelegramAPI"
     }
 
+    logger -t podkop-bot "[Probe][Services] start: 12 parallel checks via ${_proxy}; deadline=${_SVC_DEADLINE}s"
+    logger -t podkop-bot "[Probe][Services] targets=telegram_api,youtube,chatgpt,claude,gemini,github,netflix,spotify,tiktok,twitch,apple,discord"
     _pids=""
     _probe_tg_svc & _pids="$_pids $!"
     _probe_svc YouTube "https://www.youtube.com/sw.js_data" "200" youtube & _pids="$_pids $!"
@@ -3797,8 +3799,15 @@ probe_services() {
         [ "$(date +%s 2>/dev/null || echo 0)" -ge "$_deadline" ] 2>/dev/null && break
         sleep 1
     done
-    for _e in $_pids; do kill "$_e" 2>/dev/null || true; done
-    wait 2>/dev/null
+    # Stop only unfinished service workers, then reap exactly those PIDs.
+    # A bare `wait` here is fatal in the main bot shell: it also waits for the
+    # long-lived health/watchdog daemon and therefore never returns.
+    for _e in $_pids; do
+        kill "$_e" 2>/dev/null || true
+    done
+    for _e in $_pids; do
+        wait "$_e" 2>/dev/null || true
+    done
 
     local _tab; _tab=$(printf '\t')
     for _slot in TelegramAPI YouTube ChatGPT Claude Gemini GitHub Netflix Spotify TikTok Twitch Apple Discord; do
@@ -3827,7 +3836,9 @@ probe_services() {
         [ "$_slot" = "TelegramAPI" ] && [ "$_st" != "ok" ] && PROBE_TG_BLOCKED=1
         PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
+        logger -t podkop-bot "[Probe][Services] ${_slot}: status=${_st} http=${_code} time=${_ms}ms${_geo:+ geo=${_geo}}"
     done
+    logger -t podkop-bot "[Probe][Services] complete: telegram_blocked=${PROBE_TG_BLOCKED}"
     rm -rf "$_svc_dir" 2>/dev/null
 }
 
@@ -15096,6 +15107,10 @@ EOF
             fi
             printf '%s' "$_now" > "$_probe_ts_file"
 
+            # The full probe can take tens of seconds. Run it outside the main
+            # Telegram polling loop so /start and other commands remain responsive.
+            (
+            logger -t podkop-bot "[Probe] background worker started: back=${_back} message=${mid:-new}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 1/4: геолокация…' "$E_MICRO")" ""
 
             # Collect context
@@ -15112,24 +15127,35 @@ EOF
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
             [ "$px_type" = "unknown" ] && px_type="Неизвестно"
 
+            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${px_type}"
+
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
+            logger -t podkop-bot "[Probe] step 1/4 geo: start"
             probe_geo
+            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${PROBE_EXIT_IP:-n/a} country=${PROBE_COUNTRY:-n/a} cf=${PROBE_CF_COUNTRY:-n/a}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 2/4: геолокация Google…' "$E_MICRO")" ""
 
             # Step 2: Google
             PROBE_GOOGLE_COUNTRY=""
+            logger -t podkop-bot "[Probe] step 2/4 google: start"
             probe_google
+            logger -t podkop-bot "[Probe] step 2/4 google: done country=${PROBE_GOOGLE_COUNTRY:-n/a}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 3/4: доступность сервисов…' "$E_MICRO")" ""
 
             # Step 3: Services
             PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
+            logger -t podkop-bot "[Probe] step 3/4 services: start"
             probe_services
+            local _probe_services_rc=$?
+            logger -t podkop-bot "[Probe] step 3/4 services: done rc=${_probe_services_rc} telegram_blocked=${PROBE_TG_BLOCKED:-0}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 4/4: скорость соединения…' "$E_MICRO")" ""
 
             # Step 4: Throughput
             PROBE_SPEED_MBPS=""; PROBE_SPEED_BYTES=0; PROBE_SPEED_SECS=""; PROBE_SPEED_STATUS=""
+            logger -t podkop-bot "[Probe] step 4/4 throughput: start (32KiB + up to 8MiB; direct comparison may add up to 8MiB)"
             probe_throughput
+            logger -t podkop-bot "[Probe] step 4/4 throughput: done status=${PROBE_SPEED_STATUS:-n/a} speed=${PROBE_SPEED_MBPS:-n/a}Mbps bytes=${PROBE_SPEED_BYTES:-0} direct=${PROBE_SPEED_DIRECT_MBPS:-n/a}Mbps"
 
             # ── Build result card ──────────────────────────────────────────
             local size_kb_disp size_unit
@@ -15241,8 +15267,11 @@ EOF
             esac
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
 
-            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
+            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
+            ) &
+            local _probe_worker_pid=$!
+            logger -t podkop-bot "[Probe] queued background worker pid=${_probe_worker_pid}"
             ;;
 
         "cmd_upstream_health")
@@ -15926,7 +15955,7 @@ EOF
 
             cp -f "$BOT_PATH" "${BOT_PATH}.bak" 2>/dev/null || true
             mv "$bot_tmp" "$BOT_PATH"
-            logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Backup at ${BOT_PATH}.bak. Перезапуск…"
+            logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Backup at ${BOT_PATH}.bak. Restarting."
 
             # Preserve offset outside BOT_DIR before restart.
             # The trap (INT/TERM/QUIT) runs rm -rf "$BOT_DIR" which would wipe
@@ -16333,7 +16362,7 @@ send_startup_notification_async() {
             load_bot_identity >/dev/null 2>&1
             # api_request_fast already published the FAST diagnostic route.
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
-                logger -t podkop-bot "Connected via: ${LAST_ROUTE_FAST_NAME} (fast=${LAST_ROUTE_FAST})"
+                logger -t podkop-bot "Connected via route=${LAST_ROUTE_FAST} profile=fast"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Роутер")
                 p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
