@@ -20,8 +20,8 @@
 # 5. Background Health Daemon: 5 watchdog checks (TG connectivity, sing-box,
 #    SOCKS probe, proxy leaf change, route degradation). Alerts on tier4/tier5.
 # 6. Active Outbound Probe: geo (ipapi.co + Cloudflare + Google), service
-#    reachability (YouTube/Telegram/ChatGPT/Gemini/Discord), 2-stage throughput
-#    (32KB block detection + 1MB speed measurement).
+#    reachability (12 services including Telegram Bot API), 2-stage throughput
+#    (32KB block detection + 8MB speed measurement).
 #
 # ==============================================================================
 
@@ -3683,130 +3683,158 @@ probe_google() {
 # probe_services: check reachability of key services through active outbound
 # Sets: PROBE_SVC_RESULTS (TAB-separated lines: "name<TAB>icon<TAB>detail")
 probe_services() {
-    local m_ip m_port sec
+    local m_ip m_port sec _proxy _svc_dir _pids _deadline _expected _slot _f _line
     sec=$(get_active_section)
     m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
+    _proxy="socks5h://${m_ip}:${m_port}"
     PROBE_SVC_RESULTS=""
     PROBE_TG_BLOCKED=0
 
-    local _name _url _expected _parse _code _icon _detail _tab
-    _tab=$(printf '\t')
-    local _ua="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-    local _proxy="-x socks5h://${m_ip}:${m_port}"
-    local _curl_base="curl -s -k --connect-timeout 6 --max-time 10"
+    # Keep the 12-service set in sync with LuCI Runtime. Run in parallel so one
+    # blocked service cannot turn the diagnostic into a 2-minute sequential wait.
+    local _SVC_DEADLINE=15
+    _svc_dir="${BOT_DIR}/probe_services_$$"
+    rm -rf "$_svc_dir" 2>/dev/null
+    mkdir -p "$_svc_dir" || return 1
 
-    # Helper: run probe, set _code and optionally parse JSON for _detail
-    _probe() {
-        local __url="$1" __expected="$2" __parse="$3"
-        shift 3
-        _code=$($_curl_base $_proxy -o /tmp/podkop_probe_svc.tmp -w "%{http_code}" "$@" "$__url" 2>/dev/null)
-        _detail=""
-        if [ -n "$__parse" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-            _detail=$(jq -r "$__parse // empty" /tmp/podkop_probe_svc.tmp 2>/dev/null || echo "")
-            [ -n "$_detail" ] && _detail=" ($_detail)"
+    local _K_NETFLIX="YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"
+    local _K_SPOTIFY="142b583129b2df829de3656f9eb484e6"
+    local _K_SPOTIFY_CID="9a8d2f0ce77a4e248bb71fefcb557637"
+    local _K_TWITCH="kimne78kx3ncx6brgo4mv6wki5h1ko"
+    local _TWITCH_GQL='[{"operationName":"VerifyEmail_CurrentUser","variables":{},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"f9e7dcdf7e99c314c82d8f7f725fab5f99d1df3d7359b53c9ae122deec590198"}}}]'
+
+    # _probe_svc SLOT URL OK_CODES GEO_KIND [METHOD] [HEADER] [DATA]
+    _probe_svc() {
+        local _ps_slot="$1" _ps_url="$2" _ps_ok="$3" _ps_geo="$4"
+        local _ps_method="${5:-GET}" _ps_hdr="$6" _ps_data="$7"
+        local _ps_body="${_svc_dir}/.body_${_ps_slot}" _ps_resp _ps_code _ps_time _ps_ms _ps_stat _ps_detail=""
+        if [ -n "$_ps_hdr" ] && [ -n "$_ps_data" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" -H "$_ps_hdr" --data "$_ps_data" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        elif [ -n "$_ps_hdr" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" -H "$_ps_hdr" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        elif [ -n "$_ps_data" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" --data "$_ps_data" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        else
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
         fi
-        rm -f /tmp/podkop_probe_svc.tmp
-        case "$_code" in
-            "$__expected")       _icon="${E_OK}" ;;
-            ''|000)              _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-            301|302|303|307|308) _icon="${E_YLW}"; _detail=" (перенаправление $_code)" ;;
-            403|451)             _icon="${E_RED}"; _detail=" (заблокировано $_code)" ;;
-            *)                   _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+        _ps_code=$(printf '%s' "$_ps_resp" | awk '{print $1}')
+        _ps_time=$(printf '%s' "$_ps_resp" | awk '{print $2}')
+        _ps_ms=$(awk -v t="${_ps_time:-0}" 'BEGIN{printf "%d", t*1000}')
+        case " $_ps_ok " in
+            *" ${_ps_code} "*) _ps_stat="ok" ;;
+            *) case "$_ps_code" in
+                ''|000) _ps_stat="timeout" ;;
+                403|451) _ps_stat="blocked" ;;
+                *) _ps_stat="other" ;;
+               esac ;;
         esac
+        if [ -s "$_ps_body" ]; then
+            case "$_ps_geo" in
+                youtube) _ps_detail=$(tail -n +3 "$_ps_body" 2>/dev/null | jq -r '.[0][2][0][0][1] // empty' 2>/dev/null) ;;
+                netflix) _ps_detail=$(jq -r '.client.location.country // empty' "$_ps_body" 2>/dev/null) ;;
+                spotify) _ps_detail=$(jq -r '.country // empty' "$_ps_body" 2>/dev/null) ;;
+                tiktok) _ps_detail=$(jq -r '.body.appProps.region // empty' "$_ps_body" 2>/dev/null) ;;
+                twitch) _ps_detail=$(jq -r '.[0].data.requestInfo.countryCode // empty' "$_ps_body" 2>/dev/null) ;;
+                apple) _ps_detail=$(head -c 8 "$_ps_body" 2>/dev/null | tr -dc 'A-Za-z' | cut -c1-2 | tr 'a-z' 'A-Z') ;;
+            esac
+        fi
+        rm -f "$_ps_body" 2>/dev/null
+        printf '%s|%s|%s|%s' "$_ps_stat" "${_ps_code:-000}" "${_ps_ms:-0}" "$_ps_detail" > "$_svc_dir/$_ps_slot"
     }
 
-    # YouTube — sw.js_data endpoint returns country as ipregion.sh approach
-    # tail -n +3 skips first 2 lines (non-JSON prefix), then parse country field
-    _name="YouTube"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /tmp/podkop_probe_svc.tmp \
-        -w "%{http_code}" \
-        "https://www.youtube.com/sw.js_data" 2>/dev/null)
-    _detail=""
-    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-        local _yt_country
-        _yt_country=$(tail -n +3 /tmp/podkop_probe_svc.tmp 2>/dev/null | \
-            jq -r '.[0][2][0][0][1] // empty' 2>/dev/null)
-        [ -n "$_yt_country" ] && _detail=" ($_yt_country)"
-        _icon="${E_OK}"
-    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
-        _icon="${E_RED}"; _detail=" (тайм-аут)"
-    else
-        _icon="${E_RED}"; _detail=" (HTTP $_code)"
-    fi
-    rm -f /tmp/podkop_probe_svc.tmp
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+    # Telegram is special: a generic HTTP response is insufficient. Verify the
+    # configured bot itself with getMe and require {ok:true,result.id:...}.
+    _probe_tg_svc() {
+        local _pt_body="${_svc_dir}/.body_TelegramAPI" _pt_resp _pt_code _pt_time _pt_ms _pt_stat _pt_detail
+        _pt_resp=$(curl -s -k -x "$_proxy" --connect-timeout 5 --max-time 12 \
+            -o "$_pt_body" -w '%{http_code} %{time_total}' \
+            "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
+        _pt_code=$(printf '%s' "$_pt_resp" | awk '{print $1}')
+        _pt_time=$(printf '%s' "$_pt_resp" | awk '{print $2}')
+        _pt_ms=$(awk -v t="${_pt_time:-0}" 'BEGIN{printf "%d", t*1000}')
+        _pt_detail=""
+        if [ "$_pt_code" = "200" ] && jq -e '.ok == true and (.result.id != null)' "$_pt_body" >/dev/null 2>&1; then
+            _pt_stat="ok"
+            _pt_detail=$(jq -r '.result.username // empty' "$_pt_body" 2>/dev/null)
+            [ -n "$_pt_detail" ] && _pt_detail="@${_pt_detail}"
+        else
+            case "$_pt_code" in
+                ''|000) _pt_stat="timeout" ;;
+                401) _pt_stat="auth"; _pt_detail="токен отклонён" ;;
+                403|451) _pt_stat="blocked" ;;
+                *) _pt_stat="other" ;;
+            esac
+        fi
+        rm -f "$_pt_body" 2>/dev/null
+        printf '%s|%s|%s|%s' "$_pt_stat" "${_pt_code:-000}" "${_pt_ms:-0}" "$_pt_detail" > "$_svc_dir/TelegramAPI"
+    }
+
+    _pids=""
+    _probe_tg_svc & _pids="$_pids $!"
+    _probe_svc YouTube "https://www.youtube.com/sw.js_data" "200" youtube & _pids="$_pids $!"
+    _probe_svc ChatGPT "https://api.openai.com/v1/models" "200 401" "" & _pids="$_pids $!"
+    _probe_svc Claude "https://api.anthropic.com/v1/models" "200 401" "" & _pids="$_pids $!"
+    _probe_svc Gemini "https://gemini.google.com/app" "200" "" GET "" "" & _pids="$_pids $!"
+    _probe_svc GitHub "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200" "" & _pids="$_pids $!"
+    _probe_svc Netflix "https://api.fast.com/netflix/speedtest/v2?https=true&token=${_K_NETFLIX}&urlCount=1" "200" netflix & _pids="$_pids $!"
+    _probe_svc Spotify "https://spclient.wg.spotify.com/signup/public/v1/account/?validate=1&key=${_K_SPOTIFY}" "200" spotify GET "X-Client-Id: ${_K_SPOTIFY_CID}" & _pids="$_pids $!"
+    _probe_svc TikTok "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988" "200" tiktok & _pids="$_pids $!"
+    _probe_svc Twitch "https://gql.twitch.tv/gql" "200" twitch POST "Client-Id: ${_K_TWITCH}" "$_TWITCH_GQL" & _pids="$_pids $!"
+    _probe_svc Apple "https://gspe1-ssl.ls.apple.com/pep/gcc" "200" apple & _pids="$_pids $!"
+    _probe_svc Discord "https://discord.com/api/v9/gateway" "200" "" & _pids="$_pids $!"
+
+    _expected="TelegramAPI YouTube ChatGPT Claude Gemini GitHub Netflix Spotify TikTok Twitch Apple Discord"
+    _deadline=$(( $(date +%s 2>/dev/null || echo 0) + _SVC_DEADLINE ))
+    while :; do
+        local _missing=0 _e
+        for _e in $_expected; do [ -f "$_svc_dir/$_e" ] || _missing=1; done
+        [ "$_missing" = "0" ] && break
+        [ "$(date +%s 2>/dev/null || echo 0)" -ge "$_deadline" ] 2>/dev/null && break
+        sleep 1
+    done
+    for _e in $_pids; do kill "$_e" 2>/dev/null || true; done
+    wait 2>/dev/null
+
+    local _tab; _tab=$(printf '\t')
+    for _slot in TelegramAPI YouTube ChatGPT Claude Gemini GitHub Netflix Spotify TikTok Twitch Apple Discord; do
+        _f="$_svc_dir/$_slot"
+        if [ -s "$_f" ]; then
+            _line=$(cat "$_f")
+            local _st _code _ms _geo _name _icon _detail
+            _st=$(printf '%s' "$_line" | cut -d'|' -f1)
+            _code=$(printf '%s' "$_line" | cut -d'|' -f2)
+            _ms=$(printf '%s' "$_line" | cut -d'|' -f3)
+            _geo=$(printf '%s' "$_line" | cut -d'|' -f4-)
+        else
+            _st="na"; _code="000"; _ms=0; _geo=""
+        fi
+        case "$_slot" in TelegramAPI) _name="Telegram API" ;; *) _name="$_slot" ;; esac
+        case "$_st" in
+            ok) _icon="$E_OK"; _detail="" ;;
+            timeout) _icon="$E_RED"; _detail=" (тайм-аут)" ;;
+            blocked) _icon="$E_RED"; _detail=" (заблокировано HTTP ${_code})" ;;
+            auth) _icon="$E_RED"; _detail=" (${_geo:-токен отклонён})" ;;
+            na) _icon="$E_YLW"; _detail=" (N/A)" ;;
+            *) _icon="$E_YLW"; _detail=" (HTTP ${_code})" ;;
+        esac
+        [ "$_st" = "ok" ] && [ -n "$_ms" ] && [ "$_ms" -gt 0 ] 2>/dev/null && _detail="${_detail} (${_ms} мс)"
+        [ -n "$_geo" ] && [ "$_st" = "ok" ] && _detail="${_detail} [${_geo}]"
+        [ "$_slot" = "TelegramAPI" ] && [ "$_st" != "ok" ] && PROBE_TG_BLOCKED=1
+        PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Telegram API
-    _name="Telegram API"
-    _probe "https://api.telegram.org" "200" "" -L
-    [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # ChatGPT — platform.openai.com/v1/models returns 401 (auth required) = accessible
-    # ab.chatgpt.com times out on many datacenter IPs — use API endpoint instead
-    _name="ChatGPT"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 8 --max-time 15 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://api.openai.com/v1/models" 2>/dev/null)
-    case "$_code" in
-        200|401) _icon="${E_OK}";  _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Claude.ai — api.anthropic.com/v1/models returns 401 (auth required) = accessible
-    # claude.ai/login returns 403 for datacenter IPs via Cloudflare — use API instead
-    _name="Claude.ai"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://api.anthropic.com/v1/models" 2>/dev/null)
-    case "$_code" in
-        200|401) _icon="${E_OK}";  _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Gemini — google.com/app returns 200 in supported regions, redirects/403 elsewhere
-    _name="Gemini"
-    _code=$(curl -s -k -L -A "$_ua" \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://gemini.google.com/app" 2>/dev/null)
-    case "$_code" in
-        200)     _icon="${E_OK}"; _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Discord
-    _name="Discord"
-    _probe "https://discord.com/api/v9/gateway" "200" ""
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
+    done
+    rm -rf "$_svc_dir" 2>/dev/null
 }
 
 # probe_throughput: measure download speed and detect ISP throttle/block.
 # Two-stage test:
 #   Stage 1: 32 KB — fast, detects 16 KB block pattern (РКН drops after ~16 KB)
-#   Stage 2: 1 MB  — accurate speed measurement (skipped if stage 1 shows block)
+#   Stage 2: 8 MB  — accurate speed measurement (skipped if stage 1 shows block)
 # Sets: PROBE_SPEED_MBPS, PROBE_SPEED_BYTES, PROBE_SPEED_SECS, PROBE_SPEED_STATUS
 probe_throughput() {
     local m_ip m_port sec raw speed_bps size_bytes time_secs
@@ -3846,14 +3874,14 @@ probe_throughput() {
         return
     fi
 
-    # Stage 2: 1 MB — accurate speed measurement
+    # Stage 2: 8 MB — accurate speed measurement
     raw=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 60 \
-        -H "Range: bytes=0-1048575" \
+        -H "Range: bytes=0-8388607" \
         -o /dev/null \
         -w "%{speed_download}:%{size_download}:%{time_total}" \
-        "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+        "https://speed.cloudflare.com/__down?bytes=8388608" 2>/dev/null)
 
     speed_bps=$(printf '%s' "${raw%%:*}"          | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
     size_bytes=$(printf '%s' "$raw" | cut -d: -f2 | grep -oE '^[0-9]+'            || echo "0")
@@ -3887,11 +3915,11 @@ probe_throughput() {
             local raw_d speed_d
             raw_d=$(curl -4 -s -k \
                 $_if_flag --noproxy '*' \
-                --connect-timeout 6 --max-time 30 \
-                -H "Range: bytes=0-1048575" \
+                --connect-timeout 6 --max-time 60 \
+                -H "Range: bytes=0-8388607" \
                 -o /dev/null \
                 -w "%{speed_download}" \
-                "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+                "https://speed.cloudflare.com/__down?bytes=8388608" 2>/dev/null)
             speed_d=$(printf '%s' "$raw_d" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
             [ -n "$speed_d" ] && [ "$(awk "BEGIN{print (${speed_d} > 0) ? 1 : 0}")" = "1" ] && \
                 PROBE_SPEED_DIRECT_MBPS=$(awk "BEGIN{printf \"%.2f\", ${speed_d} * 8 / 1000000}")
@@ -13502,53 +13530,86 @@ _handle_fallback_socks() {
             ;;
 
         "cmd_test_fb_socks")
-            send_or_edit "$mid" "$(printf '%s Проверка SOCKS-узлов…' "$E_TIME")" ""
+            send_or_edit "$mid" "$(printf '%s Проверка транспортных каналов…' "$E_TIME")" ""
             _load_transport_ctx
             local n=0 _fb result_text=""
-            # Short timeouts for interactive test (3s connect / 5s total per endpoint)
-            _probe_fast() {
-                local _url="$1" _out _code _time
-                _out=$(curl -s -k -x "$_url" \
-                    --connect-timeout 3 --max-time 5 \
-                    -o /dev/null -w "%{http_code}:%{time_total}" \
+
+            # Deliberately diagnostic-only: this function never writes route state.
+            # gstatic measures generic egress; getMe proves THIS bot can use Telegram.
+            _probe_channel() {
+                local _pc_proxy="$1" _pc_out _pc_code _pc_time _pc_body
+                CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
+                CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="тайм-аут"
+
+                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                    -o /dev/null -w '%{http_code}:%{time_total}' \
                     "http://www.gstatic.com/generate_204" 2>/dev/null)
-                _code="${_out%%:*}"
-                _time="${_out#*:}"
-                if [ "$_code" = "204" ]; then
-                    awk -v t="$_time" 'BEGIN{printf "%d мс", int(t*1000)}'
-                else
-                    echo "timeout"
+                _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
+                if [ "$_pc_code" = "204" ]; then
+                    CH_INET_OK=1
+                    CH_INET_MS=$(awk -v t="${_pc_time:-0}" 'BEGIN{printf "%d", t*1000}')
                 fi
+
+                _pc_body="${BOT_DIR}/channel_tg_$$"
+                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                    -o "$_pc_body" -w '%{http_code}:%{time_total}' \
+                    "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
+                _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
+                CH_TG_CODE="${_pc_code:-000}"
+                if [ -n "$_pc_code" ] && [ "$_pc_code" != "000" ]; then
+                    CH_TG_REACH=1
+                    CH_TG_MS=$(awk -v t="${_pc_time:-0}" 'BEGIN{printf "%d", t*1000}')
+                    CH_TG_DETAIL="HTTP ${_pc_code}"
+                fi
+                if [ "$_pc_code" = "200" ] && jq -e '.ok == true and (.result.id != null)' "$_pc_body" >/dev/null 2>&1; then
+                    CH_TG_OK=1
+                    CH_TG_DETAIL="ok"
+                elif [ "$_pc_code" = "401" ]; then
+                    CH_TG_DETAIL="токен отклонён"
+                elif [ "$_pc_code" = "429" ]; then
+                    CH_TG_DETAIL="Telegram ответил 429"
+                fi
+                rm -f "$_pc_body" 2>/dev/null
             }
-            local lat; lat=$(_probe_fast "socks5h://${_t_auth}${_t_ip}:${_t_port}")
-            case "$lat" in timeout|fail) result_text="${result_text}${E_ERR} Основной Podkop: <code>$lat</code>\n" ;;
-                *) result_text="${result_text}${E_ON} Основной Podkop: <code>$lat</code>\n" ;; esac
+
+            _append_channel() {
+                local _ac_label="$1" _ac_show="$2" _ac_icon _ac_inet _ac_tg
+                if [ "$CH_TG_OK" = "1" ]; then
+                    _ac_icon="$E_ON"
+                elif [ "$CH_INET_OK" = "1" ] || [ "$CH_TG_REACH" = "1" ]; then
+                    _ac_icon="$E_YLW"
+                else
+                    _ac_icon="$E_ERR"
+                fi
+                [ "$CH_INET_OK" = "1" ] && _ac_inet="${CH_INET_MS} мс" || _ac_inet="нет"
+                if [ "$CH_TG_OK" = "1" ]; then
+                    _ac_tg="${CH_TG_MS} мс"
+                elif [ "$CH_TG_REACH" = "1" ]; then
+                    _ac_tg="${CH_TG_DETAIL} · ${CH_TG_MS} мс"
+                else
+                    _ac_tg="тайм-аут"
+                fi
+                result_text="${result_text}${_ac_icon} ${_ac_label}: Internet <code>${_ac_inet}</code> · Telegram <code>${_ac_tg}</code>${_ac_show:+ <i>${_ac_show}</i>}\n"
+            }
+
+            _probe_channel "socks5h://${_t_auth}${_t_ip}:${_t_port}"
+            _append_channel "Основной Podkop" ""
             for _fb in $_t_fb_socks; do
                 n=$((n + 1))
-                lat=$(_probe_fast "$(_proxy_endpoint "$_fb")")
+                _probe_channel "$(_proxy_endpoint "$_fb")"
                 local _fb_show; _fb_show=$(html_escape "$(_proxy_display "$_fb")")
-                case "$lat" in timeout|fail)
-                    result_text="${result_text}${E_ERR} Резервный №${n}: <code>$lat</code> <i>${_fb_show}</i>\n" ;;
-                    *) result_text="${result_text}${E_ON} Резервный №${n}: <code>$lat</code> <i>${_fb_show}</i>\n" ;;
-                esac
+                _append_channel "Резервный №${n}" "$_fb_show"
             done
-            # tier3 was missing here, so with an empty fallback list this screen
-            # tested the podkop mixed proxy and nothing else — while the bot proxy
-            # sat in the live chain untested. Every tier that can carry traffic is
-            # checked now.
             local _t3_test; _t3_test=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
             if [ -n "$_t3_test" ]; then
-                lat=$(_probe_fast "$(_proxy_endpoint "$_t3_test")")
+                _probe_channel "$(_proxy_endpoint "$_t3_test")"
                 local _t3_show; _t3_show=$(html_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3_test")")")
-                case "$lat" in timeout|fail)
-                    result_text="${result_text}${E_ERR} Прокси бота: <code>$lat</code> <i>${_t3_show}</i>\n" ;;
-                    *) result_text="${result_text}${E_ON} Прокси бота: <code>$lat</code> <i>${_t3_show}</i>\n" ;;
-                esac
+                _append_channel "Прокси бота" "$_t3_show"
             fi
-            unset -f _probe_fast
+            unset -f _probe_channel _append_channel
             [ -z "$result_text" ] && result_text="<i>Узлы не настроены.</i>"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>(gstatic 204, тайм-аут 3 с. Показывает, что канал живой; пройдёт ли через него Telegram — вопрос отдельный)</i>\n\n%b' "$E_TEST" "$result_text")" \
+                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>Internet: gstatic 204. Telegram: реальный <code>getMe</code> текущего бота. Тайм-аут: 3 с connect / 5 с total.</i>\n\n%b' "$E_TEST" "$result_text")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Проверить снова\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fallback_socks_menu\"}]]}"
             ;;
 
@@ -13975,6 +14036,7 @@ ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
 <i>бот v${BOT_VERSION}</i>")
             kb='{"inline_keyboard":['
             kb="${kb}[{\"text\":\"🧭 Подробнее\",\"callback_data\":\"cmd_runtime\"}],"
+            kb="${kb}[{\"text\":\"${E_MICRO} Полный тест Outbound\",\"callback_data\":\"ask_probe_outbound_status\"}],"
             if [ "$podkop_running" = "1" ]; then
                 kb="${kb}[{\"text\":\"♻️ Перезапустить Podkop\",\"callback_data\":\"ask_reload_podkop\"}],"
             else
@@ -14974,11 +15036,14 @@ EOF
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "ask_probe_outbound"|"ask_probe_outbound_px_"*|"ask_probe_outbound_url")
+        "ask_probe_outbound"|"ask_probe_outbound_status"|"ask_probe_outbound_px_"*|"ask_probe_outbound_url")
             local sec proxy_mode active_px active_px_display text kb
             # Determine back target: px_view_N if came from proxy card, else diagnostics
             local _back_target="cmd_diagnostics"
             case "$cmd" in
+                ask_probe_outbound_status)
+                    _back_target="cmd_status"
+                    ;;
                 ask_probe_outbound_px_*)
                     local _px_idx="${cmd#ask_probe_outbound_px_}"
                     _back_target="px_view_${_px_idx}"
@@ -15010,7 +15075,7 @@ EOF
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
             [ "$proxy_mode" = "proxy:urltest" ] && mode_note=$(printf '\n<i>Режим URLTest: проверяется текущий автоматически выбранный прокси.</i>')
-            text=$(printf '%s <b>Проверить активный прокси</b>\n\nПроверка выполняется через активный прокси роутера:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность сервисов (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• скорость загрузки (короткая проверка на 32 КБ и тест на 1 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Проверка занимает 20–40 секунд и использует около 1,3 МБ трафика.</i>' \
+            text=$(printf '%s <b>Проверить активный прокси</b>\n\nПроверка выполняется через активный прокси роутера:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность 12 сервисов (Telegram API, YouTube, ChatGPT, Claude, Gemini, GitHub, Netflix, Spotify, TikTok, Twitch, Apple, Discord)\n• скорость загрузки (32 КБ для выявления обрыва после ~16 КБ + выборка 8 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Проверка занимает 20–60 секунд. Скорость: до 8 МБ через туннель; при доступном WAN — ещё до 8 МБ для прямого сравнения.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Запустить\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
