@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.15
+# Podkop Telegram Bot v0.19.16
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.15"
+BOT_VERSION="0.19.16"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -462,6 +462,9 @@ _write_route_state() {
         poll)
             LAST_ROUTE_POLL="$_key"
             LAST_ROUTE_POLL_NAME="$_name"
+            case "$_key" in
+                tier1|tier2_*|tier3) POLL_PROXY_FAIL_STREAK=0 ;;
+            esac
             LAST_ROUTE="$_key"
             LAST_ROUTE_NAME="$_name"
             _write_state_file "$POLL_ROUTE_FILE" "$_name"
@@ -592,6 +595,9 @@ LAST_ROUTE_DOC="unknown"
 # the recovery strategy of the long-polling getUpdates control plane.
 FAST_RECOVERY_MODE=0
 POLL_RECOVERY_MODE=0
+# POLL demotion hysteresis: a single failed long-poll cascade must not drop a
+# proxy route to Direct while the independent follower still sees a fresh live proxy.
+POLL_PROXY_FAIL_STREAK=0
 _TOKEN_401_LAST=0
 # Telegram 409/429 tracking. These are answers FROM Telegram, so they prove the
 # tier carried the request — treating them as "tier down" demotes working proxies.
@@ -1954,6 +1960,24 @@ _try_all_tiers() {
         # Same reasoning as above: a refusal is not a fault of this proxy.
         [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
     fi
+    # POLL-only demotion hysteresis.  If the independent follower has a
+    # fresh positive proxy sample, one failed long-poll cascade is treated as transient.
+    # The next POLL retries the proxy stack; two consecutive failures still allow Direct.
+    if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then
+        if _poll_follower_has_fresh_proxy; then
+            POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))
+            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then
+                _TG_NO_DEMOTE=1
+                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold"
+                return 1
+            fi
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote"
+        else
+            POLL_PROXY_FAIL_STREAK=0
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
+        fi
+    fi
+
     # tier4: direct
     if [ "$_t_policy" != "socks" ]; then
         if _try_curl "$_t_ifflag" "$max_time" "$args" "5"; then
@@ -2280,40 +2304,81 @@ probe_socks_latency() {
     fi
 }
 
-# Probe all configured SOCKS endpoints (tier1 + fallback_socks list) and write
-# structured results to SOCKS_PROBE_FILE. Called periodically from watchdog.
-# Формат: tier1=<ms|timeout>  tier2_1=<ms|timeout>  ts=<epoch>
+# Probe all configured proxy endpoints in parallel and write structured results
+# to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active
+# POLL route: while the bot is on a reserve path it keeps watching tier1, every
+# other tier2_N and tier3 at the same time.  This is health telemetry only and
+# never mutates FAST/POLL route state.
+# Format: tier1=<ms|timeout>  tier2_1=<ms|timeout>  tier3=<ms|timeout>  ts=<epoch>
 probe_all_socks_write() {
-    # Use _load_transport_ctx to get tier1 + all fallbacks (explicit + auto-sections).
-    # This ensures Transport Latency card in Tunnel Health shows all paths including
-    # auto-added mixed_proxy from other sections.
     _load_transport_ctx
-    local lat out="ts=$(date +%s)"
+    local _probe_dir _pids="" _slots="tier1" _n=0 _fb _slot _line _lat
+    _probe_dir=$(mktemp -d /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
 
-    # tier1: primary Podkop SOCKS
-    lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
-    out="${out}\ntier1=${lat}"
-    logger -t podkop-bot "[SOCKSProbe] Primary (${_t_ip}:${_t_port}): ${lat}"
+    (
+        _lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
+        printf 'tier1=%s\n' "$_lat" > "$_probe_dir/tier1"
+    ) & _pids="$_pids $!"
 
-    # tier2_N: all fallbacks (explicit fallback_socks + auto-added sections)
-    local _n=0 _fb
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
-        lat=$(probe_socks_latency "$(_proxy_endpoint "$_fb")")
-        out="${out}\ntier2_${_n}=${lat} url=$(_proxy_display "$_fb")"
-        logger -t podkop-bot "[SOCKSProbe] Fallback-${_n} ($(_proxy_display "$_fb")): ${lat}"
+        _slot="tier2_${_n}"
+        _slots="$_slots $_slot"
+        (
+            _lat=$(probe_socks_latency "$(_proxy_endpoint "$_fb")")
+            printf '%s=%s url=%s\n' "$_slot" "$_lat" "$(_proxy_display "$_fb")" > "$_probe_dir/$_slot"
+        ) & _pids="$_pids $!"
     done
 
-    # tier3: custom_proxy
     if [ -n "$_t_custom" ]; then
-        lat=$(probe_socks_latency "$_t_custom")
-        out="${out}\ntier3=${lat} url=${_t_custom}"
-        logger -t podkop-bot "[SOCKSProbe] Custom proxy (${_t_custom}): ${lat}"
+        _slots="$_slots tier3"
+        (
+            _lat=$(probe_socks_latency "$_t_custom")
+            printf 'tier3=%s url=%s\n' "$_lat" "$(_mask_proxy "$(_proxy_endpoint "$_t_custom")")" > "$_probe_dir/tier3"
+        ) & _pids="$_pids $!"
     fi
 
+    # Reap exactly our workers; never use a bare wait in the bot shell.
+    for _pid in $_pids; do wait "$_pid" 2>/dev/null || true; done
+
+    local out="ts=$(date +%s)"
+    for _slot in $_slots; do
+        _line=$(cat "$_probe_dir/$_slot" 2>/dev/null)
+        [ -n "$_line" ] || _line="${_slot}=timeout"
+        out="${out}\n${_line}"
+        _lat=$(printf '%s' "$_line" | cut -d= -f2 | awk '{print $1}')
+        logger -t podkop-bot "[SOCKSProbe] route=${_slot} status=${_lat}"
+    done
+
+    rm -rf "$_probe_dir" 2>/dev/null
     local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
     printf '%b\n' "$out" > "$_probe_tmp"
     mv "$_probe_tmp" "$SOCKS_PROBE_FILE" 2>/dev/null || rm -f "$_probe_tmp"
+}
+
+# Return success only when the follower has a recent positive proxy sample.
+# A gstatic 204 does not prove that a Telegram long-poll will survive, therefore
+# this signal is used only to grant one hysteresis hold, never as a route success.
+_poll_follower_has_fresh_proxy() {
+    [ -s "$SOCKS_PROBE_FILE" ] || return 1
+    local _ts _now _hi _max_age
+    _ts=$(sed -n 's/^ts=//p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
+    case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
+    _now=$(date +%s 2>/dev/null || echo 0)
+    _hi=$(uci -q get podkop_bot.settings.health_interval 2>/dev/null || echo 60)
+    case "$_hi" in ''|*[!0-9]*) _hi=60 ;; esac
+    _max_age=$((_hi * 2 + 30))
+    [ "$_max_age" -lt 90 ] && _max_age=90
+    [ "$_max_age" -gt 600 ] && _max_age=600
+    [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1
+    grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
+}
+
+# Journal values must stay ASCII/machine-readable even when UI fallback text is localized.
+_probe_journal_value() {
+    local _v="$1"
+    [ -n "$_v" ] || { printf 'n/a'; return; }
+    if LC_ALL=C printf '%s' "$_v" | grep -q '[^ -~]'; then printf 'n/a'; else printf '%s' "$_v"; fi
 }
 
 # api_document: sendDocument — never updates FAST or POLL route state.
@@ -5376,7 +5441,13 @@ start_health_daemon() {
             fi
 
             probe_cycle=$((probe_cycle + 1))
-            if [ "$probe_cycle" -ge "$PROBE_EVERY" ]; then
+            _wd_probe_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\r\n\t')
+            _wd_probe_due=0
+            case "${_wd_probe_route:-unknown}" in
+                tier1|unknown|"") [ "$probe_cycle" -ge "$PROBE_EVERY" ] && _wd_probe_due=1 ;;
+                *)                _wd_probe_due=1 ;;
+            esac
+            if [ "$_wd_probe_due" -eq 1 ]; then
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
                 _wd_log_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
@@ -15140,7 +15211,8 @@ EOF
             PROBE_GOOGLE_COUNTRY=""
             logger -t podkop-bot "[Probe] step 2/4 google: start"
             probe_google
-            logger -t podkop-bot "[Probe] step 2/4 google: done country=${PROBE_GOOGLE_COUNTRY:-n/a}"
+            local _j_google; _j_google=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] step 2/4 google: done country=${_j_google}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 3/4: доступность сервисов…' "$E_MICRO")" ""
 
             # Step 3: Services
@@ -15267,7 +15339,11 @@ EOF
             esac
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
 
-            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
+            local _j_geo _j_cf _j_google_final
+            _j_geo=$(_probe_journal_value "${PROBE_COUNTRY:-}")
+            _j_cf=$(_probe_journal_value "${PROBE_CF_COUNTRY:-}")
+            _j_google_final=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${_j_geo} cf=${_j_cf} google=${_j_google_final} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
             ) &
             local _probe_worker_pid=$!
