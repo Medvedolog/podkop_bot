@@ -1,4 +1,4 @@
-name: tmp-patch-0.19.16-refine
+name: tmp-patch-0.19.16-fix
 
 on:
   push:
@@ -17,110 +17,54 @@ jobs:
         with:
           ref: dev/0.19.16-parallel-health-hysteresis
           fetch-depth: 0
-      - name: Refine 0.19.16 follower and journal
+      - name: Fix follower function and validate
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
-
           p = Path('podkop_bot.sh')
           s = p.read_text()
+          start = s.index('# Measure Telegram Bot API reachability through one proxy endpoint.')
+          end = s.index('# Probe all configured proxy endpoints in parallel and write structured results', start)
+          fixed = '''# Measure Telegram Bot API reachability through one proxy endpoint.
+# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,
+# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:
+# Telegram answered, even though the application request itself was rejected.
+probe_telegram_proxy_latency() {
+    local _proxy="$1" _tmp _out _code _time
+    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }
+    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \\
+        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)
+    _code="${_out%%:*}"
+    _time="${_out#*:}"
+    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \\
+       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then
+        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'
+    else
+        printf 'timeout'
+    fi
+    rm -f "$_tmp" 2>/dev/null
+}
 
-          def one(old, new, label):
-              global s
-              n = s.count(old)
-              if n != 1:
-                  raise SystemExit(f'{label}: expected exactly one match, got {n}')
-              s = s.replace(old, new, 1)
-
-          # The adaptive cadence must read the machine key file, not the localized display file.
-          one('_wd_probe_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d \'\\r\\n\\t\')',
-              '_wd_probe_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d \'\\r\\n\\t\')',
-              'adaptive route key')
-
-          # Health summary is syslog/machine-facing too.
-          one('_wd_log_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d \'\\n\' || echo "unknown")',
-              '_wd_log_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d \'\\n\' || echo "unknown")',
-              'health summary route key')
-
-          # The follower must test the thing we actually care about: Telegram Bot API,
-          # not only a generic gstatic 204. Application-level 401/429 still prove that
-          # the network path reached Telegram and are therefore health-positive.
-          marker = '''# Probe all configured proxy endpoints in parallel and write structured results\n'''
-          fn = r'''# Measure Telegram Bot API reachability through one proxy endpoint.\n# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,\n# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:\n# Telegram answered, even though the application request itself was rejected.\nprobe_telegram_proxy_latency() {\n    local _proxy="$1" _tmp _out _code _time\n    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }\n    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \\\n        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)\n    _code="${_out%%:*}"\n    _time="${_out#*:}"\n    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \\\n       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then\n        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'\n    else\n        printf 'timeout'\n    fi\n    rm -f "$_tmp" 2>/dev/null\n}\n\n'''
-          if marker not in s:
-              raise SystemExit('follower marker missing')
-          s = s.replace(marker, fn + marker, 1)
-
-          s = s.replace('probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}"',
-                        'probe_telegram_proxy_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}"', 1)
-          s = s.replace('probe_socks_latency "$(_proxy_endpoint "$_fb")"',
-                        'probe_telegram_proxy_latency "$(_proxy_endpoint "$_fb")"', 1)
-          s = s.replace('probe_socks_latency "$_t_custom"',
-                        'probe_telegram_proxy_latency "$_t_custom"', 1)
-
-          # Rename the sanitizer now that it protects more than probe-only fields.
-          one('_probe_journal_value() {', '_journal_value() {', 'journal helper name')
-          s = s.replace('_probe_journal_value ', '_journal_value ')
-
-          # User-facing proxy mnemonics and localized fallback labels must not leak into syslog.
-          one('logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display "$_fb")"',
-              'logger -t podkop-bot "[Transport] Trying fallback SOCKS. route=tier2_${_n}"',
-              'fallback route journal')
-
-          # GH fetch fallback loop gets a machine route number for the journal; UI text stays unchanged.
-          old = '''    local _fb\n    for _fb in $_t_fb_socks; do\n        if curl -s --connect-timeout "$_ct" --max-time "$_max" \\\n                -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then\n            _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"\n            logger -t podkop-bot "[GH fetch] via fallback SOCKS $(_proxy_display "$_fb")"\n            return 0\n        fi\n    done'''
-          new = '''    local _fb _gh_fb_n=0\n    for _fb in $_t_fb_socks; do\n        _gh_fb_n=$((_gh_fb_n + 1))\n        if curl -s --connect-timeout "$_ct" --max-time "$_max" \\\n                -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then\n            _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"\n            logger -t podkop-bot "[GH fetch] via fallback SOCKS route=tier2_${_gh_fb_n}"\n            return 0\n        fi\n    done'''
-          one(old, new, 'GH fallback journal')
-
-          # Watchdog's fallback probe was another localized mnemonic leak.
-          old = '''                        for _fb in "$@"; do\n                            local _fb_ip _fb_port _fb_hp'''
-          new = '''                        local _wd_fb_n=0\n                        for _fb in "$@"; do\n                            _wd_fb_n=$((_wd_fb_n + 1))\n                            local _fb_ip _fb_port _fb_hp'''
-          one(old, new, 'watchdog fallback counter')
-          one('logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display "$_fb") is alive."',
-              'logger -t podkop-bot "[Watchdog] Primary SOCKS down; fallback route=tier2_${_wd_fb_n} is alive."',
-              'watchdog fallback journal')
-
-          # Probe context/geo fields have localized display fallbacks. Sanitize before logger.
-          one('''            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${px_type}"''',
-              '''            local _j_px_type; _j_px_type=$(_journal_value "${px_type:-}")\n            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_px_type}"''',
-              'probe context journal')
-          one('''            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${PROBE_EXIT_IP:-n/a} country=${PROBE_COUNTRY:-n/a} cf=${PROBE_CF_COUNTRY:-n/a}"''',
-              '''            local _j_exit_ip _j_country _j_cf_step1\n            _j_exit_ip=$(_journal_value "${PROBE_EXIT_IP:-}")\n            _j_country=$(_journal_value "${PROBE_COUNTRY:-}")\n            _j_cf_step1=$(_journal_value "${PROBE_CF_COUNTRY:-}")\n            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${_j_exit_ip} country=${_j_country} cf=${_j_cf_step1}"''',
-              'probe step1 journal')
-
-          # Public IP UI may use a localized failure label; keep syslog ASCII.
-          one('''    logger -t podkop-bot "[PublicIP] ${winner} (via ${sources})"''',
-              '''    local _j_pubip _j_sources\n    _j_pubip=$(_journal_value "${winner:-}")\n    _j_sources=$(_journal_value "${sources:-}")\n    logger -t podkop-bot "[PublicIP] value=${_j_pubip} sources=${_j_sources}"''',
-              'public ip journal')
-
-          # Make the follower log identify the actual probe contract.
-          one('logger -t podkop-bot "[SOCKSProbe] route=${_slot} status=${_lat}"',
-              'logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"',
-              'follower journal tag')
-
-          # Changelog correction: follower is Telegram-specific, not merely generic latency.
-          ch = Path('CHANGELOG.md')
-          c = ch.read_text()
-          c = c.replace('the watchdog follower now probes tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially.',
-                        'the watchdog follower now probes Telegram `getMe` through tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially.', 1)
-          c = c.replace('probe geo fallback values are normalized to ASCII machine values (`n/a`) before syslog;',
-                        'localized route/probe fallback values are normalized to ASCII machine values before syslog;', 1)
-          ch.write_text(c)
-
+'''
+          s = s[:start] + fixed + s[end:]
+          s = s.replace('# A gstatic 204 does not prove that a Telegram long-poll will survive, therefore\n# this signal is used only to grant one hysteresis hold, never as a route success.',
+                        '# A successful getMe proves Bot API reachability but not that a 50s long-poll will\n# survive; this signal grants one hysteresis hold, never an authoritative route success.')
           p.write_text(s)
           PY
 
           sh -n podkop_bot.sh
-          grep -q 'probe_telegram_proxy_latency' podkop_bot.sh
-          grep -q 'POLL_ROUTE_KEY_FILE.*_wd_probe_route\|_wd_probe_route=.*POLL_ROUTE_KEY_FILE' podkop_bot.sh
-          grep -q '\[Follower\] target=telegram_getMe' podkop_bot.sh
-          ! grep -F 'logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display' podkop_bot.sh
-          ! grep -F 'logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display' podkop_bot.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('podkop_bot.sh').read_text()
+          assert 'probe_telegram_proxy_latency() {' in s
+          assert '\\nprobe_telegram_proxy_latency()' not in s
+          assert s.count('probe_telegram_proxy_latency() {') == 1
+          assert s.count('probe_telegram_proxy_latency "') >= 3
+          PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add podkop_bot.sh CHANGELOG.md
+          git add podkop_bot.sh
           git diff --cached --check
-          git commit -m "0.19.16: make follower Telegram-aware and journal-safe"
+          git commit -m "0.19.16: fix Telegram follower function"
           git push origin HEAD:dev/0.19.16-parallel-health-hysteresis
