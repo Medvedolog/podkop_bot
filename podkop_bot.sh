@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.13
+# Podkop Telegram Bot v0.19.14
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.13"
+BOT_VERSION="0.19.14"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -15075,7 +15075,7 @@ EOF
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
             [ "$proxy_mode" = "proxy:urltest" ] && mode_note=$(printf '\n<i>Режим URLTest: проверяется текущий автоматически выбранный прокси.</i>')
-            text=$(printf '%s <b>Проверить активный прокси</b>\n\nПроверка выполняется через активный прокси роутера:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность 12 сервисов (Telegram API, YouTube, ChatGPT, Claude, Gemini, GitHub, Netflix, Spotify, TikTok, Twitch, Apple, Discord)\n• скорость загрузки (32 КБ для выявления обрыва после ~16 КБ + выборка 8 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Проверка занимает 20–60 секунд. Скорость: до 8 МБ через туннель; при доступном WAN — ещё до 8 МБ для прямого сравнения.</i>' \
+            text=$(printf '%s <b>Полный тест Outbound</b>\n\nЭто тот же полный тест, что <b>Диагностика → Проверить прокси</b>; отдельной второй реализации нет.\n\nПроверка выполняется через активный прокси роутера и не меняет маршруты или настройки:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность 12 сервисов (Telegram API, YouTube, ChatGPT, Claude, Gemini, GitHub, Netflix, Spotify, TikTok, Twitch, Apple, Discord)\n• скорость загрузки (32 КБ для выявления обрыва после ~16 КБ + выборка 8 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Обычно 20–60 секунд. Создаёт кратковременную сетевую и небольшую CPU-нагрузку: 12 параллельных проверок сервисов, до 8 МБ через туннель и, если прямой WAN доступен, ещё до 8 МБ для сравнения скорости.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Запустить\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -16208,7 +16208,7 @@ handle_command() {
         cmd_server_instances|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
-        ask_probe_outbound|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
+        ask_probe_outbound|ask_probe_outbound_status|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
         cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
         ask_restart_bot|do_restart_bot|\
         ask_restart_router_1|ask_restart_router_2)
