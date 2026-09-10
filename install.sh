@@ -18,6 +18,14 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.6.2"
+#
+# CHANGELOG v2.6.2:
+# - FIXED: update-luci accepts native owfeed/OpenWrt APKv3 release asset names
+#        (luci-app-podkop-bot-<version>-rN.apk). APK matching now uses the
+#        unambiguous .apk extension, which also remains compatible with the old
+#        nFPM _noarch.apk releases. IPK matching remains _all.ipk.
+#
 # INSTALLER_VERSION="2.6.1"
 #
 # CHANGELOG v2.6.1:
@@ -337,7 +345,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.6.1"
+INSTALLER_VERSION="2.6.2"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -1544,7 +1552,7 @@ _update_luci_app() {
     if command -v apk >/dev/null 2>&1; then _pm="apk"
     elif command -v opkg >/dev/null 2>&1; then _pm="opkg"
     else _lu_log "[!!] Neither apk nor opkg found"; return 1; fi
-    local _suffix; [ "$_pm" = "apk" ] && _suffix="_noarch.apk" || _suffix="_all.ipk"
+    local _suffix; [ "$_pm" = "apk" ] && _suffix=".apk" || _suffix="_all.ipk"
     _lu_log "[OK] Package manager: $_pm (asset *$_suffix)"
 
     # latest release metadata
