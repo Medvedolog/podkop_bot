@@ -425,6 +425,65 @@ esac
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_day)" ]  && uci set podkop_bot.settings.weekly_report_day="7"
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_time)" ] && uci set podkop_bot.settings.weekly_report_time="09:00"
 [ -z "$(uci -q get podkop_bot.settings.daily_report_time)" ] && uci set podkop_bot.settings.daily_report_time="08:00"
+[ -z "$(uci -q get podkop_bot.settings.log_level)" ]         && uci set podkop_bot.settings.log_level="normal"
+
+# System journal verbosity. A tiny /tmp cache is shared by the main loop and
+# watchdog children, so changing the level does not require a restart and does
+# not spawn `uci` for every log line. The watchdog refreshes it once per health
+# cycle, while Telegram settings update it immediately.
+LOG_LEVEL_FILE="${BOT_DIR}/log_level"
+FOLLOWER_LOG_STATE_FILE="${BOT_DIR}/follower_log_state"
+FOLLOWER_LOG_SUMMARY_TS_FILE="${BOT_DIR}/follower_log_summary_ts"
+
+_normalize_log_level() {
+    case "$1" in quiet|normal|debug) printf '%s' "$1" ;; *) printf 'normal' ;; esac
+}
+
+_set_log_level_cache() {
+    local _ll _tmp
+    _ll=$(_normalize_log_level "$1")
+    _tmp="${LOG_LEVEL_FILE}.tmp.$$"
+    printf '%s\n' "$_ll" > "$_tmp" && mv "$_tmp" "$LOG_LEVEL_FILE" 2>/dev/null
+}
+
+_refresh_log_level_cache() {
+    local _ll
+    _ll=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo normal)
+    _set_log_level_cache "$_ll"
+}
+
+_load_log_level() {
+    PB_LOG_LEVEL="normal"
+    if [ -r "$LOG_LEVEL_FILE" ]; then
+        IFS= read -r PB_LOG_LEVEL < "$LOG_LEVEL_FILE" || PB_LOG_LEVEL="normal"
+    fi
+    case "$PB_LOG_LEVEL" in quiet|normal|debug) ;; *) PB_LOG_LEVEL="normal" ;; esac
+}
+
+# Central gate for bot journal verbosity. Keep unknown/new messages in normal
+# rather than hiding them accidentally; only proven high-frequency telemetry is
+# filtered. FATAL messages emitted before this function is defined are therefore
+# also never suppressible.
+logger() {
+    _load_log_level
+    local _msg="$*"
+    case "$PB_LOG_LEVEL" in
+        debug) command logger "$@"; return ;;
+        normal)
+            case "$_msg" in
+                *"[Health] System OK "*|*"[Probe] step="*|*"[Probe][Services]"*|*"[Probe] queued background worker"*|*"[Transport] Probing SOCKS tiers (recovery mode)"*|*"[Transport] Trying bot proxy"*) return ;;
+            esac
+            ;;
+        quiet)
+            case "$_msg" in
+                *"[Follower]"*|*"[Health] System OK "*|*"[Probe]"*|*"[SOCKSProbe]"*|*"[GH fetch]"*|*"[Transport] Probing SOCKS tiers (recovery mode)"*|*"[Transport] Trying bot proxy"*|*"[Transport] Sticky route missed"*|*"profile=fast"*) return ;;
+            esac
+            ;;
+    esac
+    command logger "$@"
+}
+
+_refresh_log_level_cache
 
 API_URL="https://api.telegram.org/bot${TOKEN}"
 TG_EMERGENCY_IPS="149.154.167.220 149.154.166.110 91.108.4.249"
@@ -2336,6 +2395,45 @@ probe_telegram_proxy_latency() {
     rm -f "$_tmp" 2>/dev/null
 }
 
+# Follower logging is state-driven in normal mode: no per-probe steady-state
+# spam, only up/down transitions plus one compact hourly snapshot. Debug retains
+# every raw sample; quiet keeps the follower entirely out of the journal.
+_log_follower_sample() {
+    local _slot="$1" _lat="$2" _state _prev_line _prev_state _tmp
+    _load_log_level
+    [ "$PB_LOG_LEVEL" = "quiet" ] && return 0
+    if [ "$PB_LOG_LEVEL" = "debug" ]; then
+        command logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"
+        return 0
+    fi
+    case "$_lat" in *ms) _state="up" ;; *) _state="down" ;; esac
+    _prev_line=$(grep "^${_slot}|" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null | head -1)
+    _prev_state=$(printf '%s' "$_prev_line" | cut -d'|' -f2)
+    if [ -n "$_prev_state" ] && [ "$_prev_state" != "$_state" ]; then
+        command logger -t podkop-bot "[Follower] route=${_slot} state=${_state} previous=${_prev_state} status=${_lat}"
+    fi
+    _tmp="${FOLLOWER_LOG_STATE_FILE}.tmp.$$"
+    { grep -v "^${_slot}|" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null || true; printf '%s|%s|%s\n' "$_slot" "$_state" "$_lat"; } > "$_tmp"
+    mv "$_tmp" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null || rm -f "$_tmp"
+}
+
+_log_follower_summary() {
+    local _out="$1" _now _last=0 _summary
+    _load_log_level
+    [ "$PB_LOG_LEVEL" = "normal" ] || return 0
+    _now=$(date +%s 2>/dev/null || echo 0)
+    if [ -r "$FOLLOWER_LOG_SUMMARY_TS_FILE" ]; then IFS= read -r _last < "$FOLLOWER_LOG_SUMMARY_TS_FILE" || _last=0; fi
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -eq 0 ]; then
+        printf '%s\n' "$_now" > "$FOLLOWER_LOG_SUMMARY_TS_FILE"
+        return 0
+    fi
+    [ $((_now - _last)) -lt 3600 ] && return 0
+    _summary=$(printf '%b\n' "$_out" | grep '^tier' | sed 's/ url=.*//' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    [ -n "$_summary" ] && command logger -t podkop-bot "[Follower] summary ${_summary}"
+    printf '%s\n' "$_now" > "$FOLLOWER_LOG_SUMMARY_TS_FILE"
+}
+
 # Probe all configured proxy endpoints in parallel and write structured results
 # to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active
 # POLL route: while the bot is on a reserve path it keeps watching tier1, every
@@ -2379,8 +2477,9 @@ probe_all_socks_write() {
         [ -n "$_line" ] || _line="${_slot}=timeout"
         out="${out}\n${_line}"
         _lat=$(printf '%s' "$_line" | cut -d= -f2 | awk '{print $1}')
-        logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"
+        _log_follower_sample "$_slot" "$_lat"
     done
+    _log_follower_summary "$out"
 
     rm -rf "$_probe_dir" 2>/dev/null
     local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
@@ -5564,6 +5663,10 @@ start_health_daemon() {
                     send_weekly_report scheduled &
                 fi
             fi
+
+            # Pick up LuCI log-level changes without restarting the bot. This is
+            # one UCI read per watchdog cycle, not one read per journal line.
+            _refresh_log_level_cache
 
             probe_cycle=$((probe_cycle + 1))
             _wd_probe_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\r\n\t')
@@ -15019,7 +15122,9 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             esac
 
             local bi_btn st_icon al_icon bc bc_icon ram_al ram_al_icon qh qh_icon qh_from qh_to
-            local wr wr_icon wr_day wr_time _wr_day_name
+            local wr wr_icon wr_day wr_time _wr_day_name log_lvl log_lvl_disp
+            log_lvl=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo "normal")
+            case "$log_lvl" in quiet) log_lvl_disp="Тихий" ;; debug) log_lvl_disp="Отладочный" ;; *) log_lvl="normal"; log_lvl_disp="Обычный" ;; esac
             wr=$(uci -q get podkop_bot.settings.weekly_report || echo "0")
             wr_day=$(uci -q get podkop_bot.settings.weekly_report_day || echo "7")
             wr_time=$(uci -q get podkop_bot.settings.weekly_report_time || echo "09:00")
@@ -15053,6 +15158,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
 {"inline_keyboard":[
   [{"text":"Подключение: ${tr_disp}","callback_data":"ask_set_tr_menu"}],
   [{"text":"Интервал: ${hi} с","callback_data":"set_bot_hi_${next_hi}"}],
+  [{"text":"${E_LOG} Журнал: ${log_lvl_disp}","callback_data":"log_level_menu"}],
   [{"text":"${E_NET} Прокси подключения${cp_sfx}","callback_data":"net_proxies_menu"}],
   [${bi_btn}],
   [{"text":"${st_icon} Сообщать о запуске","callback_data":"toggle_bot_st"}],
@@ -15087,6 +15193,7 @@ ${tr_chain}
 <b>Прокси бота:</b> <code>${cp_disp}</code>${cp_hint:+
 ${cp_hint}}
 <b>Сетевой интерфейс:</b> <code>${bi_disp}</code>
+<b>Системный журнал:</b> <code>${log_lvl_disp}</code>
 <code>────────────────────</code>
 <b>Время работы бота:</b> ${uptime_sys}
 <b>Запущен:</b> ${BOT_START_STR}
@@ -15145,6 +15252,22 @@ EOF
             uci set podkop_bot.settings.health_interval="$_new_hi"
             uci_commit_safe podkop_bot
             _handle_bot "bot_settings" "$mid" "" "" ;;
+        "log_level_menu")
+            local _ll _q _n _d
+            _ll=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo normal)
+            _q="Тихий"; _n="Обычный"; _d="Отладочный"
+            case "$_ll" in quiet) _q="✓ Тихий" ;; debug) _d="✓ Отладочный" ;; *) _n="✓ Обычный" ;; esac
+            send_or_edit "$mid" "$(printf '%s <b>Подробность системного журнала</b>\n\n<b>Тихий</b> — только важные события, ошибки, безопасность и смена маршрута.\n<b>Обычный</b> — рекомендуемый режим: значимые события, изменения follower и редкая сводка.\n<b>Отладочный</b> — все проверки и транспортная телеметрия; журнал заполняется заметно быстрее.' "$E_LOG")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_q}\",\"callback_data\":\"set_log_level_quiet\"},{\"text\":\"${_n}\",\"callback_data\":\"set_log_level_normal\"}],[{\"text\":\"${_d}\",\"callback_data\":\"set_log_level_debug\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"}]]}"
+            ;;
+        "set_log_level_"*)
+            local _new_ll="${cmd#set_log_level_}"
+            case "$_new_ll" in quiet|normal|debug) ;; *) _new_ll="normal" ;; esac
+            uci set podkop_bot.settings.log_level="$_new_ll"
+            uci_commit_safe podkop_bot
+            _set_log_level_cache "$_new_ll"
+            _handle_bot "bot_settings" "$mid" "" ""
+            ;;
         "toggle_bot_st") toggle_uci_bool "podkop_bot.settings" "startup_notify"; _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_bot_al") toggle_uci_bool "podkop_bot.settings" "alert_notify";   _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_broadcast_alerts") toggle_uci_bool "podkop_bot.settings" "broadcast_alerts"; _handle_bot "bot_settings" "$mid" "" "" ;;
