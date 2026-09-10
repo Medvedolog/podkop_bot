@@ -1,0 +1,23 @@
+name: tmp-inspect-0.19.17-logverbosity
+on:
+  push:
+    branches: [dev/0.19.17-security-hardening]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.17-security-hardening
+      - name: Inspect logging and Telegram settings anchors
+        run: |
+          echo '=== logger count ==='
+          grep -c 'logger -t podkop-bot' podkop_bot.sh || true
+          echo '=== bot_settings anchors ==='
+          grep -n -A80 -B10 'bot_settings)' podkop_bot.sh | head -120 || true
+          echo '=== set_bot anchors ==='
+          grep -n -A30 -B10 'set_bot_anon_' podkop_bot.sh | head -100 || true
+          echo '=== follower anchors ==='
+          grep -n -A90 -B20 'probe_all_socks_write()' podkop_bot.sh | head -140 || true
