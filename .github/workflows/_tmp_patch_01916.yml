@@ -1,4 +1,4 @@
-name: tmp-patch-0.19.16
+name: tmp-patch-0.19.16-refine
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
         with:
           ref: dev/0.19.16-parallel-health-hysteresis
           fetch-depth: 0
-      - name: Apply 0.19.16 transport patch
+      - name: Refine 0.19.16 follower and journal
         shell: bash
         run: |
           python3 - <<'PY'
@@ -34,65 +34,93 @@ jobs:
                   raise SystemExit(f'{label}: expected exactly one match, got {n}')
               s = s.replace(old, new, 1)
 
-          one('Podkop Telegram Bot v0.19.15', 'Podkop Telegram Bot v0.19.16', 'header version')
-          one('BOT_VERSION="0.19.15"', 'BOT_VERSION="0.19.16"', 'BOT_VERSION')
-          one('FAST_RECOVERY_MODE=0\nPOLL_RECOVERY_MODE=0',
-              'FAST_RECOVERY_MODE=0\nPOLL_RECOVERY_MODE=0\n# POLL demotion hysteresis: a single failed long-poll cascade must not drop a\n# proxy route to Direct while the independent follower still sees a fresh live proxy.\nPOLL_PROXY_FAIL_STREAK=0',
-              'poll fail streak state')
+          # The adaptive cadence must read the machine key file, not the localized display file.
+          one('_wd_probe_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d \'\\r\\n\\t\')',
+              '_wd_probe_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d \'\\r\\n\\t\')',
+              'adaptive route key')
 
-          # Reset demotion hysteresis only on an authoritative successful POLL proxy route.
-          one('''        poll)\n            LAST_ROUTE_POLL="$_key"\n            LAST_ROUTE_POLL_NAME="$_name"''',
-              '''        poll)\n            LAST_ROUTE_POLL="$_key"\n            LAST_ROUTE_POLL_NAME="$_name"\n            case "$_key" in\n                tier1|tier2_*|tier3) POLL_PROXY_FAIL_STREAK=0 ;;\n            esac''',
-              'poll route state reset')
+          # Health summary is syslog/machine-facing too.
+          one('_wd_log_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d \'\\n\' || echo "unknown")',
+              '_wd_log_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d \'\\n\' || echo "unknown")',
+              'health summary route key')
 
-          # Parallel follower: all proxy legs are measured concurrently.  The result file\n          # remains ordered and atomic, so existing readers keep the same contract.
-          pat = re.compile(r'''# Probe all configured SOCKS endpoints \(tier1 \+ fallback_socks list\) and write\n# structured results to SOCKS_PROBE_FILE\. Called periodically from watchdog\.\n# Формат: tier1=<ms\|timeout>  tier2_1=<ms\|timeout>  ts=<epoch>\nprobe_all_socks_write\(\) \{.*?\n\}\n\n# api_document:''', re.S)
-          repl = r'''# Probe all configured proxy endpoints in parallel and write structured results\n# to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active\n# POLL route: while the bot is on a reserve path it keeps watching tier1, every\n# other tier2_N and tier3 at the same time.  This is health telemetry only and\n# never mutates FAST/POLL route state.\n# Format: tier1=<ms|timeout>  tier2_1=<ms|timeout>  tier3=<ms|timeout>  ts=<epoch>\nprobe_all_socks_write() {\n    _load_transport_ctx\n    local _probe_dir _pids="" _slots="tier1" _n=0 _fb _slot _line _lat\n    _probe_dir=$(mktemp -d /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1\n\n    (\n        _lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")\n        printf 'tier1=%s\\n' "$_lat" > "$_probe_dir/tier1"\n    ) & _pids="$_pids $!"\n\n    for _fb in $_t_fb_socks; do\n        _n=$((_n + 1))\n        _slot="tier2_${_n}"\n        _slots="$_slots $_slot"\n        (\n            _lat=$(probe_socks_latency "$(_proxy_endpoint "$_fb")")\n            printf '%s=%s url=%s\\n' "$_slot" "$_lat" "$(_proxy_display "$_fb")" > "$_probe_dir/$_slot"\n        ) & _pids="$_pids $!"\n    done\n\n    if [ -n "$_t_custom" ]; then\n        _slots="$_slots tier3"\n        (\n            _lat=$(probe_socks_latency "$_t_custom")\n            printf 'tier3=%s url=%s\\n' "$_lat" "$(_mask_proxy "$(_proxy_endpoint "$_t_custom")")" > "$_probe_dir/tier3"\n        ) & _pids="$_pids $!"\n    fi\n\n    # Reap exactly our workers; never use a bare wait in the bot shell.\n    for _pid in $_pids; do wait "$_pid" 2>/dev/null || true; done\n\n    local out="ts=$(date +%s)"\n    for _slot in $_slots; do\n        _line=$(cat "$_probe_dir/$_slot" 2>/dev/null)\n        [ -n "$_line" ] || _line="${_slot}=timeout"\n        out="${out}\\n${_line}"\n        _lat=$(printf '%s' "$_line" | cut -d= -f2 | awk '{print $1}')\n        logger -t podkop-bot "[SOCKSProbe] route=${_slot} status=${_lat}"\n    done\n\n    rm -rf "$_probe_dir" 2>/dev/null\n    local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1\n    printf '%b\\n' "$out" > "$_probe_tmp"\n    mv "$_probe_tmp" "$SOCKS_PROBE_FILE" 2>/dev/null || rm -f "$_probe_tmp"\n}\n\n# Return success only when the follower has a recent positive proxy sample.\n# A gstatic 204 does not prove that a Telegram long-poll will survive, therefore\n# this signal is used only to grant one hysteresis hold, never as a route success.\n_poll_follower_has_fresh_proxy() {\n    [ -s "$SOCKS_PROBE_FILE" ] || return 1\n    local _ts _now _hi _max_age\n    _ts=$(sed -n 's/^ts=//p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)\n    case "$_ts" in ''|*[!0-9]*) return 1 ;; esac\n    _now=$(date +%s 2>/dev/null || echo 0)\n    _hi=$(uci -q get podkop_bot.settings.health_interval 2>/dev/null || echo 60)\n    case "$_hi" in ''|*[!0-9]*) _hi=60 ;; esac\n    _max_age=$((_hi * 2 + 30))\n    [ "$_max_age" -lt 90 ] && _max_age=90\n    [ "$_max_age" -gt 600 ] && _max_age=600\n    [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1\n    grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null\n}\n\n# Journal values must stay ASCII/machine-readable even when UI fallback text is localized.\n_probe_journal_value() {\n    local _v="$1"\n    [ -n "$_v" ] || { printf 'n/a'; return; }\n    if LC_ALL=C printf '%s' "$_v" | grep -q '[^ -~]'; then printf 'n/a'; else printf '%s' "$_v"; fi\n}\n\n# api_document:'''
-          s2, n = pat.subn(repl, s, count=1)
-          if n != 1:
-              raise SystemExit(f'parallel follower block: expected 1 match, got {n}')
-          s = s2
+          # The follower must test the thing we actually care about: Telegram Bot API,
+          # not only a generic gstatic 204. Application-level 401/429 still prove that
+          # the network path reached Telegram and are therefore health-positive.
+          marker = '''# Probe all configured proxy endpoints in parallel and write structured results\n'''
+          fn = r'''# Measure Telegram Bot API reachability through one proxy endpoint.\n# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,\n# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:\n# Telegram answered, even though the application request itself was rejected.\nprobe_telegram_proxy_latency() {\n    local _proxy="$1" _tmp _out _code _time\n    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }\n    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \\\n        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)\n    _code="${_out%%:*}"\n    _time="${_out#*:}"\n    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \\\n       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then\n        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'\n    else\n        printf 'timeout'\n    fi\n    rm -f "$_tmp" 2>/dev/null\n}\n\n'''
+          if marker not in s:
+              raise SystemExit('follower marker missing')
+          s = s.replace(marker, fn + marker, 1)
 
-          # Before a POLL route is demoted to Direct, use the independent fresh follower\n          # as a one-event hysteresis.  First failed cascade is held; a second consecutive\n          # failed cascade is allowed to demote. FAST is intentionally untouched.
-          needle = '''    # tier4: direct\n    if [ "$_t_policy" != "socks" ]; then'''
-          insert = '''    # POLL-only demotion hysteresis.  If the independent follower has a\n    # fresh positive proxy sample, one failed long-poll cascade is treated as transient.\n    # The next POLL retries the proxy stack; two consecutive failures still allow Direct.\n    if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then\n        if _poll_follower_has_fresh_proxy; then\n            POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))\n            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then\n                _TG_NO_DEMOTE=1\n                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold"\n                return 1\n            fi\n            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote"\n        else\n            POLL_PROXY_FAIL_STREAK=0\n            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"\n        fi\n    fi\n\n    # tier4: direct\n    if [ "$_t_policy" != "socks" ]; then'''
-          one(needle, insert, 'poll hysteresis insertion')
+          s = s.replace('probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}"',
+                        'probe_telegram_proxy_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}"', 1)
+          s = s.replace('probe_socks_latency "$(_proxy_endpoint "$_fb")"',
+                        'probe_telegram_proxy_latency "$(_proxy_endpoint "$_fb")"', 1)
+          s = s.replace('probe_socks_latency "$_t_custom"',
+                        'probe_telegram_proxy_latency "$_t_custom"', 1)
 
-          # While POLL is on any reserve/degraded route, refresh the parallel follower\n          # every health tick instead of every fifth tick.  On tier1 keep the cheap 5x cadence.
-          one('''            probe_cycle=$((probe_cycle + 1))\n            if [ "$probe_cycle" -ge "$PROBE_EVERY" ]; then\n                probe_cycle=0''',
-              '''            probe_cycle=$((probe_cycle + 1))\n            _wd_probe_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\\r\\n\\t')\n            _wd_probe_due=0\n            case "${_wd_probe_route:-unknown}" in\n                tier1|unknown|"") [ "$probe_cycle" -ge "$PROBE_EVERY" ] && _wd_probe_due=1 ;;\n                *)                _wd_probe_due=1 ;;\n            esac\n            if [ "$_wd_probe_due" -eq 1 ]; then\n                probe_cycle=0''',
-              'adaptive follower cadence')
+          # Rename the sanitizer now that it protects more than probe-only fields.
+          one('_probe_journal_value() {', '_journal_value() {', 'journal helper name')
+          s = s.replace('_probe_journal_value ', '_journal_value ')
 
-          # Keep localized display values in Telegram, but never interpolate them into syslog.
-          one('''            logger -t podkop-bot "[Probe] step 2/4 google: done country=${PROBE_GOOGLE_COUNTRY:-n/a}"''',
-              '''            local _j_google; _j_google=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")\n            logger -t podkop-bot "[Probe] step 2/4 google: done country=${_j_google}"''',
-              'google journal sanitization')
-          one('''            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"''',
-              '''            local _j_geo _j_cf _j_google_final\n            _j_geo=$(_probe_journal_value "${PROBE_COUNTRY:-}")\n            _j_cf=$(_probe_journal_value "${PROBE_CF_COUNTRY:-}")\n            _j_google_final=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")\n            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${_j_geo} cf=${_j_cf} google=${_j_google_final} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"''',
-              'final probe journal sanitization')
+          # User-facing proxy mnemonics and localized fallback labels must not leak into syslog.
+          one('logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display "$_fb")"',
+              'logger -t podkop-bot "[Transport] Trying fallback SOCKS. route=tier2_${_n}"',
+              'fallback route journal')
 
-          p.write_text(s)
-          Path('version.txt').write_text('0.19.16\n')
+          # GH fetch fallback loop gets a machine route number for the journal; UI text stays unchanged.
+          old = '''    local _fb\n    for _fb in $_t_fb_socks; do\n        if curl -s --connect-timeout "$_ct" --max-time "$_max" \\\n                -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then\n            _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"\n            logger -t podkop-bot "[GH fetch] via fallback SOCKS $(_proxy_display "$_fb")"\n            return 0\n        fi\n    done'''
+          new = '''    local _fb _gh_fb_n=0\n    for _fb in $_t_fb_socks; do\n        _gh_fb_n=$((_gh_fb_n + 1))\n        if curl -s --connect-timeout "$_ct" --max-time "$_max" \\\n                -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then\n            _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"\n            logger -t podkop-bot "[GH fetch] via fallback SOCKS route=tier2_${_gh_fb_n}"\n            return 0\n        fi\n    done'''
+          one(old, new, 'GH fallback journal')
 
+          # Watchdog's fallback probe was another localized mnemonic leak.
+          old = '''                        for _fb in "$@"; do\n                            local _fb_ip _fb_port _fb_hp'''
+          new = '''                        local _wd_fb_n=0\n                        for _fb in "$@"; do\n                            _wd_fb_n=$((_wd_fb_n + 1))\n                            local _fb_ip _fb_port _fb_hp'''
+          one(old, new, 'watchdog fallback counter')
+          one('logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display "$_fb") is alive."',
+              'logger -t podkop-bot "[Watchdog] Primary SOCKS down; fallback route=tier2_${_wd_fb_n} is alive."',
+              'watchdog fallback journal')
+
+          # Probe context/geo fields have localized display fallbacks. Sanitize before logger.
+          one('''            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${px_type}"''',
+              '''            local _j_px_type; _j_px_type=$(_journal_value "${px_type:-}")\n            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_px_type}"''',
+              'probe context journal')
+          one('''            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${PROBE_EXIT_IP:-n/a} country=${PROBE_COUNTRY:-n/a} cf=${PROBE_CF_COUNTRY:-n/a}"''',
+              '''            local _j_exit_ip _j_country _j_cf_step1\n            _j_exit_ip=$(_journal_value "${PROBE_EXIT_IP:-}")\n            _j_country=$(_journal_value "${PROBE_COUNTRY:-}")\n            _j_cf_step1=$(_journal_value "${PROBE_CF_COUNTRY:-}")\n            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${_j_exit_ip} country=${_j_country} cf=${_j_cf_step1}"''',
+              'probe step1 journal')
+
+          # Public IP UI may use a localized failure label; keep syslog ASCII.
+          one('''    logger -t podkop-bot "[PublicIP] ${winner} (via ${sources})"''',
+              '''    local _j_pubip _j_sources\n    _j_pubip=$(_journal_value "${winner:-}")\n    _j_sources=$(_journal_value "${sources:-}")\n    logger -t podkop-bot "[PublicIP] value=${_j_pubip} sources=${_j_sources}"''',
+              'public ip journal')
+
+          # Make the follower log identify the actual probe contract.
+          one('logger -t podkop-bot "[SOCKSProbe] route=${_slot} status=${_lat}"',
+              'logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"',
+              'follower journal tag')
+
+          # Changelog correction: follower is Telegram-specific, not merely generic latency.
           ch = Path('CHANGELOG.md')
           c = ch.read_text()
-          marker = '# Changelog\n\n---\n'
-          entry = '''# Changelog\n\n---\n## v0.19.16\n\n- **TRANSPORT:** the watchdog follower now probes tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially. While POLL is using a reserve/degraded route the follower refreshes every health tick; on tier1 it keeps the normal low-frequency cadence.\n- **ANTI-FLAP:** POLL demotion to Direct gets one-event hysteresis when the independent follower still has a fresh positive proxy sample. One failed long-poll cascade is held and retried; two consecutive failed cascades may demote. FAST state remains independent.\n- **JOURNAL:** probe geo fallback values are normalized to ASCII machine values (`n/a`) before syslog; Telegram/LuCI localization is unchanged.\n\n'''
-          if marker not in c:
-              raise SystemExit('CHANGELOG marker not found')
-          ch.write_text(c.replace(marker, entry, 1))
+          c = c.replace('the watchdog follower now probes tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially.',
+                        'the watchdog follower now probes Telegram `getMe` through tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially.', 1)
+          c = c.replace('probe geo fallback values are normalized to ASCII machine values (`n/a`) before syslog;',
+                        'localized route/probe fallback values are normalized to ASCII machine values before syslog;', 1)
+          ch.write_text(c)
+
+          p.write_text(s)
           PY
 
           sh -n podkop_bot.sh
-          grep -q 'BOT_VERSION="0.19.16"' podkop_bot.sh
-          grep -q 'POLL_PROXY_FAIL_STREAK' podkop_bot.sh
-          grep -q '_poll_follower_has_fresh_proxy' podkop_bot.sh
-          grep -q 'route=${_slot} status=${_lat}' podkop_bot.sh
-          test "$(cat version.txt)" = "0.19.16"
-
+          grep -q 'probe_telegram_proxy_latency' podkop_bot.sh
+          grep -q 'POLL_ROUTE_KEY_FILE.*_wd_probe_route\|_wd_probe_route=.*POLL_ROUTE_KEY_FILE' podkop_bot.sh
+          grep -q '\[Follower\] target=telegram_getMe' podkop_bot.sh
+          ! grep -F 'logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display' podkop_bot.sh
+          ! grep -F 'logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display' podkop_bot.sh
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add podkop_bot.sh version.txt CHANGELOG.md
+          git add podkop_bot.sh CHANGELOG.md
           git diff --cached --check
-          git commit -m "0.19.16: parallel follower and POLL demotion hysteresis"
+          git commit -m "0.19.16: make follower Telegram-aware and journal-safe"
           git push origin HEAD:dev/0.19.16-parallel-health-hysteresis
