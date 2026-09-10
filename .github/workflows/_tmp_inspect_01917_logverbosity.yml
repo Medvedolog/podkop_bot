@@ -11,13 +11,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: dev/0.19.17-security-hardening
-      - name: Inspect logging and Telegram settings anchors
+      - name: Inspect Telegram settings anchors
         run: |
-          echo '=== logger count ==='
-          grep -c 'logger -t podkop-bot' podkop_bot.sh || true
-          echo '=== bot_settings anchors ==='
-          grep -n -A80 -B10 'bot_settings)' podkop_bot.sh | head -120 || true
-          echo '=== set_bot anchors ==='
-          grep -n -A30 -B10 'set_bot_anon_' podkop_bot.sh | head -100 || true
-          echo '=== follower anchors ==='
-          grep -n -A90 -B20 'probe_all_socks_write()' podkop_bot.sh | head -140 || true
+          echo '=== settings menu literal ==='
+          grep -n -A120 -B30 'Настройки бота' podkop_bot.sh | tail -n +1 | head -220 || true
+          echo '=== startup notify anchors ==='
+          grep -n -A100 -B30 'startup_notify' podkop_bot.sh | tail -n 260 || true
+          echo '=== anon anchors ==='
+          grep -n -A80 -B20 'allow_anonymous_admins' podkop_bot.sh | tail -n 220 || true
