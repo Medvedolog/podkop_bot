@@ -27,6 +27,7 @@ probe_telegram_proxy_latency() {
 '''
 s = s[:start] + fixed + s[end:]
 s = s.replace('# A gstatic 204 does not prove that a Telegram long-poll will survive, therefore\n# this signal is used only to grant one hysteresis hold, never as a route success.', '# A successful getMe proves Bot API reachability but not that a 50s long-poll will\n# survive; this signal grants one hysteresis hold, never an authoritative route success.')
+s = s.replace('local _j_px_type; _j_px_type=$(_journal_value "${px_type:-}")\n            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_px_type}"', 'local _j_type; _j_type=$(_journal_value "${px_type:-}")\n            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_type}"')
 p.write_text(s)
 
 s = p.read_text()
@@ -34,3 +35,4 @@ assert 'probe_telegram_proxy_latency() {' in s
 assert '\\nprobe_telegram_proxy_latency()' not in s
 assert s.count('probe_telegram_proxy_latency() {') == 1
 assert s.count('probe_telegram_proxy_latency "') >= 3
+assert '${_j_px_type}' not in s
