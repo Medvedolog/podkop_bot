@@ -1,6 +1,15 @@
 # Changelog
 
 ---
+## v0.19.13
+
+- **FIXED (transport-state): FAST and POLL no longer share authoritative route state.** `getUpdates` writes `poll_route*`; short Bot API calls write `fast_route*`. Watchdog degradation/recovery decisions use POLL only, so sending its own alert cannot manufacture a Direct → recovered pair. Legacy `main_route*` mirrors POLL for compatibility.
+- **FIXED: watchdog IPC can only be consumed by the main polling loop.** `ROUTE_CMD_FILE` is no longer read by the shared request engine, so `send_health_alert()` cannot consume the watchdog's own `up`/`down` command.
+- **FIXED: recovery and degraded-route reprobe state are profile-local.** A FAST success/failure cannot reset POLL recovery or postpone its SOCKS reprobe.
+- **FIXED: tier3 is consistently healthy.** Watchdog nudge now triggers only for explicit `tier4|tier5|fail`; a working custom/Opera proxy is not rediscovered every 120 seconds and `unknown` startup state is not treated as degradation.
+- **FIXED: Telegram 429 never demotes transport; FAST 409 never mutates POLL conflict state.** Only persistent POLL 409 can exceed `conflict_tolerance` and be treated as a possible second poller.
+- **DIAGNOSTICS:** structured state now includes separate `poll_route*` and `fast_route*` fields; `LAST_ROUTE_DOC` remains independent.
+
 ## v0.19.12
 
 - **FIXED (critical, 0.19.11 regression): settings could fail to save at all.** The shared UCI lock added in 0.19.11 **skipped the commit** whenever the lock could not be taken — `uci_commit_safe` had `flock … || exit 1`. The journal showed `uci commit failed (RC=1)`, implying the commit ran and failed, when in fact it never ran and the change was silently lost.

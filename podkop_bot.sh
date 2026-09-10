@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.12
+# Podkop Telegram Bot v0.19.13
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.12"
+BOT_VERSION="0.19.13"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -436,27 +436,80 @@ HEALTH_STATE_FILE="${BOT_DIR}/health_state"
 SOCKS_STATE_FILE="${BOT_DIR}/socks_state"
 # Periodic SOCKS latency probe results: key=value per endpoint, written by watchdog
 SOCKS_PROBE_FILE="${BOT_DIR}/socks_probe"
-# Timestamp of last SOCKS re-probe from degraded tier4/tier5 sticky path
-SOCKS_REPROBE_TS_FILE="${BOT_DIR}/socks_reprobe_ts"
-# Main process writes current route name here so watchdog subshell can read it
+# Profile-local timestamps for degraded tier4/tier5 sticky re-probes.
+FAST_REPROBE_TS_FILE="${BOT_DIR}/fast_socks_reprobe_ts"
+POLL_REPROBE_TS_FILE="${BOT_DIR}/poll_socks_reprobe_ts"
+
+# Authoritative transport state. Watchdog reads POLL only. FAST state is
+# diagnostic and may be updated by short calls from the main process or watchdog.
+POLL_ROUTE_FILE="${BOT_DIR}/poll_route"
+POLL_ROUTE_KEY_FILE="${BOT_DIR}/poll_route_key"
+FAST_ROUTE_FILE="${BOT_DIR}/fast_route"
+FAST_ROUTE_KEY_FILE="${BOT_DIR}/fast_route_key"
+
+# Backward-compatible aliases: mirror POLL only; FAST must never write these.
 MAIN_ROUTE_FILE="${BOT_DIR}/main_route"
-# Main process writes current route KEY here (tier1/tier2_N/tier3/tier4/tier5/fail).
-# Separate from MAIN_ROUTE_FILE (which holds human-readable name).
-# Watchdog reads this for per-cycle nudge logic — never writes to it.
 MAIN_ROUTE_KEY_FILE="${BOT_DIR}/main_route_key"
 
-# Write both route name and route key atomically from main process.
-# Called at every successful tier resolution so watchdog always reads fresh data.
-_write_main_route() {
-    local _key="$1" _name="$2"
-    # Atomic write via tmp+mv — prevents watchdog reading a truncated (empty) file
-    # between O_TRUNC and the actual write (TOCTOU on tmpfs).
-    printf '%s' "$_name" > "${MAIN_ROUTE_FILE}.tmp"  && \
-        mv "${MAIN_ROUTE_FILE}.tmp"     "$MAIN_ROUTE_FILE"     2>/dev/null
-    printf '%s' "$_key"  > "${MAIN_ROUTE_KEY_FILE}.tmp" && \
-        mv "${MAIN_ROUTE_KEY_FILE}.tmp" "$MAIN_ROUTE_KEY_FILE" 2>/dev/null
+_write_state_file() {
+    local _dst="$1" _val="$2" _tmp="${1}.tmp.$$"
+    printf '%s' "$_val" > "$_tmp" && mv "$_tmp" "$_dst" 2>/dev/null
 }
+
+_write_route_state() {
+    local _profile="$1" _key="$2" _name="$3"
+    case "$_profile" in
+        poll)
+            LAST_ROUTE_POLL="$_key"
+            LAST_ROUTE_POLL_NAME="$_name"
+            LAST_ROUTE="$_key"
+            LAST_ROUTE_NAME="$_name"
+            _write_state_file "$POLL_ROUTE_FILE" "$_name"
+            _write_state_file "$POLL_ROUTE_KEY_FILE" "$_key"
+            _write_state_file "$MAIN_ROUTE_FILE" "$_name"
+            _write_state_file "$MAIN_ROUTE_KEY_FILE" "$_key"
+            ;;
+        fast)
+            LAST_ROUTE_FAST="$_key"
+            LAST_ROUTE_FAST_NAME="$_name"
+            _write_state_file "$FAST_ROUTE_FILE" "$_name"
+            _write_state_file "$FAST_ROUTE_KEY_FILE" "$_key"
+            ;;
+    esac
+}
+
+_set_recovery_mode() {
+    case "$1" in
+        poll) POLL_RECOVERY_MODE="$2" ;;
+        fast) FAST_RECOVERY_MODE="$2" ;;
+    esac
+}
+
+_restore_poll_compat() {
+    LAST_ROUTE="$LAST_ROUTE_POLL"
+    LAST_ROUTE_NAME="$LAST_ROUTE_POLL_NAME"
+}
+
+# Watchdog -> main-loop IPC. Only the main polling loop consumes this file.
 ROUTE_CMD_FILE="${BOT_DIR}/route_cmd"
+_consume_poll_route_cmd() {
+    if mv "$ROUTE_CMD_FILE" "${ROUTE_CMD_FILE}.lock" 2>/dev/null; then
+        local _wd_cmd
+        _wd_cmd=$(cat "${ROUTE_CMD_FILE}.lock" 2>/dev/null)
+        rm -f "${ROUTE_CMD_FILE}.lock"
+        LAST_ROUTE_POLL="unknown"
+        LAST_ROUTE_POLL_NAME="Перепроверка…"
+        _write_route_state "poll" "unknown" "$LAST_ROUTE_POLL_NAME"
+        if [ "$_wd_cmd" = "down" ]; then
+            POLL_RECOVERY_MODE=4
+            logger -t podkop-bot "[Transport] Watchdog down signal received by polling loop. Resetting POLL route."
+        else
+            POLL_RECOVERY_MODE=2
+            rm -f "$POLL_REPROBE_TS_FILE"
+            logger -t podkop-bot "[Transport] Watchdog recovery signal received by polling loop. Forcing POLL SOCKS rediscovery."
+        fi
+    fi
+}
 LAST_CMD_FILE="${BOT_DIR}/last_cmd"
 UNAUTH_FILE="${BOT_DIR}/unauth"
 # Menu/alert interleaving fix: track last menu msg_id and last health alert msg_id.
@@ -528,14 +581,17 @@ E_TGT=$(printf '\xF0\x9F\x8E\xAF')    # [target] target — protocol selector
 
 LAST_ROUTE="unknown"
 LAST_ROUTE_NAME="Инициализация…"
-# Split route tracking: fast (sendMessage etc), poll (getUpdates), doc (sendDocument)
-# Doc path never updates FAST or POLL to avoid poisoning transport state with multipart failures.
+# Independent transport profiles. POLL is authoritative for bot availability;
+# FAST is only short Bot API traffic; DOC is multipart upload state.
 LAST_ROUTE_FAST="unknown"
+LAST_ROUTE_FAST_NAME="Инициализация…"
 LAST_ROUTE_POLL="unknown"
+LAST_ROUTE_POLL_NAME="Инициализация…"
 LAST_ROUTE_DOC="unknown"
-# Recovery mode: set to N after All transports FAILED; decrements each poll cycle.
-# While >0 bot aggressively probes SOCKS tiers before falling to direct.
-RECOVERY_MODE=0
+# Recovery is profile-local. A failed/successful sendMessage must never alter
+# the recovery strategy of the long-polling getUpdates control plane.
+FAST_RECOVERY_MODE=0
+POLL_RECOVERY_MODE=0
 _TOKEN_401_LAST=0
 # Telegram 409/429 tracking. These are answers FROM Telegram, so they prove the
 # tier carried the request — treating them as "tier down" demotes working proxies.
@@ -544,8 +600,10 @@ _TOKEN_401_LAST=0
 # previous getUpdates registered at Telegram while curl has already given up
 # locally, so the retry on the next tier collides with it. Tolerate a short streak,
 # then stop protecting the tier — a persistent conflict is a real second poller.
-_TG_CONFLICT_STREAK=0
-_TG_CONFLICT_LAST=0
+_TG_POLL_CONFLICT_STREAK=0
+_TG_POLL_CONFLICT_LAST=0
+_TG_FAST_409_LAST=0
+_TG_RATE_LIMIT_LAST=0
 _TG_NO_DEMOTE=0
 _TG_CONFLICT_MAX=$(uci -q get podkop_bot.settings.conflict_tolerance 2>/dev/null || echo 3)
 case "$_TG_CONFLICT_MAX" in ''|*[!0-9]*) _TG_CONFLICT_MAX=3 ;; esac
@@ -1301,7 +1359,7 @@ _try_curl() {
     res=$(curl -s -k --connect-timeout "$ct" --max-time "$2" $1 $3 2>/dev/null)
     if _is_telegram_response "$res"; then
         API_RESPONSE="$res"
-        _TG_CONFLICT_STREAK=0
+        [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && _TG_POLL_CONFLICT_STREAK=0
         return 0
     fi
     # Distinguish a REJECTED TOKEN from a dead transport: if Telegram actually
@@ -1315,17 +1373,38 @@ _try_curl() {
             logger -t podkop-bot "FATAL-ish: Telegram rejected the bot token (HTTP 401). Transport is fine — the token is invalid or revoked. Fix podkop_bot.settings.bot_token (get a fresh one from @BotFather) and restart. Not a network/SOCKS problem."
         fi
     fi
-    # 409 (another getUpdates in flight) and 429 (rate limit) are answers FROM
+    # 429 is an application-level rate limit returned by Telegram. It proves
+    # the selected path works and must never demote a transport tier.
+    if printf '%s' "$res" | jq -e '.ok == false and .error_code == 429' >/dev/null 2>&1; then
+        local _now_429
+        _now_429=$(date +%s 2>/dev/null || echo 0)
+        _TG_NO_DEMOTE=1
+        if [ $((_now_429 - ${_TG_RATE_LIMIT_LAST:-0})) -ge 120 ]; then
+            _TG_RATE_LIMIT_LAST="$_now_429"
+            logger -t podkop-bot "[Transport] Telegram answered 429 for ${_ROUTE_PROFILE:-?}; transport works, rate limit does not demote the tier."
+        fi
+        return 1
+    fi
+
+    # 409 (another getUpdates in flight) are answers FROM
     # Telegram: they prove this tier carried the request there and back. Returning
     # 1 for them still demotes the tier and walks the cascade down toward Direct,
     # which is how a perfectly healthy proxy ends up skipped. Behaviour is left
     # unchanged here on purpose — that is a routing decision, not a logging one —
     # but the case is now visible instead of silently looking like a dead tier.
-    if printf '%s' "$res" | jq -e '.ok == false and (.error_code == 409 or .error_code == 429)' >/dev/null 2>&1; then
+    if printf '%s' "$res" | jq -e '.ok == false and .error_code == 409' >/dev/null 2>&1; then
         local _now_cf _cf_code
         _now_cf=$(date +%s 2>/dev/null || echo 0)
         _cf_code=$(printf '%s' "$res" | jq -r '.error_code' 2>/dev/null)
-        _TG_CONFLICT_STREAK=$(( ${_TG_CONFLICT_STREAK:-0} + 1 ))
+        if [ "${_ROUTE_PROFILE:-fast}" != "poll" ]; then
+            _TG_NO_DEMOTE=1
+            if [ $((_now_cf - ${_TG_FAST_409_LAST:-0})) -ge 120 ]; then
+                _TG_FAST_409_LAST="$_now_cf"
+                logger -t podkop-bot "[Transport] Telegram answered 409 for FAST; path works and POLL conflict state is unchanged."
+            fi
+            return 1
+        fi
+        _TG_POLL_CONFLICT_STREAK=$(( ${_TG_POLL_CONFLICT_STREAK:-0} + 1 ))
         # Below the threshold the tier keeps its place: Telegram answered through
         # it, so it demonstrably works. This is the common case when an upstream
         # sing-box reload stalls the active tier — curl gives up locally while the
@@ -1334,23 +1413,23 @@ _try_curl() {
         # Past the threshold we stop protecting it: a persistent conflict means a
         # genuine second poller (same token on another router), and there the bot
         # must keep moving rather than spin forever against itself.
-        if [ "${_TG_CONFLICT_STREAK}" -lt "${_TG_CONFLICT_MAX:-3}" ]; then
+        if [ "${_TG_POLL_CONFLICT_STREAK}" -lt "${_TG_CONFLICT_MAX:-3}" ]; then
             _TG_NO_DEMOTE=1
         else
             _TG_NO_DEMOTE=0
         fi
-        if [ $((_now_cf - ${_TG_CONFLICT_LAST:-0})) -ge 120 ]; then
-            _TG_CONFLICT_LAST="$_now_cf"
+        if [ $((_now_cf - ${_TG_POLL_CONFLICT_LAST:-0})) -ge 120 ]; then
+            _TG_POLL_CONFLICT_LAST="$_now_cf"
             if [ "${_TG_NO_DEMOTE}" = "1" ]; then
-                logger -t podkop-bot "[Transport] Telegram answered ${_cf_code} for ${_ROUTE_PROFILE:-?} (${_TG_CONFLICT_STREAK}/${_TG_CONFLICT_MAX:-3}) — transport works, request refused; keeping the tier."
+                logger -t podkop-bot "[Transport] Telegram answered ${_cf_code} for ${_ROUTE_PROFILE:-?} (${_TG_POLL_CONFLICT_STREAK}/${_TG_CONFLICT_MAX:-3}) — transport works, request refused; keeping the tier."
             else
-                logger -t podkop-bot "[Transport] Telegram keeps answering ${_cf_code} (${_TG_CONFLICT_STREAK} in a row) — this is no longer transient. Check for a second bot instance using the same token; the tier will now be demoted."
+                logger -t podkop-bot "[Transport] Telegram keeps answering ${_cf_code} (${_TG_POLL_CONFLICT_STREAK} in a row) — this is no longer transient. Check for a second bot instance using the same token; the tier will now be demoted."
             fi
         fi
     else
-        # Any other failure is a real transport fault — a conflict streak that was
-        # building up is not related to it, so it must not carry over.
-        _TG_CONFLICT_STREAK=0
+        # Any other POLL failure is a real transport fault; only POLL owns this
+        # conflict streak. FAST failures must not mutate POLL control state.
+        [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && _TG_POLL_CONFLICT_STREAK=0
     fi
     return 1
 }
@@ -1911,36 +1990,12 @@ _route_request() {
     local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5"
     local _last ROUTE_KEY ROUTE_NAME
 
-    # --- IPC: read command from watchdog subshell ---
-    # Watchdog cannot modify parent variables directly (subshell isolation).
-    # It writes "down" or "up" to ROUTE_CMD_FILE; we act on it here at the
-    # top of every transport call (both api_request_fast and api_poll_long).
-    # Atomic read: mv to a lock file first — if two processes race, only one
-    # gets a successful mv (rename is atomic on Linux tmpfs), eliminating TOCTOU.
-    if mv "$ROUTE_CMD_FILE" "${ROUTE_CMD_FILE}.lock" 2>/dev/null; then
-        local _wd_cmd
-        _wd_cmd=$(cat "${ROUTE_CMD_FILE}.lock" 2>/dev/null)
-        rm -f "${ROUTE_CMD_FILE}.lock"
-        LAST_ROUTE_FAST="unknown"
-        LAST_ROUTE_POLL="unknown"
-        LAST_ROUTE="unknown"
-        if [ "$_wd_cmd" = "down" ]; then
-            RECOVERY_MODE=4
-            logger -t podkop-bot "[Transport] sing-box down signal received. Resetting routes."
-        else
-            # RECOVERY_MODE=2: next 2 poll cycles probe SOCKS tiers first (aggressive),
-            # preventing bot from settling on tier4/Direct when tier1 just recovered.
-            # Using 0 caused _try_all_tiers to miss tier1 on tight connect-timeout
-            # and fall through to Direct if tier1 was slow to respond post-restart.
-            RECOVERY_MODE=2
-            # Clear tier5 reprobe timestamp: forces immediate SOCKS retry on tier5 path
-            rm -f "$SOCKS_REPROBE_TS_FILE"
-            logger -t podkop-bot "[Transport] Recovery signal received. Resetting routes, forcing SOCKS rediscovery."
-        fi
-    fi
-    # ------------------------------------------------
 
     _load_transport_ctx
+    case "$_rvar" in
+        LAST_ROUTE_POLL) _reprobe_file="$POLL_REPROBE_TS_FILE" ;;
+        *)               _reprobe_file="$FAST_REPROBE_TS_FILE" ;;
+    esac
     eval "_last=\$$_rvar"
     # Name the profile for the transport log: LAST_ROUTE_FAST covers short calls,
     # LAST_ROUTE_POLL the 50s getUpdates long-poll. They keep separate routes on
@@ -1958,7 +2013,7 @@ _route_request() {
                 [ "$_t_policy" != "direct" ] && \
                 _try_curl "-x socks5h://${_t_auth}${_t_ip}:${_t_port}" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier1"; LAST_ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
-                    _write_main_route "tier1" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier1" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier1"; return 0
                 }
                 ;;
@@ -1974,7 +2029,7 @@ _route_request() {
                 [ -n "$_fb" ] && \
                 _try_curl "-x $(_proxy_endpoint "$_fb")" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="$_last"; LAST_ROUTE_NAME="Резервный SOCKS №${_n} ($(_proxy_display "$_fb"))"
-                    _write_main_route "$_last" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "$_last" "$LAST_ROUTE_NAME"
                     eval "$_rvar=$_last"; return 0
                 }
                 ;;
@@ -1982,7 +2037,7 @@ _route_request() {
                 [ -n "$_t_custom" ] && \
                 _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier3"; LAST_ROUTE_NAME="Прокси бота (${_t_custom})"
-                    _write_main_route "tier3" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier3" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier3"; return 0
                 }
                 ;;
@@ -1992,9 +2047,9 @@ _route_request() {
                 # recovers but tier1 is still down (Telegram accessible directly).
                 local _now _last_reprobe
                 _now=$(date +%s)
-                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                _last_reprobe=$(cat "$_reprobe_file" 2>/dev/null || echo 0)
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
-                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    echo "$_now" > "$_reprobe_file"
                     local ROUTE_KEY ROUTE_NAME
                     # Try SOCKS tiers (tier1+tier2) first.
                     # Then try tier3 (custom proxy) separately — _try_socks_tiers doesn't cover it.
@@ -2011,7 +2066,7 @@ _route_request() {
                     fi
                     if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
                         logger -t podkop-bot "[Transport] Recovered from Direct. Active route: ${ROUTE_NAME}"
                         return 0
@@ -2021,7 +2076,7 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "5" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Напрямую"
-                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 ;;
@@ -2030,9 +2085,9 @@ _route_request() {
                 # Without this, bot stays on tier5 forever even after fallback_socks recovers.
                 local _now _last_reprobe
                 _now=$(date +%s)
-                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                _last_reprobe=$(cat "$_reprobe_file" 2>/dev/null || echo 0)
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
-                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    echo "$_now" > "$_reprobe_file"
                     local ROUTE_KEY ROUTE_NAME
                     if _try_socks_tiers "$_args" "$_max" "2"; then
                         :
@@ -2044,7 +2099,7 @@ _route_request() {
                     fi
                     if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
                         logger -t podkop-bot "[Transport] Recovered from Emergency IP. Active route: ${ROUTE_NAME}"
                         return 0
@@ -2055,13 +2110,13 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Напрямую"
-                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 for _eip in $TG_EMERGENCY_IPS; do
                     _try_curl "$_t_ifflag --resolve api.telegram.org:443:${_eip}" "$_max" "$_args" "3" && {
                         LAST_ROUTE="tier5"; LAST_ROUTE_NAME="Аварийный IP (${_eip})"
-                        _write_main_route "tier5" "$LAST_ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "tier5" "$LAST_ROUTE_NAME"
                         eval "$_rvar=tier5"; return 0
                     }
                 done
@@ -2087,11 +2142,11 @@ _route_request() {
         local _prev_name="$LAST_ROUTE_NAME"
         LAST_ROUTE="$ROUTE_KEY"
         LAST_ROUTE_NAME="$ROUTE_NAME"
-        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
             logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
-            RECOVERY_MODE=0
+            _set_recovery_mode "$_ROUTE_PROFILE" 0
         elif [ "$_prev_name" != "$ROUTE_NAME" ]; then
             logger -t podkop-bot "[Transport] Route: ${ROUTE_NAME}"
         fi
@@ -2107,10 +2162,11 @@ _route_request() {
     fi
     if [ "$_last" != "fail" ]; then
         logger -t podkop-bot "[Transport] Connection failed. All proxy tiers exhausted."
-        RECOVERY_MODE=4
+        _set_recovery_mode "$_ROUTE_PROFILE" 4
     fi
     LAST_ROUTE="fail"; LAST_ROUTE_NAME="Нет соединения"
     eval "$_rvar=fail"
+    _write_route_state "$_ROUTE_PROFILE" "fail" "$LAST_ROUTE_NAME"
     return 1
 }
 
@@ -2118,12 +2174,13 @@ _route_request() {
 # connect-timeout: 2s sticky / 3s full   max-time: 8s
 api_request_fast() {
     local method="$1" payload="$2" max_time="${3:-8}" tmp final_args
+    _ROUTE_PROFILE="fast"
     API_RESPONSE=""
     tmp=$(mktemp /tmp/podkop_req.XXXXXX 2>/dev/null) || return 1
     printf '%s' "$payload" > "$tmp"
     final_args="-X POST -H Content-Type:application/json --data-binary @${tmp} ${API_URL}/${method}"
     # Recovery mode: try SOCKS tiers first before sticky (mirrors api_poll_long behaviour)
-    if [ "${RECOVERY_MODE:-0}" -gt 0 ]; then
+    if [ "${FAST_RECOVERY_MODE:-0}" -gt 0 ]; then
         _load_transport_ctx
         local ROUTE_KEY ROUTE_NAME
         # Use reduced max_time so all SOCKS tiers fit within one fast request budget.
@@ -2133,45 +2190,45 @@ api_request_fast() {
         logger -t podkop-bot "[Transport] Fast recovery starting. Trying SOCKS tiers..."
         if _try_socks_tiers "$final_args" "$_fast_max" "3"; then
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+            _write_route_state "fast" "$ROUTE_KEY" "$ROUTE_NAME"
             LAST_ROUTE_FAST="$ROUTE_KEY"
-            # Decrement but do NOT zero — let api_poll_long confirm stability
-            # before fully exiting recovery mode. Zeroing here causes the next
-            # poll cycle to skip SOCKS-first and potentially land on Direct.
-            RECOVERY_MODE=$((RECOVERY_MODE > 1 ? RECOVERY_MODE - 1 : 0))
+            # FAST recovery is independent of POLL. Step its own recovery window
+            # down after a successful short request; POLL state is untouched.
+            FAST_RECOVERY_MODE=$((FAST_RECOVERY_MODE > 1 ? FAST_RECOVERY_MODE - 1 : 0))
             logger -t podkop-bot "[Transport] Fast recovery: connected via ${ROUTE_NAME}"
-            rm -f "$tmp"; echo "$API_RESPONSE"; return 0
+            _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
         else
             logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
         fi
     fi
     if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST"; then
-        rm -f "$tmp"; echo "$API_RESPONSE"; return 0
+        _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
     fi
-    rm -f "$tmp"; return 1
+    _restore_poll_compat; rm -f "$tmp"; return 1
 }
 # api_request: alias for api_request_fast (backward compat for non-poll callers)
 api_request() { api_request_fast "$@"; }
 
 # api_poll_long: getUpdates only
 # connect-timeout: 3s sticky / 4s full   max-time: 65s (50s poll + buffer)
-# Recovery mode: if RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
+# Recovery mode: if POLL_RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
 api_poll_long() {
     local offset="$1" poll_timeout="${2:-50}"
+    _ROUTE_PROFILE="poll"
     local args="-X GET ${API_URL}/getUpdates?offset=${offset}&timeout=${poll_timeout}"
     API_RESPONSE=""
     _load_transport_ctx
 
     # Recovery mode: aggressively try SOCKS tiers, skip sticky
-    if [ "$RECOVERY_MODE" -gt 0 ]; then
-        RECOVERY_MODE=$((RECOVERY_MODE - 1))
+    if [ "$POLL_RECOVERY_MODE" -gt 0 ]; then
+        POLL_RECOVERY_MODE=$((POLL_RECOVERY_MODE - 1))
         logger -t podkop-bot "[Transport] Probing SOCKS tiers (recovery mode)..."
         local ROUTE_KEY ROUTE_NAME
         if _try_socks_tiers "$args" "65" "4"; then
             local _prev="$LAST_ROUTE_POLL"
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             LAST_ROUTE_POLL="$ROUTE_KEY"
-            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+            _write_route_state "poll" "$ROUTE_KEY" "$ROUTE_NAME"
             [ "$_prev" = "fail" ] && \
                 logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
             return 0
@@ -4370,10 +4427,17 @@ _write_socks_state() {
     # Forward per-section TG results so Tunnel Health can read them from SOCKS_STATE_FILE
     _tg_sec_lines=$(grep "^tg_sec_" "$HEALTH_STATE_FILE" 2>/dev/null)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
-    # Authoritative route key is in MAIN_ROUTE_KEY_FILE, written by main process.
+    # Authoritative long-poll route is in POLL_ROUTE_KEY_FILE, written by POLL only.
     printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%s\n' \
         "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$_tier3_state" "$2" "$3" \
         "${_tg_sec_lines}" > "$SOCKS_STATE_FILE"
+    local _sr_poll _sr_poll_name _sr_fast _sr_fast_name
+    _sr_poll=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
+    _sr_poll_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo unknown)
+    _sr_fast=$(cat "$FAST_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
+    _sr_fast_name=$(cat "$FAST_ROUTE_FILE" 2>/dev/null || echo unknown)
+    printf 'poll_route=%s\npoll_route_name=%s\nfast_route=%s\nfast_route_name=%s\n' \
+        "$_sr_poll" "$_sr_poll_name" "$_sr_fast" "$_sr_fast_name" >> "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -5276,7 +5340,7 @@ start_health_daemon() {
             if [ "$probe_cycle" -ge "$PROBE_EVERY" ]; then
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
-                _wd_log_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
+                _wd_log_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
                 logger -t podkop-bot "[Health] System OK | SOCKS: ${last_socks_state:-?} | sing-box: ${last_sb_state:-?} | Route: ${_wd_log_route}"
                 # Reap previous probe subshell before launching a new one.
                 # In BusyBox ash, background children become zombies until the parent
@@ -5386,7 +5450,7 @@ start_health_daemon() {
                         # (that alert already conveys the recovery — no duplicate needed)
                         if [ $((_now_tg - _recovery_ts)) -ge 30 ]; then
                             local _tg_route
-                            _tg_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
+                            _tg_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
                             case "$_tg_route" in
                                 ""|"Initializing..."|"Initializing") _tg_route="через SOCKS (восстановлен)" ;;
                             esac
@@ -5603,14 +5667,14 @@ start_health_daemon() {
                 # If baseline is "up" but bot is already on degraded route,
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
-                    _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
-                    # Nudge if route is NOT a good SOCKS tier (tier1 or tier2_N).
-                    # Use negative match to handle unknown values, typos, stale files.
+                    _wd_cur_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                    # Nudge only an explicitly degraded POLL route. tier3 is healthy;
+                    # unknown/stale values are intentionally ignored until POLL resolves.
                     case "${_wd_cur_route:-unknown}" in
-                        tier1|tier2_*)
+                        tier1|tier2_*|tier3)
                             logger -t podkop-bot "[Watchdog] Route OK (${_wd_cur_route}), no action needed."
                             ;;
-                        *)
+                        tier4|tier5|fail)
                             logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$(date +%s)" > "${BOT_DIR}/last_nudge"
@@ -5693,10 +5757,10 @@ start_health_daemon() {
             # ------------------------------------------------------------------
             # Check E: Bot transport route degradation / recovery alert
             # Fires when bot route drops to tier4 (Direct) or tier5 (Emergency IP)
-            # and when it recovers back to tier1/tier2.
+            # and when it recovers back to tier1/tier2/tier3.
             # ------------------------------------------------------------------
             local _wd_bot_route
-            _wd_bot_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+            _wd_bot_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
             # tier3 belongs in the recovered branch, not in a gap between the two.
             # It used to match neither arm, so a bot that came back up through its
             # own proxy sent no recovery notice AND left last_bot_route_degraded=1 —
@@ -5712,7 +5776,7 @@ start_health_daemon() {
                         logger -t podkop-bot "[Watchdog] Bot route recovered: ${_wd_bot_route}"
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                             local _route_name
-                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             local _rec_route_txt
                             _rec_route_txt=$(printf '<b>[%s]</b> %s <b>Соединение бота восстановлено</b>\n\n<b>Способ подключения:</b> <code>%s</code>' \
                                 "$_hn" "$E_OK" "$_route_name")
@@ -5730,7 +5794,7 @@ start_health_daemon() {
                         logger -t podkop-bot "[Watchdog] Bot route degraded: ${_wd_bot_route}"
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                             local _route_name _deg_route_txt _deg_route_pl
-                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             # Reaching tier4 means every earlier tier failed — including
                             # the bot proxy, which is not a SOCKS proxy at all. Saying
                             # only "all SOCKS are down" hid that from anyone who had one
@@ -5757,20 +5821,20 @@ start_health_daemon() {
             # send IPC up every cycle to nudge main loop back to SOCKS discovery.
             # Per-cycle nudge: if SOCKS is up but bot route is degraded,
             # send IPC up so main loop rediscovers tier1 within one health interval.
-            # Reads MAIN_ROUTE_KEY_FILE — written by main process, never stale.
+            # Reads POLL_ROUTE_KEY_FILE — written by main process, never stale.
             # Nudge: if SOCKS (tier2+) is alive but bot route is degraded,
             # send IPC up to trigger SOCKS rediscovery.
-            # Throttled to once per 120s to avoid continuous LAST_ROUTE_FAST resets
-            # which would cause full discovery every poll cycle (recover old=fail loop).
+            # Throttled to once per 120s to avoid continuously resetting POLL
+            # discovery while a degraded route is still usable.
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
-                _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
-                # Negative match: nudge on anything that is NOT tier1/tier2_*
-                # Handles stale files with typos/old values from previous bot versions.
+                _wd_cur_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                # Only explicit degradation is actionable. Unknown/stale values do
+                # not prove a broken long-poll and therefore must not trigger rediscovery.
                 case "${_wd_cur_route:-unknown}" in
-                    tier1|tier2_*)
+                    tier1|tier2_*|tier3)
                         : # good route, no nudge needed
                         ;;
-                    *)
+                    tier4|tier5|fail)
                         local _now_nudge _last_nudge
                         _now_nudge=$(date +%s)
                         _last_nudge=$(cat "${BOT_DIR}/last_nudge" 2>/dev/null || echo 0)
@@ -13776,7 +13840,7 @@ EOF
             esac
             [ "$_h_tgt" = "ok" ] && _tg_ok=1
 
-            _sev=$(_status_severity "$podkop_running" "$sb_running" "$_h_tgt" "$_h_socks" "$LAST_ROUTE")
+            _sev=$(_status_severity "$podkop_running" "$sb_running" "$_h_tgt" "$_h_socks" "$LAST_ROUTE_POLL")
             # Override: empty SOCKS_STATE_FILE (watchdog not yet run) → pending, not degraded
             [ "$_socks_state" = "unknown" ] && [ "$_sev" = "degraded" ] && _sev="ok"
 
@@ -16174,13 +16238,11 @@ if [ ! -f "$OFFSET_FILE" ] && [ -f "/tmp/podkop_bot_offset" ]; then
     logger -t podkop-bot "[Startup] Migrated offset from legacy path"
 fi
 
-# Pre-initialize route key file so watchdog nudge logic works from first cycle.
-# Without this, MAIN_ROUTE_KEY_FILE is empty until first api_request_fast succeeds,
-# and watchdog sees "unknown" → sends nudge → IPC up resets FAST/POLL → bot does
-# full discovery but may land on tier4 (Direct) before tier1 is confirmed reachable.
-# Setting "unknown" explicitly ensures nudge fires and triggers SOCKS-first rediscovery.
-printf 'unknown' > "$MAIN_ROUTE_KEY_FILE"
-printf 'Инициализация…' > "$MAIN_ROUTE_FILE"
+# Pre-initialize both route profiles. POLL starts as unknown and watchdog does
+# not treat unknown as degradation; the first completed getUpdates attempt becomes
+# authoritative. FAST is diagnostic only and can be populated independently.
+_write_route_state "poll" "unknown" "Инициализация…"
+_write_route_state "fast" "unknown" "Инициализация…"
 
 # Startup notification runs in background subprocess to not block the main loop
 send_startup_notification_async() {
@@ -16204,10 +16266,9 @@ send_startup_notification_async() {
     while [ "$i" -le 12 ]; do
         if api_request_fast "getMe" "{}" "5" >/dev/null; then
             load_bot_identity >/dev/null 2>&1
-            # Write initial route so watchdog subshell can read it immediately
-            _write_main_route "$LAST_ROUTE_FAST" "$LAST_ROUTE_NAME"
+            # api_request_fast already published the FAST diagnostic route.
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
-                logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
+                logger -t podkop-bot "Connected via: ${LAST_ROUTE_FAST_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Роутер")
                 p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
@@ -16253,7 +16314,7 @@ trap 'kill "$HEALTH_PID" 2>/dev/null
     # Remove volatile runtime state but preserve persistent files:
     # OFFSET_FILE (offset survives restart), ACTIVE_SECTION_FILE (user choice),
     # BOT_USERNAME_FILE / BOT_ID_FILE (identity cache).
-    rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE"         "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE"         "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$LAST_CMD_FILE" "$UNAUTH_FILE"         "${BOT_DIR}/last_nudge" "${BOT_DIR}/probe_ts" "${BOT_DIR}/pubip_refresh.lockdir"         "$PUBIP_CACHE" "$TAG_URI_CACHE" "$UCI_LINKS_CACHE" "$TAG_NAME_CACHE"         "$RELOAD_TS_FILE" "$RELOAD_LOCK" "$BOT_PID_FILE"
+    rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE"         "$POLL_REPROBE_TS_FILE" "$FAST_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$POLL_ROUTE_FILE" "$POLL_ROUTE_KEY_FILE" "$FAST_ROUTE_FILE" "$FAST_ROUTE_KEY_FILE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE"         "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$LAST_CMD_FILE" "$UNAUTH_FILE"         "${BOT_DIR}/last_nudge" "${BOT_DIR}/probe_ts" "${BOT_DIR}/pubip_refresh.lockdir"         "$PUBIP_CACHE" "$TAG_URI_CACHE" "$UCI_LINKS_CACHE" "$TAG_NAME_CACHE"         "$RELOAD_TS_FILE" "$RELOAD_LOCK" "$BOT_PID_FILE"
     rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.*         /tmp/podkop_ip[1-5].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null
     rm -f "$_LOCK_PID_FILE" 2>/dev/null
     exit' INT TERM QUIT
@@ -16266,6 +16327,7 @@ offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 while true; do
     UPDATES_FILE="/tmp/podkop_updates.$$"
 
+    _consume_poll_route_cmd
     api_poll_long "$offset" "50"
     response="$API_RESPONSE"
     [ -z "$response" ] && sleep 2 && continue
