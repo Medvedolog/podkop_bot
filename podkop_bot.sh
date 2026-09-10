@@ -1624,7 +1624,7 @@ _try_socks_tiers() {
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
         _fb_ep=$(_proxy_endpoint "$_fb")
-        logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display "$_fb")"
+        logger -t podkop-bot "[Transport] Trying fallback SOCKS. route=tier2_${_n}"
         if _try_curl "-x ${_fb_ep}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier2_${_n}"
             ROUTE_NAME="Резервный SOCKS №${_n} ($(_proxy_display "$_fb"))"
@@ -1663,12 +1663,13 @@ _curl_via_best_socks() {
     fi
 
     # 3. tier2_N — fallback_socks in order
-    local _fb
+    local _fb _gh_fb_n=0
     for _fb in $_t_fb_socks; do
+        _gh_fb_n=$((_gh_fb_n + 1))
         if curl -s --connect-timeout "$_ct" --max-time "$_max" \
                 -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then
             _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"
-            logger -t podkop-bot "[GH fetch] via fallback SOCKS $(_proxy_display "$_fb")"
+            logger -t podkop-bot "[GH fetch] via fallback SOCKS route=tier2_${_gh_fb_n}"
             return 0
         fi
     done
@@ -2304,7 +2305,7 @@ probe_socks_latency() {
     fi
 }
 
-# Probe all configured proxy endpoints in parallel and write structured results
+# Measure Telegram Bot API reachability through one proxy endpoint.\n# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,\n# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:\n# Telegram answered, even though the application request itself was rejected.\nprobe_telegram_proxy_latency() {\n    local _proxy="$1" _tmp _out _code _time\n    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }\n    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \\\n        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)\n    _code="${_out%%:*}"\n    _time="${_out#*:}"\n    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \\\n       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then\n        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'\n    else\n        printf 'timeout'\n    fi\n    rm -f "$_tmp" 2>/dev/null\n}\n\n# Probe all configured proxy endpoints in parallel and write structured results
 # to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active
 # POLL route: while the bot is on a reserve path it keeps watching tier1, every
 # other tier2_N and tier3 at the same time.  This is health telemetry only and
@@ -2316,7 +2317,7 @@ probe_all_socks_write() {
     _probe_dir=$(mktemp -d /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
 
     (
-        _lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
+        _lat=$(probe_telegram_proxy_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
         printf 'tier1=%s\n' "$_lat" > "$_probe_dir/tier1"
     ) & _pids="$_pids $!"
 
@@ -2325,7 +2326,7 @@ probe_all_socks_write() {
         _slot="tier2_${_n}"
         _slots="$_slots $_slot"
         (
-            _lat=$(probe_socks_latency "$(_proxy_endpoint "$_fb")")
+            _lat=$(probe_telegram_proxy_latency "$(_proxy_endpoint "$_fb")")
             printf '%s=%s url=%s\n' "$_slot" "$_lat" "$(_proxy_display "$_fb")" > "$_probe_dir/$_slot"
         ) & _pids="$_pids $!"
     done
@@ -2333,7 +2334,7 @@ probe_all_socks_write() {
     if [ -n "$_t_custom" ]; then
         _slots="$_slots tier3"
         (
-            _lat=$(probe_socks_latency "$_t_custom")
+            _lat=$(probe_telegram_proxy_latency "$_t_custom")
             printf 'tier3=%s url=%s\n' "$_lat" "$(_mask_proxy "$(_proxy_endpoint "$_t_custom")")" > "$_probe_dir/tier3"
         ) & _pids="$_pids $!"
     fi
@@ -2347,7 +2348,7 @@ probe_all_socks_write() {
         [ -n "$_line" ] || _line="${_slot}=timeout"
         out="${out}\n${_line}"
         _lat=$(printf '%s' "$_line" | cut -d= -f2 | awk '{print $1}')
-        logger -t podkop-bot "[SOCKSProbe] route=${_slot} status=${_lat}"
+        logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"
     done
 
     rm -rf "$_probe_dir" 2>/dev/null
@@ -2375,7 +2376,7 @@ _poll_follower_has_fresh_proxy() {
 }
 
 # Journal values must stay ASCII/machine-readable even when UI fallback text is localized.
-_probe_journal_value() {
+_journal_value() {
     local _v="$1"
     [ -n "$_v" ] || { printf 'n/a'; return; }
     if LC_ALL=C printf '%s' "$_v" | grep -q '[^ -~]'; then printf 'n/a'; else printf '%s' "$_v"; fi
@@ -2934,7 +2935,10 @@ refresh_public_ip_cache() {
     mv "$tmp" "$PUBIP_CACHE" 2>/dev/null || { rm -f "$tmp"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
 
     rm -rf "$PUBIP_REFRESH_LOCK"
-    logger -t podkop-bot "[PublicIP] ${winner} (via ${sources})"
+    local _j_pubip _j_sources
+    _j_pubip=$(_journal_value "${winner:-}")
+    _j_sources=$(_journal_value "${sources:-}")
+    logger -t podkop-bot "[PublicIP] value=${_j_pubip} sources=${_j_sources}"
 }
 
 # Read public IP from cache instantly (no blocking I/O).
@@ -5441,7 +5445,7 @@ start_health_daemon() {
             fi
 
             probe_cycle=$((probe_cycle + 1))
-            _wd_probe_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\r\n\t')
+            _wd_probe_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\r\n\t')
             _wd_probe_due=0
             case "${_wd_probe_route:-unknown}" in
                 tier1|unknown|"") [ "$probe_cycle" -ge "$PROBE_EVERY" ] && _wd_probe_due=1 ;;
@@ -5450,7 +5454,7 @@ start_health_daemon() {
             if [ "$_wd_probe_due" -eq 1 ]; then
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
-                _wd_log_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
+                _wd_log_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
                 logger -t podkop-bot "[Health] System OK | SOCKS: ${last_socks_state:-?} | sing-box: ${last_sb_state:-?} | Route: ${_wd_log_route}"
                 # Reap previous probe subshell before launching a new one.
                 # In BusyBox ash, background children become zombies until the parent
@@ -5668,7 +5672,9 @@ start_health_daemon() {
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
                         { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
+                        local _wd_fb_n=0
                         for _fb in "$@"; do
+                            _wd_fb_n=$((_wd_fb_n + 1))
                             local _fb_ip _fb_port _fb_hp
                             # endpoint without mnemonic, then strip scheme and any user:pass@
                             _fb_hp=$(_proxy_endpoint "$_fb" | sed 's|socks5h\?://||; s|.*@||')
@@ -5678,7 +5684,7 @@ start_health_daemon() {
                                 curr_socks_state="up"
                                 _fb_ok=1
                                 _fb_alive="$_fb"
-                                logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display "$_fb") is alive."
+                                logger -t podkop-bot "[Watchdog] Primary SOCKS down; fallback route=tier2_${_wd_fb_n} is alive."
                                 break
                             fi
                         done
@@ -15198,20 +15204,25 @@ EOF
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
             [ "$px_type" = "unknown" ] && px_type="Неизвестно"
 
-            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${px_type}"
+            local _j_px_type; _j_px_type=$(_journal_value "${px_type:-}")
+            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_px_type}"
 
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
             logger -t podkop-bot "[Probe] step 1/4 geo: start"
             probe_geo
-            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${PROBE_EXIT_IP:-n/a} country=${PROBE_COUNTRY:-n/a} cf=${PROBE_CF_COUNTRY:-n/a}"
+            local _j_exit_ip _j_country _j_cf_step1
+            _j_exit_ip=$(_journal_value "${PROBE_EXIT_IP:-}")
+            _j_country=$(_journal_value "${PROBE_COUNTRY:-}")
+            _j_cf_step1=$(_journal_value "${PROBE_CF_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${_j_exit_ip} country=${_j_country} cf=${_j_cf_step1}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 2/4: геолокация Google…' "$E_MICRO")" ""
 
             # Step 2: Google
             PROBE_GOOGLE_COUNTRY=""
             logger -t podkop-bot "[Probe] step 2/4 google: start"
             probe_google
-            local _j_google; _j_google=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            local _j_google; _j_google=$(_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
             logger -t podkop-bot "[Probe] step 2/4 google: done country=${_j_google}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 3/4: доступность сервисов…' "$E_MICRO")" ""
 
@@ -15340,9 +15351,9 @@ EOF
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
 
             local _j_geo _j_cf _j_google_final
-            _j_geo=$(_probe_journal_value "${PROBE_COUNTRY:-}")
-            _j_cf=$(_probe_journal_value "${PROBE_CF_COUNTRY:-}")
-            _j_google_final=$(_probe_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            _j_geo=$(_journal_value "${PROBE_COUNTRY:-}")
+            _j_cf=$(_journal_value "${PROBE_CF_COUNTRY:-}")
+            _j_google_final=$(_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
             logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${_j_geo} cf=${_j_cf} google=${_j_google_final} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
             ) &

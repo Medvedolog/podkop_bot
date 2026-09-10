@@ -3,9 +3,9 @@
 ---
 ## v0.19.16
 
-- **TRANSPORT:** the watchdog follower now probes tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially. While POLL is using a reserve/degraded route the follower refreshes every health tick; on tier1 it keeps the normal low-frequency cadence.
+- **TRANSPORT:** the watchdog follower now probes Telegram `getMe` through tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially. While POLL is using a reserve/degraded route the follower refreshes every health tick; on tier1 it keeps the normal low-frequency cadence.
 - **ANTI-FLAP:** POLL demotion to Direct gets one-event hysteresis when the independent follower still has a fresh positive proxy sample. One failed long-poll cascade is held and retried; two consecutive failed cascades may demote. FAST state remains independent.
-- **JOURNAL:** probe geo fallback values are normalized to ASCII machine values (`n/a`) before syslog; Telegram/LuCI localization is unchanged.
+- **JOURNAL:** localized route/probe fallback values are normalized to ASCII machine values before syslog; Telegram/LuCI localization is unchanged.
 
 ## v0.19.15
 
