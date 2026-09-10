@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.17
+
+- **SECURITY:** anonymous-admin sender_chat access is now opt-in (default off).
+- **SECURITY:** executable bot uploads require a fresh 5-minute session started by the primary admin in a private chat; extra admins and sender_chat identities cannot upload code.
+- **SECURITY:** unauthorized actors get per-actor temporary blocking after 5 attempts in 60 seconds plus a global alert limiter; manual UCI blocklists are supported via `blocked_user_ids` and `blocked_sender_chat_ids`.
+- **SECURITY:** attacker-controlled Telegram text is no longer written verbatim to syslog.
+
 ---
 ## v0.19.16
 

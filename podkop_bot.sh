@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.16
+# Podkop Telegram Bot v0.19.17
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.16"
+BOT_VERSION="0.19.17"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -335,12 +335,23 @@ ADMIN_ID=$(uci -q get podkop_bot.settings.chat_id)
 ADMIN_IDS=$(uci -q get podkop_bot.settings.admin_ids 2>/dev/null)
 ADMIN_SENDER_CHAT_IDS=$(uci -q get podkop_bot.settings.admin_sender_chat_ids 2>/dev/null)
 ALLOW_ANON_ADMINS=$(uci -q get podkop_bot.settings.allow_anonymous_admins 2>/dev/null)
-[ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="1"
+[ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="0"
 
 BOT_USERNAME_FILE="${BOT_DIR}/username"
 BOT_USERNAME=""
 BOT_ID_FILE="${BOT_DIR}/id"
 BOT_ID=""
+
+# Security controls. Persistent manual blocklists live in UCI; transient abuse
+# counters stay in /tmp so hostile traffic never causes flash-write amplification.
+SECURITY_GLOBAL_FILE="${BOT_DIR}/security_global"
+SECURITY_PREFIX="${BOT_DIR}/security_actor"
+SECURITY_WINDOW_SEC=60
+SECURITY_STRIKE_LIMIT=5
+SECURITY_BLOCK_SEC=3600
+SECURITY_ALERT_WINDOW_SEC=600
+SECURITY_ALERT_LIMIT=5
+UPLOAD_SESSION_TTL=300
 
 TARGET_CHAT_ID="$ADMIN_ID"
 TARGET_MESSAGE_ID=""
@@ -2567,6 +2578,92 @@ is_allowed_actor() {
     is_whitelisted_admin "$1" && return 0
     [ "$4" = "1" ] && is_whitelisted_sender_chat "$2" && return 0
     return 1
+}
+
+# Manual blocklists are anti-abuse controls for actors that are not authorized.
+# Authorized admins intentionally take precedence so an accidental list entry
+# cannot lock the owner out of the router.
+is_manually_blocked_actor() {
+    local _uid="$1" _scid="$2" _v
+    if [ -n "$_uid" ] && [ "$_uid" != "null" ]; then
+        for _v in $(uci -q get podkop_bot.settings.blocked_user_ids 2>/dev/null); do
+            [ "$_uid" = "$_v" ] && return 0
+        done
+    fi
+    if [ -n "$_scid" ] && [ "$_scid" != "null" ]; then
+        for _v in $(uci -q get podkop_bot.settings.blocked_sender_chat_ids 2>/dev/null); do
+            [ "$_scid" = "$_v" ] && return 0
+        done
+    fi
+    return 1
+}
+
+_security_actor_file() {
+    local _uid="$1" _scid="$2" _kind _id _safe
+    if [ -n "$_uid" ] && [ "$_uid" != "null" ]; then
+        _kind="user"; _id="$_uid"
+    else
+        _kind="sender"; _id="$_scid"
+    fi
+    _safe=$(printf '%s' "$_id" | tr -cd '0-9-')
+    [ -n "$_safe" ] || _safe="unknown"
+    printf '%s_%s_%s' "$SECURITY_PREFIX" "$_kind" "$_safe"
+}
+
+# Sets SECURITY_EVENT to: alert | journal | blocked_new | blocked.
+security_note_unauthorized() {
+    local _uid="$1" _scid="$2" _now _f _count=0 _start=0 _until=0
+    _now=$(date +%s)
+    _f=$(_security_actor_file "$_uid" "$_scid")
+    if [ -f "$_f" ]; then
+        IFS='|' read -r _count _start _until < "$_f"
+    fi
+    case "$_count" in ''|*[!0-9]*) _count=0 ;; esac
+    case "$_start" in ''|*[!0-9]*) _start=0 ;; esac
+    case "$_until" in ''|*[!0-9]*) _until=0 ;; esac
+    if [ "$_until" -gt "$_now" ]; then
+        SECURITY_EVENT="blocked"
+        return 0
+    fi
+    if [ $((_now - _start)) -gt "$SECURITY_WINDOW_SEC" ]; then
+        _count=0; _start="$_now"; _until=0
+    fi
+    [ "$_start" -eq 0 ] && _start="$_now"
+    _count=$((_count + 1))
+    if [ "$_count" -ge "$SECURITY_STRIKE_LIMIT" ]; then
+        _until=$((_now + SECURITY_BLOCK_SEC))
+        SECURITY_EVENT="blocked_new"
+    elif [ "$_count" -eq 1 ]; then
+        SECURITY_EVENT="alert"
+    else
+        SECURITY_EVENT="journal"
+    fi
+    printf '%s|%s|%s\n' "$_count" "$_start" "$_until" > "$_f"
+}
+
+# Global alert limiter. Sets SECURITY_SUPPRESSED to the number suppressed in the
+# previous 10-minute window when a new window starts.
+security_allow_alert() {
+    local _now _count=0 _start=0 _supp=0
+    _now=$(date +%s); SECURITY_SUPPRESSED=0
+    if [ -f "$SECURITY_GLOBAL_FILE" ]; then
+        IFS='|' read -r _count _start _supp < "$SECURITY_GLOBAL_FILE"
+    fi
+    case "$_count" in ''|*[!0-9]*) _count=0 ;; esac
+    case "$_start" in ''|*[!0-9]*) _start=0 ;; esac
+    case "$_supp" in ''|*[!0-9]*) _supp=0 ;; esac
+    if [ "$_start" -eq 0 ] || [ $((_now - _start)) -gt "$SECURITY_ALERT_WINDOW_SEC" ]; then
+        SECURITY_SUPPRESSED="$_supp"
+        _count=0; _start="$_now"; _supp=0
+    fi
+    if [ "$_count" -ge "$SECURITY_ALERT_LIMIT" ]; then
+        _supp=$((_supp + 1))
+        printf '%s|%s|%s\n' "$_count" "$_start" "$_supp" > "$SECURITY_GLOBAL_FILE"
+        return 1
+    fi
+    _count=$((_count + 1))
+    printf '%s|%s|%s\n' "$_count" "$_start" "$_supp" > "$SECURITY_GLOBAL_FILE"
+    return 0
 }
 
 is_private_chat() { [ "$1" = "private" ]; }
@@ -15677,7 +15774,13 @@ EOF
             ;;
 
         "cmd_upload_bot_script")
-            echo "wait_bot_script_file" > "$STATE_FILE"
+            if [ "${user_id:-}" != "$ADMIN_ID" ] || [ "${chat_type:-}" != "private" ]; then
+                send_or_edit "$mid" "$(printf '%s Загрузка исполняемого скрипта разрешена только основному администратору в личном чате.' "$E_ERR")" ""
+                return
+            fi
+            {
+                printf 'wait_bot_script_file\n%s\n%s\n%s\n' "$user_id" "$chat_id" "$(date +%s)"
+            } > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте файл <code>podkop_bot.sh</code> как документ.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_maintenance\"}]]}"
@@ -16581,33 +16684,35 @@ EOF
         [ -z "$BOT_USERNAME" ] && load_bot_identity >/dev/null 2>&1
         [ -z "$BOT_ID" ]       && load_bot_identity >/dev/null 2>&1
 
-        # Authorization check
+        # Authorization check. Allowlist is the security boundary; blocklists and
+        # rate limits only reduce abuse from actors that already failed it.
         if ! is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
-            if [ "$is_bot_sender" != "true" ] && [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
-                now=$(date +%s); count=1
-                [ -f "$UNAUTH_FILE" ] && count=$(( $(cut -d'|' -f1 "$UNAUTH_FILE") + 1 ))
-                echo "${count}|${now}|${u_name:-Unknown}|${user_id}" > "$UNAUTH_FILE"
-                logger -t podkop-bot "[Security] Unauthorized: user=@${u_name:-Unknown} id=${user_id} text=${text}"
+            if is_manually_blocked_actor "$user_id" "$sender_chat_id"; then
+                continue
+            fi
+            security_note_unauthorized "$user_id" "$sender_chat_id"
+            _sec_actor="user"; _sec_id="$user_id"
+            if [ -z "$_sec_id" ] || [ "$_sec_id" = "null" ]; then
+                _sec_actor="sender_chat"; _sec_id="$sender_chat_id"
+            fi
+            case "$SECURITY_EVENT" in
+                blocked) continue ;;
+                blocked_new)
+                    logger -t podkop-bot "[Security] unauthorized actor=${_sec_actor} id=${_sec_id:-unknown} action=temp_block duration=${SECURITY_BLOCK_SEC}s" ;;
+                *)
+                    logger -t podkop-bot "[Security] unauthorized actor=${_sec_actor} id=${_sec_id:-unknown} event=update" ;;
+            esac
+            if [ "$is_bot_sender" != "true" ] && [ "$SECURITY_EVENT" != "journal" ] && security_allow_alert; then
                 safe_u_name=$(html_escape "${u_name:-не указано}")
-                safe_chat_title=$(html_escape "${sender_chat_title:-без названия}")
-                safe_alert_text=$(html_escape "$text")
-                case "$chat_type" in
-                    private)    alert_chat_type="личный" ;;
-                    group)      alert_chat_type="группа" ;;
-                    supergroup) alert_chat_type="супергруппа" ;;
-                    channel)    alert_chat_type="канал" ;;
-                    *)          alert_chat_type="${chat_type:-неизвестно}" ;;
-                esac
-                if [ -n "$u_name" ] && [ "$u_name" != "null" ]; then
-                    alert_user_display="@${safe_u_name}"
-                else
-                    alert_user_display="имя пользователя не указано"
-                fi
+                safe_alert_text=$(printf '%.120s' "$text" | tr '\r\n\t' '   ')
+                safe_alert_text=$(html_escape "$safe_alert_text")
+                _sec_note=""
+                [ "$SECURITY_EVENT" = "blocked_new" ] && _sec_note="\n<b>Действие:</b> временная блокировка на 1 час"
+                [ "${SECURITY_SUPPRESSED:-0}" -gt 0 ] 2>/dev/null && _sec_note="${_sec_note}\n<b>Подавлено ранее:</b> ${SECURITY_SUPPRESSED}"
                 alert_txt=$(cat <<EOF
 ${E_WARN} <b>Попытка несанкционированного доступа</b>
-<b>Пользователь:</b> ${alert_user_display} (ID: <code>${user_id}</code>)
-<b>Чат:</b> ${alert_chat_type} | <b>Название:</b> ${safe_chat_title}
-<b>Сообщение:</b> <code>${safe_alert_text}</code>
+<b>Пользователь:</b> @${safe_u_name} (ID: <code>${_sec_id:-unknown}</code>)
+<b>Сообщение:</b> <code>${safe_alert_text}</code>${_sec_note}
 EOF
 )
                 alert_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$alert_txt" \
@@ -16644,21 +16749,25 @@ EOF
         _doc_file_id=$(printf '%s' "$update" | jq -r '.message.document.file_id // empty' 2>/dev/null)
         if [ -n "$_doc_file_id" ] && is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
             _cur_doc_state=$(head -n1 "$STATE_FILE" 2>/dev/null)
-            # Accept a bot-script upload whether or not wait_bot_script_file state
-            # is set — /tmp state can be cleared by a restart between pressing
-            # "Upload Bot Script" and sending the file. To avoid downloading every
-            # attachment an admin sends, gate on filename + size metadata BEFORE
-            # fetching. Safety of the install itself still depends on the admin
-            # gate (above) + shebang + BOT_VERSION + syntax check (below).
+            _upload_uid=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+            _upload_chat=$(sed -n '3p' "$STATE_FILE" 2>/dev/null)
+            _upload_ts=$(sed -n '4p' "$STATE_FILE" 2>/dev/null)
+            _upload_now=$(date +%s)
+            case "$_upload_ts" in ''|*[!0-9]*) _upload_ts=0 ;; esac
+            if [ "$_cur_doc_state" != "wait_bot_script_file" ] || \
+               [ "$chat_type" != "private" ] || [ "$user_id" != "$ADMIN_ID" ] || \
+               [ "$_upload_uid" != "$user_id" ] || [ "$_upload_chat" != "$chat_id" ] || \
+               [ $((_upload_now - _upload_ts)) -lt 0 ] || \
+               [ $((_upload_now - _upload_ts)) -gt "$UPLOAD_SESSION_TTL" ]; then
+                [ "$_cur_doc_state" = "wait_bot_script_file" ] && rm -f "$STATE_FILE"
+                continue
+            fi
             _doc_name=$(printf '%s' "$update" | jq -r '.message.document.file_name // empty' 2>/dev/null)
             _doc_size=$(printf '%s' "$update" | jq -r '.message.document.file_size // 0' 2>/dev/null)
             _doc_ok=0
             case "$_doc_name" in
-                podkop_bot*.sh|podkop_bot|*podkop_bot*.sh) _doc_ok=1 ;;
+                podkop_bot*.sh|podkop_bot) _doc_ok=1 ;;
             esac
-            # If explicitly waiting for a script (user just tapped Upload), accept
-            # any name — the intent is unambiguous.
-            [ "$_cur_doc_state" = "wait_bot_script_file" ] && _doc_ok=1
             case "$_doc_size" in ''|*[!0-9]*) _doc_size=0 ;; esac
             # Valid-looking bot script but too large: tell the user explicitly
             # instead of silently ignoring it (which would leave the wait state
