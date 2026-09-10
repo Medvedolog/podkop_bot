@@ -15224,8 +15224,8 @@ EOF
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
             [ "$px_type" = "unknown" ] && px_type="Неизвестно"
 
-            local _j_px_type; _j_px_type=$(_journal_value "${px_type:-}")
-            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_px_type}"
+            local _j_type; _j_type=$(_journal_value "${px_type:-}")
+            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_type}"
 
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
