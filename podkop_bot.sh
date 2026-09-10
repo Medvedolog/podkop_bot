@@ -2305,7 +2305,27 @@ probe_socks_latency() {
     fi
 }
 
-# Measure Telegram Bot API reachability through one proxy endpoint.\n# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,\n# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:\n# Telegram answered, even though the application request itself was rejected.\nprobe_telegram_proxy_latency() {\n    local _proxy="$1" _tmp _out _code _time\n    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }\n    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \\\n        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)\n    _code="${_out%%:*}"\n    _time="${_out#*:}"\n    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \\\n       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then\n        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'\n    else\n        printf 'timeout'\n    fi\n    rm -f "$_tmp" 2>/dev/null\n}\n\n# Probe all configured proxy endpoints in parallel and write structured results
+# Measure Telegram Bot API reachability through one proxy endpoint.
+# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,
+# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:
+# Telegram answered, even though the application request itself was rejected.
+probe_telegram_proxy_latency() {
+    local _proxy="$1" _tmp _out _code _time
+    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }
+    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \
+        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)
+    _code="${_out%%:*}"
+    _time="${_out#*:}"
+    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \
+       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then
+        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'
+    else
+        printf 'timeout'
+    fi
+    rm -f "$_tmp" 2>/dev/null
+}
+
+# Probe all configured proxy endpoints in parallel and write structured results
 # to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active
 # POLL route: while the bot is on a reserve path it keeps watching tier1, every
 # other tier2_N and tier3 at the same time.  This is health telemetry only and
@@ -2358,8 +2378,8 @@ probe_all_socks_write() {
 }
 
 # Return success only when the follower has a recent positive proxy sample.
-# A gstatic 204 does not prove that a Telegram long-poll will survive, therefore
-# this signal is used only to grant one hysteresis hold, never as a route success.
+# A successful getMe proves Bot API reachability but not that a 50s long-poll will
+# survive; this signal grants one hysteresis hold, never an authoritative route success.
 _poll_follower_has_fresh_proxy() {
     [ -s "$SOCKS_PROBE_FILE" ] || return 1
     local _ts _now _hi _max_age
