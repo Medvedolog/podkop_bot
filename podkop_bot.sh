@@ -2399,9 +2399,13 @@ _poll_follower_has_fresh_proxy() {
     _now=$(date +%s 2>/dev/null || echo 0)
     _hi=$(uci -q get podkop_bot.settings.health_interval 2>/dev/null || echo 60)
     case "$_hi" in ''|*[!0-9]*) _hi=60 ;; esac
-    _max_age=$((_hi * 2 + 30))
-    [ "$_max_age" -lt 90 ] && _max_age=90
-    [ "$_max_age" -gt 600 ] && _max_age=600
+    # The follower is scheduled every PROBE_EVERY=5 watchdog cycles, not every
+    # health_interval. Keep a good sample valid across two complete follower
+    # periods plus margin, otherwise a healthy proxy can be declared stale just
+    # before the next scheduled probe and POLL falsely demotes to Direct.
+    _max_age=$((_hi * 5 * 2 + 30))
+    [ "$_max_age" -lt 150 ] && _max_age=150
+    [ "$_max_age" -gt 1200 ] && _max_age=1200
     [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1
     grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
 }
