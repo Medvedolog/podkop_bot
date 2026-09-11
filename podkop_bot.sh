@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.12
+# Podkop Telegram Bot v0.19.17
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -20,8 +20,8 @@
 # 5. Background Health Daemon: 5 watchdog checks (TG connectivity, sing-box,
 #    SOCKS probe, proxy leaf change, route degradation). Alerts on tier4/tier5.
 # 6. Active Outbound Probe: geo (ipapi.co + Cloudflare + Google), service
-#    reachability (YouTube/Telegram/ChatGPT/Gemini/Discord), 2-stage throughput
-#    (32KB block detection + 1MB speed measurement).
+#    reachability (12 services including Telegram Bot API), 2-stage throughput
+#    (32KB block detection + 8MB speed measurement).
 #
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.12"
+BOT_VERSION="0.19.17"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -335,12 +335,23 @@ ADMIN_ID=$(uci -q get podkop_bot.settings.chat_id)
 ADMIN_IDS=$(uci -q get podkop_bot.settings.admin_ids 2>/dev/null)
 ADMIN_SENDER_CHAT_IDS=$(uci -q get podkop_bot.settings.admin_sender_chat_ids 2>/dev/null)
 ALLOW_ANON_ADMINS=$(uci -q get podkop_bot.settings.allow_anonymous_admins 2>/dev/null)
-[ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="1"
+[ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="0"
 
 BOT_USERNAME_FILE="${BOT_DIR}/username"
 BOT_USERNAME=""
 BOT_ID_FILE="${BOT_DIR}/id"
 BOT_ID=""
+
+# Security controls. Persistent manual blocklists live in UCI; transient abuse
+# counters stay in /tmp so hostile traffic never causes flash-write amplification.
+SECURITY_GLOBAL_FILE="${BOT_DIR}/security_global"
+SECURITY_PREFIX="${BOT_DIR}/security_actor"
+SECURITY_WINDOW_SEC=60
+SECURITY_STRIKE_LIMIT=5
+SECURITY_BLOCK_SEC=3600
+SECURITY_ALERT_WINDOW_SEC=600
+SECURITY_ALERT_LIMIT=5
+UPLOAD_SESSION_TTL=300
 
 TARGET_CHAT_ID="$ADMIN_ID"
 TARGET_MESSAGE_ID=""
@@ -414,6 +425,65 @@ esac
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_day)" ]  && uci set podkop_bot.settings.weekly_report_day="7"
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_time)" ] && uci set podkop_bot.settings.weekly_report_time="09:00"
 [ -z "$(uci -q get podkop_bot.settings.daily_report_time)" ] && uci set podkop_bot.settings.daily_report_time="08:00"
+[ -z "$(uci -q get podkop_bot.settings.log_level)" ]         && uci set podkop_bot.settings.log_level="normal"
+
+# System journal verbosity. A tiny /tmp cache is shared by the main loop and
+# watchdog children, so changing the level does not require a restart and does
+# not spawn `uci` for every log line. The watchdog refreshes it once per health
+# cycle, while Telegram settings update it immediately.
+LOG_LEVEL_FILE="${BOT_DIR}/log_level"
+FOLLOWER_LOG_STATE_FILE="${BOT_DIR}/follower_log_state"
+FOLLOWER_LOG_SUMMARY_TS_FILE="${BOT_DIR}/follower_log_summary_ts"
+
+_normalize_log_level() {
+    case "$1" in quiet|normal|debug) printf '%s' "$1" ;; *) printf 'normal' ;; esac
+}
+
+_set_log_level_cache() {
+    local _ll _tmp
+    _ll=$(_normalize_log_level "$1")
+    _tmp="${LOG_LEVEL_FILE}.tmp.$$"
+    printf '%s\n' "$_ll" > "$_tmp" && mv "$_tmp" "$LOG_LEVEL_FILE" 2>/dev/null
+}
+
+_refresh_log_level_cache() {
+    local _ll
+    _ll=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo normal)
+    _set_log_level_cache "$_ll"
+}
+
+_load_log_level() {
+    PB_LOG_LEVEL="normal"
+    if [ -r "$LOG_LEVEL_FILE" ]; then
+        IFS= read -r PB_LOG_LEVEL < "$LOG_LEVEL_FILE" || PB_LOG_LEVEL="normal"
+    fi
+    case "$PB_LOG_LEVEL" in quiet|normal|debug) ;; *) PB_LOG_LEVEL="normal" ;; esac
+}
+
+# Central gate for bot journal verbosity. Keep unknown/new messages in normal
+# rather than hiding them accidentally; only proven high-frequency telemetry is
+# filtered. FATAL messages emitted before this function is defined are therefore
+# also never suppressible.
+logger() {
+    _load_log_level
+    local _msg="$*"
+    case "$PB_LOG_LEVEL" in
+        debug) command logger "$@"; return ;;
+        normal)
+            case "$_msg" in
+                *"[Health] System OK "*|*"[Probe] step="*|*"[Probe][Services]"*|*"[Probe] queued background worker"*|*"[Transport] Probing SOCKS tiers (recovery mode)"*|*"[Transport] Trying bot proxy"*) return ;;
+            esac
+            ;;
+        quiet)
+            case "$_msg" in
+                *"[Follower]"*|*"[Health] System OK "*|*"[Probe]"*|*"[SOCKSProbe]"*|*"[GH fetch]"*|*"[Transport] Probing SOCKS tiers (recovery mode)"*|*"[Transport] Trying bot proxy"*|*"[Transport] Sticky route missed"*|*"profile=fast"*) return ;;
+            esac
+            ;;
+    esac
+    command logger "$@"
+}
+
+_refresh_log_level_cache
 
 API_URL="https://api.telegram.org/bot${TOKEN}"
 TG_EMERGENCY_IPS="149.154.167.220 149.154.166.110 91.108.4.249"
@@ -436,27 +506,83 @@ HEALTH_STATE_FILE="${BOT_DIR}/health_state"
 SOCKS_STATE_FILE="${BOT_DIR}/socks_state"
 # Periodic SOCKS latency probe results: key=value per endpoint, written by watchdog
 SOCKS_PROBE_FILE="${BOT_DIR}/socks_probe"
-# Timestamp of last SOCKS re-probe from degraded tier4/tier5 sticky path
-SOCKS_REPROBE_TS_FILE="${BOT_DIR}/socks_reprobe_ts"
-# Main process writes current route name here so watchdog subshell can read it
+# Profile-local timestamps for degraded tier4/tier5 sticky re-probes.
+FAST_REPROBE_TS_FILE="${BOT_DIR}/fast_socks_reprobe_ts"
+POLL_REPROBE_TS_FILE="${BOT_DIR}/poll_socks_reprobe_ts"
+
+# Authoritative transport state. Watchdog reads POLL only. FAST state is
+# diagnostic and may be updated by short calls from the main process or watchdog.
+POLL_ROUTE_FILE="${BOT_DIR}/poll_route"
+POLL_ROUTE_KEY_FILE="${BOT_DIR}/poll_route_key"
+FAST_ROUTE_FILE="${BOT_DIR}/fast_route"
+FAST_ROUTE_KEY_FILE="${BOT_DIR}/fast_route_key"
+
+# Backward-compatible aliases: mirror POLL only; FAST must never write these.
 MAIN_ROUTE_FILE="${BOT_DIR}/main_route"
-# Main process writes current route KEY here (tier1/tier2_N/tier3/tier4/tier5/fail).
-# Separate from MAIN_ROUTE_FILE (which holds human-readable name).
-# Watchdog reads this for per-cycle nudge logic — never writes to it.
 MAIN_ROUTE_KEY_FILE="${BOT_DIR}/main_route_key"
 
-# Write both route name and route key atomically from main process.
-# Called at every successful tier resolution so watchdog always reads fresh data.
-_write_main_route() {
-    local _key="$1" _name="$2"
-    # Atomic write via tmp+mv — prevents watchdog reading a truncated (empty) file
-    # between O_TRUNC and the actual write (TOCTOU on tmpfs).
-    printf '%s' "$_name" > "${MAIN_ROUTE_FILE}.tmp"  && \
-        mv "${MAIN_ROUTE_FILE}.tmp"     "$MAIN_ROUTE_FILE"     2>/dev/null
-    printf '%s' "$_key"  > "${MAIN_ROUTE_KEY_FILE}.tmp" && \
-        mv "${MAIN_ROUTE_KEY_FILE}.tmp" "$MAIN_ROUTE_KEY_FILE" 2>/dev/null
+_write_state_file() {
+    local _dst="$1" _val="$2" _tmp="${1}.tmp.$$"
+    printf '%s' "$_val" > "$_tmp" && mv "$_tmp" "$_dst" 2>/dev/null
 }
+
+_write_route_state() {
+    local _profile="$1" _key="$2" _name="$3"
+    case "$_profile" in
+        poll)
+            LAST_ROUTE_POLL="$_key"
+            LAST_ROUTE_POLL_NAME="$_name"
+            case "$_key" in
+                tier1|tier2_*|tier3) POLL_PROXY_FAIL_STREAK=0 ;;
+            esac
+            LAST_ROUTE="$_key"
+            LAST_ROUTE_NAME="$_name"
+            _write_state_file "$POLL_ROUTE_FILE" "$_name"
+            _write_state_file "$POLL_ROUTE_KEY_FILE" "$_key"
+            _write_state_file "$MAIN_ROUTE_FILE" "$_name"
+            _write_state_file "$MAIN_ROUTE_KEY_FILE" "$_key"
+            ;;
+        fast)
+            LAST_ROUTE_FAST="$_key"
+            LAST_ROUTE_FAST_NAME="$_name"
+            _write_state_file "$FAST_ROUTE_FILE" "$_name"
+            _write_state_file "$FAST_ROUTE_KEY_FILE" "$_key"
+            ;;
+    esac
+}
+
+_set_recovery_mode() {
+    case "$1" in
+        poll) POLL_RECOVERY_MODE="$2" ;;
+        fast) FAST_RECOVERY_MODE="$2" ;;
+    esac
+}
+
+_restore_poll_compat() {
+    LAST_ROUTE="$LAST_ROUTE_POLL"
+    LAST_ROUTE_NAME="$LAST_ROUTE_POLL_NAME"
+}
+
+# Watchdog -> main-loop IPC. Only the main polling loop consumes this file.
 ROUTE_CMD_FILE="${BOT_DIR}/route_cmd"
+_consume_poll_route_cmd() {
+    if mv "$ROUTE_CMD_FILE" "${ROUTE_CMD_FILE}.lock" 2>/dev/null; then
+        local _wd_cmd
+        _wd_cmd=$(cat "${ROUTE_CMD_FILE}.lock" 2>/dev/null)
+        rm -f "${ROUTE_CMD_FILE}.lock"
+        LAST_ROUTE_POLL="unknown"
+        LAST_ROUTE_POLL_NAME="Перепроверка…"
+        _write_route_state "poll" "unknown" "$LAST_ROUTE_POLL_NAME"
+        if [ "$_wd_cmd" = "down" ]; then
+            POLL_RECOVERY_MODE=4
+            logger -t podkop-bot "[Transport] Watchdog down signal received by polling loop. Resetting POLL route."
+        else
+            POLL_RECOVERY_MODE=2
+            rm -f "$POLL_REPROBE_TS_FILE"
+            logger -t podkop-bot "[Transport] Watchdog recovery signal received by polling loop. Forcing POLL SOCKS rediscovery."
+        fi
+    fi
+}
 LAST_CMD_FILE="${BOT_DIR}/last_cmd"
 UNAUTH_FILE="${BOT_DIR}/unauth"
 # Menu/alert interleaving fix: track last menu msg_id and last health alert msg_id.
@@ -528,14 +654,20 @@ E_TGT=$(printf '\xF0\x9F\x8E\xAF')    # [target] target — protocol selector
 
 LAST_ROUTE="unknown"
 LAST_ROUTE_NAME="Инициализация…"
-# Split route tracking: fast (sendMessage etc), poll (getUpdates), doc (sendDocument)
-# Doc path never updates FAST or POLL to avoid poisoning transport state with multipart failures.
+# Independent transport profiles. POLL is authoritative for bot availability;
+# FAST is only short Bot API traffic; DOC is multipart upload state.
 LAST_ROUTE_FAST="unknown"
+LAST_ROUTE_FAST_NAME="Инициализация…"
 LAST_ROUTE_POLL="unknown"
+LAST_ROUTE_POLL_NAME="Инициализация…"
 LAST_ROUTE_DOC="unknown"
-# Recovery mode: set to N after All transports FAILED; decrements each poll cycle.
-# While >0 bot aggressively probes SOCKS tiers before falling to direct.
-RECOVERY_MODE=0
+# Recovery is profile-local. A failed/successful sendMessage must never alter
+# the recovery strategy of the long-polling getUpdates control plane.
+FAST_RECOVERY_MODE=0
+POLL_RECOVERY_MODE=0
+# POLL demotion hysteresis: a single failed long-poll cascade must not drop a
+# proxy route to Direct while the independent follower still sees a fresh live proxy.
+POLL_PROXY_FAIL_STREAK=0
 _TOKEN_401_LAST=0
 # Telegram 409/429 tracking. These are answers FROM Telegram, so they prove the
 # tier carried the request — treating them as "tier down" demotes working proxies.
@@ -544,8 +676,10 @@ _TOKEN_401_LAST=0
 # previous getUpdates registered at Telegram while curl has already given up
 # locally, so the retry on the next tier collides with it. Tolerate a short streak,
 # then stop protecting the tier — a persistent conflict is a real second poller.
-_TG_CONFLICT_STREAK=0
-_TG_CONFLICT_LAST=0
+_TG_POLL_CONFLICT_STREAK=0
+_TG_POLL_CONFLICT_LAST=0
+_TG_FAST_409_LAST=0
+_TG_RATE_LIMIT_LAST=0
 _TG_NO_DEMOTE=0
 _TG_CONFLICT_MAX=$(uci -q get podkop_bot.settings.conflict_tolerance 2>/dev/null || echo 3)
 case "$_TG_CONFLICT_MAX" in ''|*[!0-9]*) _TG_CONFLICT_MAX=3 ;; esac
@@ -1301,7 +1435,7 @@ _try_curl() {
     res=$(curl -s -k --connect-timeout "$ct" --max-time "$2" $1 $3 2>/dev/null)
     if _is_telegram_response "$res"; then
         API_RESPONSE="$res"
-        _TG_CONFLICT_STREAK=0
+        [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && _TG_POLL_CONFLICT_STREAK=0
         return 0
     fi
     # Distinguish a REJECTED TOKEN from a dead transport: if Telegram actually
@@ -1315,17 +1449,38 @@ _try_curl() {
             logger -t podkop-bot "FATAL-ish: Telegram rejected the bot token (HTTP 401). Transport is fine — the token is invalid or revoked. Fix podkop_bot.settings.bot_token (get a fresh one from @BotFather) and restart. Not a network/SOCKS problem."
         fi
     fi
-    # 409 (another getUpdates in flight) and 429 (rate limit) are answers FROM
+    # 429 is an application-level rate limit returned by Telegram. It proves
+    # the selected path works and must never demote a transport tier.
+    if printf '%s' "$res" | jq -e '.ok == false and .error_code == 429' >/dev/null 2>&1; then
+        local _now_429
+        _now_429=$(date +%s 2>/dev/null || echo 0)
+        _TG_NO_DEMOTE=1
+        if [ $((_now_429 - ${_TG_RATE_LIMIT_LAST:-0})) -ge 120 ]; then
+            _TG_RATE_LIMIT_LAST="$_now_429"
+            logger -t podkop-bot "[Transport] Telegram answered 429 for ${_ROUTE_PROFILE:-?}; transport works, rate limit does not demote the tier."
+        fi
+        return 1
+    fi
+
+    # 409 (another getUpdates in flight) are answers FROM
     # Telegram: they prove this tier carried the request there and back. Returning
     # 1 for them still demotes the tier and walks the cascade down toward Direct,
     # which is how a perfectly healthy proxy ends up skipped. Behaviour is left
     # unchanged here on purpose — that is a routing decision, not a logging one —
     # but the case is now visible instead of silently looking like a dead tier.
-    if printf '%s' "$res" | jq -e '.ok == false and (.error_code == 409 or .error_code == 429)' >/dev/null 2>&1; then
+    if printf '%s' "$res" | jq -e '.ok == false and .error_code == 409' >/dev/null 2>&1; then
         local _now_cf _cf_code
         _now_cf=$(date +%s 2>/dev/null || echo 0)
         _cf_code=$(printf '%s' "$res" | jq -r '.error_code' 2>/dev/null)
-        _TG_CONFLICT_STREAK=$(( ${_TG_CONFLICT_STREAK:-0} + 1 ))
+        if [ "${_ROUTE_PROFILE:-fast}" != "poll" ]; then
+            _TG_NO_DEMOTE=1
+            if [ $((_now_cf - ${_TG_FAST_409_LAST:-0})) -ge 120 ]; then
+                _TG_FAST_409_LAST="$_now_cf"
+                logger -t podkop-bot "[Transport] Telegram answered 409 for FAST; path works and POLL conflict state is unchanged."
+            fi
+            return 1
+        fi
+        _TG_POLL_CONFLICT_STREAK=$(( ${_TG_POLL_CONFLICT_STREAK:-0} + 1 ))
         # Below the threshold the tier keeps its place: Telegram answered through
         # it, so it demonstrably works. This is the common case when an upstream
         # sing-box reload stalls the active tier — curl gives up locally while the
@@ -1334,23 +1489,23 @@ _try_curl() {
         # Past the threshold we stop protecting it: a persistent conflict means a
         # genuine second poller (same token on another router), and there the bot
         # must keep moving rather than spin forever against itself.
-        if [ "${_TG_CONFLICT_STREAK}" -lt "${_TG_CONFLICT_MAX:-3}" ]; then
+        if [ "${_TG_POLL_CONFLICT_STREAK}" -lt "${_TG_CONFLICT_MAX:-3}" ]; then
             _TG_NO_DEMOTE=1
         else
             _TG_NO_DEMOTE=0
         fi
-        if [ $((_now_cf - ${_TG_CONFLICT_LAST:-0})) -ge 120 ]; then
-            _TG_CONFLICT_LAST="$_now_cf"
+        if [ $((_now_cf - ${_TG_POLL_CONFLICT_LAST:-0})) -ge 120 ]; then
+            _TG_POLL_CONFLICT_LAST="$_now_cf"
             if [ "${_TG_NO_DEMOTE}" = "1" ]; then
-                logger -t podkop-bot "[Transport] Telegram answered ${_cf_code} for ${_ROUTE_PROFILE:-?} (${_TG_CONFLICT_STREAK}/${_TG_CONFLICT_MAX:-3}) — transport works, request refused; keeping the tier."
+                logger -t podkop-bot "[Transport] Telegram answered ${_cf_code} for ${_ROUTE_PROFILE:-?} (${_TG_POLL_CONFLICT_STREAK}/${_TG_CONFLICT_MAX:-3}) — transport works, request refused; keeping the tier."
             else
-                logger -t podkop-bot "[Transport] Telegram keeps answering ${_cf_code} (${_TG_CONFLICT_STREAK} in a row) — this is no longer transient. Check for a second bot instance using the same token; the tier will now be demoted."
+                logger -t podkop-bot "[Transport] Telegram keeps answering ${_cf_code} (${_TG_POLL_CONFLICT_STREAK} in a row) — this is no longer transient. Check for a second bot instance using the same token; the tier will now be demoted."
             fi
         fi
     else
-        # Any other failure is a real transport fault — a conflict streak that was
-        # building up is not related to it, so it must not carry over.
-        _TG_CONFLICT_STREAK=0
+        # Any other POLL failure is a real transport fault; only POLL owns this
+        # conflict streak. FAST failures must not mutate POLL control state.
+        [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && _TG_POLL_CONFLICT_STREAK=0
     fi
     return 1
 }
@@ -1539,7 +1694,7 @@ _try_socks_tiers() {
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
         _fb_ep=$(_proxy_endpoint "$_fb")
-        logger -t podkop-bot "[Transport] Trying fallback SOCKS: $(_proxy_display "$_fb")"
+        logger -t podkop-bot "[Transport] Trying fallback SOCKS. route=tier2_${_n}"
         if _try_curl "-x ${_fb_ep}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier2_${_n}"
             ROUTE_NAME="Резервный SOCKS №${_n} ($(_proxy_display "$_fb"))"
@@ -1578,12 +1733,13 @@ _curl_via_best_socks() {
     fi
 
     # 3. tier2_N — fallback_socks in order
-    local _fb
+    local _fb _gh_fb_n=0
     for _fb in $_t_fb_socks; do
+        _gh_fb_n=$((_gh_fb_n + 1))
         if curl -s --connect-timeout "$_ct" --max-time "$_max" \
                 -x "$(_proxy_endpoint "$_fb")" $_args 2>/dev/null; then
             _last_fetch_route="Резервный SOCKS ($(_proxy_display "$_fb"))"
-            logger -t podkop-bot "[GH fetch] via fallback SOCKS $(_proxy_display "$_fb")"
+            logger -t podkop-bot "[GH fetch] via fallback SOCKS route=tier2_${_gh_fb_n}"
             return 0
         fi
     done
@@ -1875,6 +2031,24 @@ _try_all_tiers() {
         # Same reasoning as above: a refusal is not a fault of this proxy.
         [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
     fi
+    # POLL-only demotion hysteresis.  If the independent follower has a
+    # fresh positive proxy sample, one failed long-poll cascade is treated as transient.
+    # The next POLL retries the proxy stack; two consecutive failures still allow Direct.
+    if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then
+        if _poll_follower_has_fresh_proxy; then
+            POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))
+            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then
+                _TG_NO_DEMOTE=1
+                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold"
+                return 1
+            fi
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote"
+        else
+            POLL_PROXY_FAIL_STREAK=0
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
+        fi
+    fi
+
     # tier4: direct
     if [ "$_t_policy" != "socks" ]; then
         if _try_curl "$_t_ifflag" "$max_time" "$args" "5"; then
@@ -1911,36 +2085,12 @@ _route_request() {
     local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5"
     local _last ROUTE_KEY ROUTE_NAME
 
-    # --- IPC: read command from watchdog subshell ---
-    # Watchdog cannot modify parent variables directly (subshell isolation).
-    # It writes "down" or "up" to ROUTE_CMD_FILE; we act on it here at the
-    # top of every transport call (both api_request_fast and api_poll_long).
-    # Atomic read: mv to a lock file first — if two processes race, only one
-    # gets a successful mv (rename is atomic on Linux tmpfs), eliminating TOCTOU.
-    if mv "$ROUTE_CMD_FILE" "${ROUTE_CMD_FILE}.lock" 2>/dev/null; then
-        local _wd_cmd
-        _wd_cmd=$(cat "${ROUTE_CMD_FILE}.lock" 2>/dev/null)
-        rm -f "${ROUTE_CMD_FILE}.lock"
-        LAST_ROUTE_FAST="unknown"
-        LAST_ROUTE_POLL="unknown"
-        LAST_ROUTE="unknown"
-        if [ "$_wd_cmd" = "down" ]; then
-            RECOVERY_MODE=4
-            logger -t podkop-bot "[Transport] sing-box down signal received. Resetting routes."
-        else
-            # RECOVERY_MODE=2: next 2 poll cycles probe SOCKS tiers first (aggressive),
-            # preventing bot from settling on tier4/Direct when tier1 just recovered.
-            # Using 0 caused _try_all_tiers to miss tier1 on tight connect-timeout
-            # and fall through to Direct if tier1 was slow to respond post-restart.
-            RECOVERY_MODE=2
-            # Clear tier5 reprobe timestamp: forces immediate SOCKS retry on tier5 path
-            rm -f "$SOCKS_REPROBE_TS_FILE"
-            logger -t podkop-bot "[Transport] Recovery signal received. Resetting routes, forcing SOCKS rediscovery."
-        fi
-    fi
-    # ------------------------------------------------
 
     _load_transport_ctx
+    case "$_rvar" in
+        LAST_ROUTE_POLL) _reprobe_file="$POLL_REPROBE_TS_FILE" ;;
+        *)               _reprobe_file="$FAST_REPROBE_TS_FILE" ;;
+    esac
     eval "_last=\$$_rvar"
     # Name the profile for the transport log: LAST_ROUTE_FAST covers short calls,
     # LAST_ROUTE_POLL the 50s getUpdates long-poll. They keep separate routes on
@@ -1958,7 +2108,7 @@ _route_request() {
                 [ "$_t_policy" != "direct" ] && \
                 _try_curl "-x socks5h://${_t_auth}${_t_ip}:${_t_port}" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier1"; LAST_ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
-                    _write_main_route "tier1" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier1" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier1"; return 0
                 }
                 ;;
@@ -1974,7 +2124,7 @@ _route_request() {
                 [ -n "$_fb" ] && \
                 _try_curl "-x $(_proxy_endpoint "$_fb")" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="$_last"; LAST_ROUTE_NAME="Резервный SOCKS №${_n} ($(_proxy_display "$_fb"))"
-                    _write_main_route "$_last" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "$_last" "$LAST_ROUTE_NAME"
                     eval "$_rvar=$_last"; return 0
                 }
                 ;;
@@ -1982,7 +2132,7 @@ _route_request() {
                 [ -n "$_t_custom" ] && \
                 _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier3"; LAST_ROUTE_NAME="Прокси бота (${_t_custom})"
-                    _write_main_route "tier3" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier3" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier3"; return 0
                 }
                 ;;
@@ -1992,9 +2142,9 @@ _route_request() {
                 # recovers but tier1 is still down (Telegram accessible directly).
                 local _now _last_reprobe
                 _now=$(date +%s)
-                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                _last_reprobe=$(cat "$_reprobe_file" 2>/dev/null || echo 0)
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
-                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    echo "$_now" > "$_reprobe_file"
                     local ROUTE_KEY ROUTE_NAME
                     # Try SOCKS tiers (tier1+tier2) first.
                     # Then try tier3 (custom proxy) separately — _try_socks_tiers doesn't cover it.
@@ -2011,9 +2161,9 @@ _route_request() {
                     fi
                     if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] Recovered from Direct. Active route: ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Direct. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
                         return 0
                     fi
                 fi
@@ -2021,7 +2171,7 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "5" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Напрямую"
-                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 ;;
@@ -2030,9 +2180,9 @@ _route_request() {
                 # Without this, bot stays on tier5 forever even after fallback_socks recovers.
                 local _now _last_reprobe
                 _now=$(date +%s)
-                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                _last_reprobe=$(cat "$_reprobe_file" 2>/dev/null || echo 0)
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
-                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    echo "$_now" > "$_reprobe_file"
                     local ROUTE_KEY ROUTE_NAME
                     if _try_socks_tiers "$_args" "$_max" "2"; then
                         :
@@ -2044,9 +2194,9 @@ _route_request() {
                     fi
                     if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] Recovered from Emergency IP. Active route: ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Emergency IP. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
                         return 0
                     fi
                 fi
@@ -2055,13 +2205,13 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Напрямую"
-                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
+                    _write_route_state "$_ROUTE_PROFILE" "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 for _eip in $TG_EMERGENCY_IPS; do
                     _try_curl "$_t_ifflag --resolve api.telegram.org:443:${_eip}" "$_max" "$_args" "3" && {
                         LAST_ROUTE="tier5"; LAST_ROUTE_NAME="Аварийный IP (${_eip})"
-                        _write_main_route "tier5" "$LAST_ROUTE_NAME"
+                        _write_route_state "$_ROUTE_PROFILE" "tier5" "$LAST_ROUTE_NAME"
                         eval "$_rvar=tier5"; return 0
                     }
                 done
@@ -2087,13 +2237,13 @@ _route_request() {
         local _prev_name="$LAST_ROUTE_NAME"
         LAST_ROUTE="$ROUTE_KEY"
         LAST_ROUTE_NAME="$ROUTE_NAME"
-        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+        _write_route_state "$_ROUTE_PROFILE" "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
-            logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
-            RECOVERY_MODE=0
+            logger -t podkop-bot "[Transport] Connection recovered. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
+            _set_recovery_mode "$_ROUTE_PROFILE" 0
         elif [ "$_prev_name" != "$ROUTE_NAME" ]; then
-            logger -t podkop-bot "[Transport] Route: ${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Route changed. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
         fi
         return 0
     fi
@@ -2107,10 +2257,11 @@ _route_request() {
     fi
     if [ "$_last" != "fail" ]; then
         logger -t podkop-bot "[Transport] Connection failed. All proxy tiers exhausted."
-        RECOVERY_MODE=4
+        _set_recovery_mode "$_ROUTE_PROFILE" 4
     fi
     LAST_ROUTE="fail"; LAST_ROUTE_NAME="Нет соединения"
     eval "$_rvar=fail"
+    _write_route_state "$_ROUTE_PROFILE" "fail" "$LAST_ROUTE_NAME"
     return 1
 }
 
@@ -2118,12 +2269,13 @@ _route_request() {
 # connect-timeout: 2s sticky / 3s full   max-time: 8s
 api_request_fast() {
     local method="$1" payload="$2" max_time="${3:-8}" tmp final_args
+    _ROUTE_PROFILE="fast"
     API_RESPONSE=""
     tmp=$(mktemp /tmp/podkop_req.XXXXXX 2>/dev/null) || return 1
     printf '%s' "$payload" > "$tmp"
     final_args="-X POST -H Content-Type:application/json --data-binary @${tmp} ${API_URL}/${method}"
     # Recovery mode: try SOCKS tiers first before sticky (mirrors api_poll_long behaviour)
-    if [ "${RECOVERY_MODE:-0}" -gt 0 ]; then
+    if [ "${FAST_RECOVERY_MODE:-0}" -gt 0 ]; then
         _load_transport_ctx
         local ROUTE_KEY ROUTE_NAME
         # Use reduced max_time so all SOCKS tiers fit within one fast request budget.
@@ -2133,47 +2285,47 @@ api_request_fast() {
         logger -t podkop-bot "[Transport] Fast recovery starting. Trying SOCKS tiers..."
         if _try_socks_tiers "$final_args" "$_fast_max" "3"; then
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+            _write_route_state "fast" "$ROUTE_KEY" "$ROUTE_NAME"
             LAST_ROUTE_FAST="$ROUTE_KEY"
-            # Decrement but do NOT zero — let api_poll_long confirm stability
-            # before fully exiting recovery mode. Zeroing here causes the next
-            # poll cycle to skip SOCKS-first and potentially land on Direct.
-            RECOVERY_MODE=$((RECOVERY_MODE > 1 ? RECOVERY_MODE - 1 : 0))
-            logger -t podkop-bot "[Transport] Fast recovery: connected via ${ROUTE_NAME}"
-            rm -f "$tmp"; echo "$API_RESPONSE"; return 0
+            # FAST recovery is independent of POLL. Step its own recovery window
+            # down after a successful short request; POLL state is untouched.
+            FAST_RECOVERY_MODE=$((FAST_RECOVERY_MODE > 1 ? FAST_RECOVERY_MODE - 1 : 0))
+            logger -t podkop-bot "[Transport] Fast recovery: route=${ROUTE_KEY} profile=fast"
+            _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
         else
             logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
         fi
     fi
     if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST"; then
-        rm -f "$tmp"; echo "$API_RESPONSE"; return 0
+        _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
     fi
-    rm -f "$tmp"; return 1
+    _restore_poll_compat; rm -f "$tmp"; return 1
 }
 # api_request: alias for api_request_fast (backward compat for non-poll callers)
 api_request() { api_request_fast "$@"; }
 
 # api_poll_long: getUpdates only
 # connect-timeout: 3s sticky / 4s full   max-time: 65s (50s poll + buffer)
-# Recovery mode: if RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
+# Recovery mode: if POLL_RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
 api_poll_long() {
     local offset="$1" poll_timeout="${2:-50}"
+    _ROUTE_PROFILE="poll"
     local args="-X GET ${API_URL}/getUpdates?offset=${offset}&timeout=${poll_timeout}"
     API_RESPONSE=""
     _load_transport_ctx
 
     # Recovery mode: aggressively try SOCKS tiers, skip sticky
-    if [ "$RECOVERY_MODE" -gt 0 ]; then
-        RECOVERY_MODE=$((RECOVERY_MODE - 1))
+    if [ "$POLL_RECOVERY_MODE" -gt 0 ]; then
+        POLL_RECOVERY_MODE=$((POLL_RECOVERY_MODE - 1))
         logger -t podkop-bot "[Transport] Probing SOCKS tiers (recovery mode)..."
         local ROUTE_KEY ROUTE_NAME
         if _try_socks_tiers "$args" "65" "4"; then
             local _prev="$LAST_ROUTE_POLL"
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             LAST_ROUTE_POLL="$ROUTE_KEY"
-            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+            _write_route_state "poll" "$ROUTE_KEY" "$ROUTE_NAME"
             [ "$_prev" = "fail" ] && \
-                logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
+                logger -t podkop-bot "[Transport] Connection recovered. profile=${_ROUTE_PROFILE:-unknown} route=${ROUTE_KEY}"
             return 0
         fi
         # SOCKS still down in recovery — fall through to full cascade
@@ -2223,40 +2375,145 @@ probe_socks_latency() {
     fi
 }
 
-# Probe all configured SOCKS endpoints (tier1 + fallback_socks list) and write
-# structured results to SOCKS_PROBE_FILE. Called periodically from watchdog.
-# Формат: tier1=<ms|timeout>  tier2_1=<ms|timeout>  ts=<epoch>
+# Measure Telegram Bot API reachability through one proxy endpoint.
+# Outputs latency in ms or "timeout". getMe is lightweight and, unlike gstatic,
+# proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:
+# Telegram answered, even though the application request itself was rejected.
+probe_telegram_proxy_latency() {
+    local _proxy="$1" _tmp _out _code _time
+    _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }
+    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \
+        -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)
+    _code="${_out%%:*}"
+    _time="${_out#*:}"
+    if { [ "$_code" = "200" ] && jq -e '.ok == true' "$_tmp" >/dev/null 2>&1; } || \
+       jq -e '.error_code == 401 or .error_code == 429' "$_tmp" >/dev/null 2>&1; then
+        awk -v t="${_time:-0}" 'BEGIN{printf "%dms", int(t*1000)}'
+    else
+        printf 'timeout'
+    fi
+    rm -f "$_tmp" 2>/dev/null
+}
+
+# Follower logging is state-driven in normal mode: no per-probe steady-state
+# spam, only up/down transitions plus one compact hourly snapshot. Debug retains
+# every raw sample; quiet keeps the follower entirely out of the journal.
+_log_follower_sample() {
+    local _slot="$1" _lat="$2" _state _prev_line _prev_state _tmp
+    _load_log_level
+    [ "$PB_LOG_LEVEL" = "quiet" ] && return 0
+    if [ "$PB_LOG_LEVEL" = "debug" ]; then
+        command logger -t podkop-bot "[Follower] target=telegram_getMe route=${_slot} status=${_lat}"
+        return 0
+    fi
+    case "$_lat" in *ms) _state="up" ;; *) _state="down" ;; esac
+    _prev_line=$(grep "^${_slot}|" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null | head -1)
+    _prev_state=$(printf '%s' "$_prev_line" | cut -d'|' -f2)
+    if [ -n "$_prev_state" ] && [ "$_prev_state" != "$_state" ]; then
+        command logger -t podkop-bot "[Follower] route=${_slot} state=${_state} previous=${_prev_state} status=${_lat}"
+    fi
+    _tmp="${FOLLOWER_LOG_STATE_FILE}.tmp.$$"
+    { grep -v "^${_slot}|" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null || true; printf '%s|%s|%s\n' "$_slot" "$_state" "$_lat"; } > "$_tmp"
+    mv "$_tmp" "$FOLLOWER_LOG_STATE_FILE" 2>/dev/null || rm -f "$_tmp"
+}
+
+_log_follower_summary() {
+    local _out="$1" _now _last=0 _summary
+    _load_log_level
+    [ "$PB_LOG_LEVEL" = "normal" ] || return 0
+    _now=$(date +%s 2>/dev/null || echo 0)
+    if [ -r "$FOLLOWER_LOG_SUMMARY_TS_FILE" ]; then IFS= read -r _last < "$FOLLOWER_LOG_SUMMARY_TS_FILE" || _last=0; fi
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    if [ "$_last" -eq 0 ]; then
+        printf '%s\n' "$_now" > "$FOLLOWER_LOG_SUMMARY_TS_FILE"
+        return 0
+    fi
+    [ $((_now - _last)) -lt 3600 ] && return 0
+    _summary=$(printf '%b\n' "$_out" | grep '^tier' | sed 's/ url=.*//' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    [ -n "$_summary" ] && command logger -t podkop-bot "[Follower] summary ${_summary}"
+    printf '%s\n' "$_now" > "$FOLLOWER_LOG_SUMMARY_TS_FILE"
+}
+
+# Probe all configured proxy endpoints in parallel and write structured results
+# to SOCKS_PROBE_FILE.  The follower is deliberately independent of the active
+# POLL route: while the bot is on a reserve path it keeps watching tier1, every
+# other tier2_N and tier3 at the same time.  This is health telemetry only and
+# never mutates FAST/POLL route state.
+# Format: tier1=<ms|timeout>  tier2_1=<ms|timeout>  tier3=<ms|timeout>  ts=<epoch>
 probe_all_socks_write() {
-    # Use _load_transport_ctx to get tier1 + all fallbacks (explicit + auto-sections).
-    # This ensures Transport Latency card in Tunnel Health shows all paths including
-    # auto-added mixed_proxy from other sections.
     _load_transport_ctx
-    local lat out="ts=$(date +%s)"
+    local _probe_dir _pids="" _slots="tier1" _n=0 _fb _slot _line _lat
+    _probe_dir=$(mktemp -d /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
 
-    # tier1: primary Podkop SOCKS
-    lat=$(probe_socks_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
-    out="${out}\ntier1=${lat}"
-    logger -t podkop-bot "[SOCKSProbe] Primary (${_t_ip}:${_t_port}): ${lat}"
+    (
+        _lat=$(probe_telegram_proxy_latency "socks5h://${_t_auth}${_t_ip}:${_t_port}")
+        printf 'tier1=%s\n' "$_lat" > "$_probe_dir/tier1"
+    ) & _pids="$_pids $!"
 
-    # tier2_N: all fallbacks (explicit fallback_socks + auto-added sections)
-    local _n=0 _fb
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
-        lat=$(probe_socks_latency "$(_proxy_endpoint "$_fb")")
-        out="${out}\ntier2_${_n}=${lat} url=$(_proxy_display "$_fb")"
-        logger -t podkop-bot "[SOCKSProbe] Fallback-${_n} ($(_proxy_display "$_fb")): ${lat}"
+        _slot="tier2_${_n}"
+        _slots="$_slots $_slot"
+        (
+            _lat=$(probe_telegram_proxy_latency "$(_proxy_endpoint "$_fb")")
+            printf '%s=%s url=%s\n' "$_slot" "$_lat" "$(_proxy_display "$_fb")" > "$_probe_dir/$_slot"
+        ) & _pids="$_pids $!"
     done
 
-    # tier3: custom_proxy
     if [ -n "$_t_custom" ]; then
-        lat=$(probe_socks_latency "$_t_custom")
-        out="${out}\ntier3=${lat} url=${_t_custom}"
-        logger -t podkop-bot "[SOCKSProbe] Custom proxy (${_t_custom}): ${lat}"
+        _slots="$_slots tier3"
+        (
+            _lat=$(probe_telegram_proxy_latency "$_t_custom")
+            printf 'tier3=%s url=%s\n' "$_lat" "$(_mask_proxy "$(_proxy_endpoint "$_t_custom")")" > "$_probe_dir/tier3"
+        ) & _pids="$_pids $!"
     fi
 
+    # Reap exactly our workers; never use a bare wait in the bot shell.
+    for _pid in $_pids; do wait "$_pid" 2>/dev/null || true; done
+
+    local out="ts=$(date +%s)"
+    for _slot in $_slots; do
+        _line=$(cat "$_probe_dir/$_slot" 2>/dev/null)
+        [ -n "$_line" ] || _line="${_slot}=timeout"
+        out="${out}\n${_line}"
+        _lat=$(printf '%s' "$_line" | cut -d= -f2 | awk '{print $1}')
+        _log_follower_sample "$_slot" "$_lat"
+    done
+    _log_follower_summary "$out"
+
+    rm -rf "$_probe_dir" 2>/dev/null
     local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
     printf '%b\n' "$out" > "$_probe_tmp"
     mv "$_probe_tmp" "$SOCKS_PROBE_FILE" 2>/dev/null || rm -f "$_probe_tmp"
+}
+
+# Return success only when the follower has a recent positive proxy sample.
+# A successful getMe proves Bot API reachability but not that a 50s long-poll will
+# survive; this signal grants one hysteresis hold, never an authoritative route success.
+_poll_follower_has_fresh_proxy() {
+    [ -s "$SOCKS_PROBE_FILE" ] || return 1
+    local _ts _now _hi _max_age
+    _ts=$(sed -n 's/^ts=//p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
+    case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
+    _now=$(date +%s 2>/dev/null || echo 0)
+    _hi=$(uci -q get podkop_bot.settings.health_interval 2>/dev/null || echo 60)
+    case "$_hi" in ''|*[!0-9]*) _hi=60 ;; esac
+    # The follower is scheduled every PROBE_EVERY=5 watchdog cycles, not every
+    # health_interval. Keep a good sample valid across two complete follower
+    # periods plus margin, otherwise a healthy proxy can be declared stale just
+    # before the next scheduled probe and POLL falsely demotes to Direct.
+    _max_age=$((_hi * 5 * 2 + 30))
+    [ "$_max_age" -lt 150 ] && _max_age=150
+    [ "$_max_age" -gt 1200 ] && _max_age=1200
+    [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1
+    grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
+}
+
+# Journal values must stay ASCII/machine-readable even when UI fallback text is localized.
+_journal_value() {
+    local _v="$1"
+    [ -n "$_v" ] || { printf 'n/a'; return; }
+    if LC_ALL=C printf '%s' "$_v" | grep -q '[^ -~]'; then printf 'n/a'; else printf '%s' "$_v"; fi
 }
 
 # api_document: sendDocument — never updates FAST or POLL route state.
@@ -2424,6 +2681,92 @@ is_allowed_actor() {
     is_whitelisted_admin "$1" && return 0
     [ "$4" = "1" ] && is_whitelisted_sender_chat "$2" && return 0
     return 1
+}
+
+# Manual blocklists are anti-abuse controls for actors that are not authorized.
+# Authorized admins intentionally take precedence so an accidental list entry
+# cannot lock the owner out of the router.
+is_manually_blocked_actor() {
+    local _uid="$1" _scid="$2" _v
+    if [ -n "$_uid" ] && [ "$_uid" != "null" ]; then
+        for _v in $(uci -q get podkop_bot.settings.blocked_user_ids 2>/dev/null); do
+            [ "$_uid" = "$_v" ] && return 0
+        done
+    fi
+    if [ -n "$_scid" ] && [ "$_scid" != "null" ]; then
+        for _v in $(uci -q get podkop_bot.settings.blocked_sender_chat_ids 2>/dev/null); do
+            [ "$_scid" = "$_v" ] && return 0
+        done
+    fi
+    return 1
+}
+
+_security_actor_file() {
+    local _uid="$1" _scid="$2" _kind _id _safe
+    if [ -n "$_uid" ] && [ "$_uid" != "null" ]; then
+        _kind="user"; _id="$_uid"
+    else
+        _kind="sender"; _id="$_scid"
+    fi
+    _safe=$(printf '%s' "$_id" | tr -cd '0-9-')
+    [ -n "$_safe" ] || _safe="unknown"
+    printf '%s_%s_%s' "$SECURITY_PREFIX" "$_kind" "$_safe"
+}
+
+# Sets SECURITY_EVENT to: alert | journal | blocked_new | blocked.
+security_note_unauthorized() {
+    local _uid="$1" _scid="$2" _now _f _count=0 _start=0 _until=0
+    _now=$(date +%s)
+    _f=$(_security_actor_file "$_uid" "$_scid")
+    if [ -f "$_f" ]; then
+        IFS='|' read -r _count _start _until < "$_f"
+    fi
+    case "$_count" in ''|*[!0-9]*) _count=0 ;; esac
+    case "$_start" in ''|*[!0-9]*) _start=0 ;; esac
+    case "$_until" in ''|*[!0-9]*) _until=0 ;; esac
+    if [ "$_until" -gt "$_now" ]; then
+        SECURITY_EVENT="blocked"
+        return 0
+    fi
+    if [ $((_now - _start)) -gt "$SECURITY_WINDOW_SEC" ]; then
+        _count=0; _start="$_now"; _until=0
+    fi
+    [ "$_start" -eq 0 ] && _start="$_now"
+    _count=$((_count + 1))
+    if [ "$_count" -ge "$SECURITY_STRIKE_LIMIT" ]; then
+        _until=$((_now + SECURITY_BLOCK_SEC))
+        SECURITY_EVENT="blocked_new"
+    elif [ "$_count" -eq 1 ]; then
+        SECURITY_EVENT="alert"
+    else
+        SECURITY_EVENT="journal"
+    fi
+    printf '%s|%s|%s\n' "$_count" "$_start" "$_until" > "$_f"
+}
+
+# Global alert limiter. Sets SECURITY_SUPPRESSED to the number suppressed in the
+# previous 10-minute window when a new window starts.
+security_allow_alert() {
+    local _now _count=0 _start=0 _supp=0
+    _now=$(date +%s); SECURITY_SUPPRESSED=0
+    if [ -f "$SECURITY_GLOBAL_FILE" ]; then
+        IFS='|' read -r _count _start _supp < "$SECURITY_GLOBAL_FILE"
+    fi
+    case "$_count" in ''|*[!0-9]*) _count=0 ;; esac
+    case "$_start" in ''|*[!0-9]*) _start=0 ;; esac
+    case "$_supp" in ''|*[!0-9]*) _supp=0 ;; esac
+    if [ "$_start" -eq 0 ] || [ $((_now - _start)) -gt "$SECURITY_ALERT_WINDOW_SEC" ]; then
+        SECURITY_SUPPRESSED="$_supp"
+        _count=0; _start="$_now"; _supp=0
+    fi
+    if [ "$_count" -ge "$SECURITY_ALERT_LIMIT" ]; then
+        _supp=$((_supp + 1))
+        printf '%s|%s|%s\n' "$_count" "$_start" "$_supp" > "$SECURITY_GLOBAL_FILE"
+        return 1
+    fi
+    _count=$((_count + 1))
+    printf '%s|%s|%s\n' "$_count" "$_start" "$_supp" > "$SECURITY_GLOBAL_FILE"
+    return 0
 }
 
 is_private_chat() { [ "$1" = "private" ]; }
@@ -2812,7 +3155,10 @@ refresh_public_ip_cache() {
     mv "$tmp" "$PUBIP_CACHE" 2>/dev/null || { rm -f "$tmp"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
 
     rm -rf "$PUBIP_REFRESH_LOCK"
-    logger -t podkop-bot "[PublicIP] ${winner} (via ${sources})"
+    local _j_pubip _j_sources
+    _j_pubip=$(_journal_value "${winner:-}")
+    _j_sources=$(_journal_value "${sources:-}")
+    logger -t podkop-bot "[PublicIP] value=${_j_pubip} sources=${_j_sources}"
 }
 
 # Read public IP from cache instantly (no blocking I/O).
@@ -3626,130 +3972,169 @@ probe_google() {
 # probe_services: check reachability of key services through active outbound
 # Sets: PROBE_SVC_RESULTS (TAB-separated lines: "name<TAB>icon<TAB>detail")
 probe_services() {
-    local m_ip m_port sec
+    local m_ip m_port sec _proxy _svc_dir _pids _deadline _expected _slot _f _line
     sec=$(get_active_section)
     m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
+    _proxy="socks5h://${m_ip}:${m_port}"
     PROBE_SVC_RESULTS=""
     PROBE_TG_BLOCKED=0
 
-    local _name _url _expected _parse _code _icon _detail _tab
-    _tab=$(printf '\t')
-    local _ua="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-    local _proxy="-x socks5h://${m_ip}:${m_port}"
-    local _curl_base="curl -s -k --connect-timeout 6 --max-time 10"
+    # Keep the 12-service set in sync with LuCI Runtime. Run in parallel so one
+    # blocked service cannot turn the diagnostic into a 2-minute sequential wait.
+    local _SVC_DEADLINE=15
+    _svc_dir="${BOT_DIR}/probe_services_$$"
+    rm -rf "$_svc_dir" 2>/dev/null
+    mkdir -p "$_svc_dir" || return 1
 
-    # Helper: run probe, set _code and optionally parse JSON for _detail
-    _probe() {
-        local __url="$1" __expected="$2" __parse="$3"
-        shift 3
-        _code=$($_curl_base $_proxy -o /tmp/podkop_probe_svc.tmp -w "%{http_code}" "$@" "$__url" 2>/dev/null)
-        _detail=""
-        if [ -n "$__parse" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-            _detail=$(jq -r "$__parse // empty" /tmp/podkop_probe_svc.tmp 2>/dev/null || echo "")
-            [ -n "$_detail" ] && _detail=" ($_detail)"
+    local _K_NETFLIX="YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"
+    local _K_SPOTIFY="142b583129b2df829de3656f9eb484e6"
+    local _K_SPOTIFY_CID="9a8d2f0ce77a4e248bb71fefcb557637"
+    local _K_TWITCH="kimne78kx3ncx6brgo4mv6wki5h1ko"
+    local _TWITCH_GQL='[{"operationName":"VerifyEmail_CurrentUser","variables":{},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"f9e7dcdf7e99c314c82d8f7f725fab5f99d1df3d7359b53c9ae122deec590198"}}}]'
+
+    # _probe_svc SLOT URL OK_CODES GEO_KIND [METHOD] [HEADER] [DATA]
+    _probe_svc() {
+        local _ps_slot="$1" _ps_url="$2" _ps_ok="$3" _ps_geo="$4"
+        local _ps_method="${5:-GET}" _ps_hdr="$6" _ps_data="$7"
+        local _ps_body="${_svc_dir}/.body_${_ps_slot}" _ps_resp _ps_code _ps_time _ps_ms _ps_stat _ps_detail=""
+        if [ -n "$_ps_hdr" ] && [ -n "$_ps_data" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" -H "$_ps_hdr" --data "$_ps_data" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        elif [ -n "$_ps_hdr" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" -H "$_ps_hdr" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        elif [ -n "$_ps_data" ]; then
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" --data "$_ps_data" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
+        else
+            _ps_resp=$(curl -s -k -x "$_proxy" -X "$_ps_method" \
+                --connect-timeout 5 --max-time 12 -o "$_ps_body" -w '%{http_code} %{time_total}' "$_ps_url" 2>/dev/null)
         fi
-        rm -f /tmp/podkop_probe_svc.tmp
-        case "$_code" in
-            "$__expected")       _icon="${E_OK}" ;;
-            ''|000)              _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-            301|302|303|307|308) _icon="${E_YLW}"; _detail=" (перенаправление $_code)" ;;
-            403|451)             _icon="${E_RED}"; _detail=" (заблокировано $_code)" ;;
-            *)                   _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+        _ps_code=$(printf '%s' "$_ps_resp" | awk '{print $1}')
+        _ps_time=$(printf '%s' "$_ps_resp" | awk '{print $2}')
+        _ps_ms=$(awk -v t="${_ps_time:-0}" 'BEGIN{printf "%d", t*1000}')
+        case " $_ps_ok " in
+            *" ${_ps_code} "*) _ps_stat="ok" ;;
+            *) case "$_ps_code" in
+                ''|000) _ps_stat="timeout" ;;
+                403|451) _ps_stat="blocked" ;;
+                *) _ps_stat="other" ;;
+               esac ;;
         esac
+        if [ -s "$_ps_body" ]; then
+            case "$_ps_geo" in
+                youtube) _ps_detail=$(tail -n +3 "$_ps_body" 2>/dev/null | jq -r '.[0][2][0][0][1] // empty' 2>/dev/null) ;;
+                netflix) _ps_detail=$(jq -r '.client.location.country // empty' "$_ps_body" 2>/dev/null) ;;
+                spotify) _ps_detail=$(jq -r '.country // empty' "$_ps_body" 2>/dev/null) ;;
+                tiktok) _ps_detail=$(jq -r '.body.appProps.region // empty' "$_ps_body" 2>/dev/null) ;;
+                twitch) _ps_detail=$(jq -r '.[0].data.requestInfo.countryCode // empty' "$_ps_body" 2>/dev/null) ;;
+                apple) _ps_detail=$(head -c 8 "$_ps_body" 2>/dev/null | tr -dc 'A-Za-z' | cut -c1-2 | tr 'a-z' 'A-Z') ;;
+            esac
+        fi
+        rm -f "$_ps_body" 2>/dev/null
+        printf '%s|%s|%s|%s' "$_ps_stat" "${_ps_code:-000}" "${_ps_ms:-0}" "$_ps_detail" > "$_svc_dir/$_ps_slot"
     }
 
-    # YouTube — sw.js_data endpoint returns country as ipregion.sh approach
-    # tail -n +3 skips first 2 lines (non-JSON prefix), then parse country field
-    _name="YouTube"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /tmp/podkop_probe_svc.tmp \
-        -w "%{http_code}" \
-        "https://www.youtube.com/sw.js_data" 2>/dev/null)
-    _detail=""
-    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-        local _yt_country
-        _yt_country=$(tail -n +3 /tmp/podkop_probe_svc.tmp 2>/dev/null | \
-            jq -r '.[0][2][0][0][1] // empty' 2>/dev/null)
-        [ -n "$_yt_country" ] && _detail=" ($_yt_country)"
-        _icon="${E_OK}"
-    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
-        _icon="${E_RED}"; _detail=" (тайм-аут)"
-    else
-        _icon="${E_RED}"; _detail=" (HTTP $_code)"
-    fi
-    rm -f /tmp/podkop_probe_svc.tmp
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+    # Telegram is special: a generic HTTP response is insufficient. Verify the
+    # configured bot itself with getMe and require {ok:true,result.id:...}.
+    _probe_tg_svc() {
+        local _pt_body="${_svc_dir}/.body_TelegramAPI" _pt_resp _pt_code _pt_time _pt_ms _pt_stat _pt_detail
+        _pt_resp=$(curl -s -k -x "$_proxy" --connect-timeout 5 --max-time 12 \
+            -o "$_pt_body" -w '%{http_code} %{time_total}' \
+            "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
+        _pt_code=$(printf '%s' "$_pt_resp" | awk '{print $1}')
+        _pt_time=$(printf '%s' "$_pt_resp" | awk '{print $2}')
+        _pt_ms=$(awk -v t="${_pt_time:-0}" 'BEGIN{printf "%d", t*1000}')
+        _pt_detail=""
+        if [ "$_pt_code" = "200" ] && jq -e '.ok == true and (.result.id != null)' "$_pt_body" >/dev/null 2>&1; then
+            _pt_stat="ok"
+            _pt_detail=$(jq -r '.result.username // empty' "$_pt_body" 2>/dev/null)
+            [ -n "$_pt_detail" ] && _pt_detail="@${_pt_detail}"
+        else
+            case "$_pt_code" in
+                ''|000) _pt_stat="timeout" ;;
+                401) _pt_stat="auth"; _pt_detail="токен отклонён" ;;
+                403|451) _pt_stat="blocked" ;;
+                *) _pt_stat="other" ;;
+            esac
+        fi
+        rm -f "$_pt_body" 2>/dev/null
+        printf '%s|%s|%s|%s' "$_pt_stat" "${_pt_code:-000}" "${_pt_ms:-0}" "$_pt_detail" > "$_svc_dir/TelegramAPI"
+    }
+
+    logger -t podkop-bot "[Probe][Services] start: 12 parallel checks via ${_proxy}; deadline=${_SVC_DEADLINE}s"
+    logger -t podkop-bot "[Probe][Services] targets=telegram_api,youtube,chatgpt,claude,gemini,github,netflix,spotify,tiktok,twitch,apple,discord"
+    _pids=""
+    _probe_tg_svc & _pids="$_pids $!"
+    _probe_svc YouTube "https://www.youtube.com/sw.js_data" "200" youtube & _pids="$_pids $!"
+    _probe_svc ChatGPT "https://api.openai.com/v1/models" "200 401" "" & _pids="$_pids $!"
+    _probe_svc Claude "https://api.anthropic.com/v1/models" "200 401" "" & _pids="$_pids $!"
+    _probe_svc Gemini "https://gemini.google.com/app" "200" "" GET "" "" & _pids="$_pids $!"
+    _probe_svc GitHub "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" "200" "" & _pids="$_pids $!"
+    _probe_svc Netflix "https://api.fast.com/netflix/speedtest/v2?https=true&token=${_K_NETFLIX}&urlCount=1" "200" netflix & _pids="$_pids $!"
+    _probe_svc Spotify "https://spclient.wg.spotify.com/signup/public/v1/account/?validate=1&key=${_K_SPOTIFY}" "200" spotify GET "X-Client-Id: ${_K_SPOTIFY_CID}" & _pids="$_pids $!"
+    _probe_svc TikTok "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988" "200" tiktok & _pids="$_pids $!"
+    _probe_svc Twitch "https://gql.twitch.tv/gql" "200" twitch POST "Client-Id: ${_K_TWITCH}" "$_TWITCH_GQL" & _pids="$_pids $!"
+    _probe_svc Apple "https://gspe1-ssl.ls.apple.com/pep/gcc" "200" apple & _pids="$_pids $!"
+    _probe_svc Discord "https://discord.com/api/v9/gateway" "200" "" & _pids="$_pids $!"
+
+    _expected="TelegramAPI YouTube ChatGPT Claude Gemini GitHub Netflix Spotify TikTok Twitch Apple Discord"
+    _deadline=$(( $(date +%s 2>/dev/null || echo 0) + _SVC_DEADLINE ))
+    while :; do
+        local _missing=0 _e
+        for _e in $_expected; do [ -f "$_svc_dir/$_e" ] || _missing=1; done
+        [ "$_missing" = "0" ] && break
+        [ "$(date +%s 2>/dev/null || echo 0)" -ge "$_deadline" ] 2>/dev/null && break
+        sleep 1
+    done
+    # Stop only unfinished service workers, then reap exactly those PIDs.
+    # A bare `wait` here is fatal in the main bot shell: it also waits for the
+    # long-lived health/watchdog daemon and therefore never returns.
+    for _e in $_pids; do
+        kill "$_e" 2>/dev/null || true
+    done
+    for _e in $_pids; do
+        wait "$_e" 2>/dev/null || true
+    done
+
+    local _tab; _tab=$(printf '\t')
+    for _slot in TelegramAPI YouTube ChatGPT Claude Gemini GitHub Netflix Spotify TikTok Twitch Apple Discord; do
+        _f="$_svc_dir/$_slot"
+        if [ -s "$_f" ]; then
+            _line=$(cat "$_f")
+            local _st _code _ms _geo _name _icon _detail
+            _st=$(printf '%s' "$_line" | cut -d'|' -f1)
+            _code=$(printf '%s' "$_line" | cut -d'|' -f2)
+            _ms=$(printf '%s' "$_line" | cut -d'|' -f3)
+            _geo=$(printf '%s' "$_line" | cut -d'|' -f4-)
+        else
+            _st="na"; _code="000"; _ms=0; _geo=""
+        fi
+        case "$_slot" in TelegramAPI) _name="Telegram API" ;; *) _name="$_slot" ;; esac
+        case "$_st" in
+            ok) _icon="$E_OK"; _detail="" ;;
+            timeout) _icon="$E_RED"; _detail=" (тайм-аут)" ;;
+            blocked) _icon="$E_RED"; _detail=" (заблокировано HTTP ${_code})" ;;
+            auth) _icon="$E_RED"; _detail=" (${_geo:-токен отклонён})" ;;
+            na) _icon="$E_YLW"; _detail=" (N/A)" ;;
+            *) _icon="$E_YLW"; _detail=" (HTTP ${_code})" ;;
+        esac
+        [ "$_st" = "ok" ] && [ -n "$_ms" ] && [ "$_ms" -gt 0 ] 2>/dev/null && _detail="${_detail} (${_ms} мс)"
+        [ -n "$_geo" ] && [ "$_st" = "ok" ] && _detail="${_detail} [${_geo}]"
+        [ "$_slot" = "TelegramAPI" ] && [ "$_st" != "ok" ] && PROBE_TG_BLOCKED=1
+        PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Telegram API
-    _name="Telegram API"
-    _probe "https://api.telegram.org" "200" "" -L
-    [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # ChatGPT — platform.openai.com/v1/models returns 401 (auth required) = accessible
-    # ab.chatgpt.com times out on many datacenter IPs — use API endpoint instead
-    _name="ChatGPT"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 8 --max-time 15 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://api.openai.com/v1/models" 2>/dev/null)
-    case "$_code" in
-        200|401) _icon="${E_OK}";  _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Claude.ai — api.anthropic.com/v1/models returns 401 (auth required) = accessible
-    # claude.ai/login returns 403 for datacenter IPs via Cloudflare — use API instead
-    _name="Claude.ai"
-    _code=$(curl -s -k \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://api.anthropic.com/v1/models" 2>/dev/null)
-    case "$_code" in
-        200|401) _icon="${E_OK}";  _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Gemini — google.com/app returns 200 in supported regions, redirects/403 elsewhere
-    _name="Gemini"
-    _code=$(curl -s -k -L -A "$_ua" \
-        -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
-        -o /dev/null \
-        -w "%{http_code}" \
-        "https://gemini.google.com/app" 2>/dev/null)
-    case "$_code" in
-        200)     _icon="${E_OK}"; _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (тайм-аут)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (недоступно в регионе)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
-    # Discord
-    _name="Discord"
-    _probe "https://discord.com/api/v9/gateway" "200" ""
-    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
-"
+        logger -t podkop-bot "[Probe][Services] ${_slot}: status=${_st} http=${_code} time=${_ms}ms${_geo:+ geo=${_geo}}"
+    done
+    logger -t podkop-bot "[Probe][Services] complete: telegram_blocked=${PROBE_TG_BLOCKED}"
+    rm -rf "$_svc_dir" 2>/dev/null
 }
 
 # probe_throughput: measure download speed and detect ISP throttle/block.
 # Two-stage test:
 #   Stage 1: 32 KB — fast, detects 16 KB block pattern (РКН drops after ~16 KB)
-#   Stage 2: 1 MB  — accurate speed measurement (skipped if stage 1 shows block)
+#   Stage 2: 8 MB  — accurate speed measurement (skipped if stage 1 shows block)
 # Sets: PROBE_SPEED_MBPS, PROBE_SPEED_BYTES, PROBE_SPEED_SECS, PROBE_SPEED_STATUS
 probe_throughput() {
     local m_ip m_port sec raw speed_bps size_bytes time_secs
@@ -3789,14 +4174,14 @@ probe_throughput() {
         return
     fi
 
-    # Stage 2: 1 MB — accurate speed measurement
+    # Stage 2: 8 MB — accurate speed measurement
     raw=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 60 \
-        -H "Range: bytes=0-1048575" \
+        -H "Range: bytes=0-8388607" \
         -o /dev/null \
         -w "%{speed_download}:%{size_download}:%{time_total}" \
-        "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+        "https://speed.cloudflare.com/__down?bytes=8388608" 2>/dev/null)
 
     speed_bps=$(printf '%s' "${raw%%:*}"          | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
     size_bytes=$(printf '%s' "$raw" | cut -d: -f2 | grep -oE '^[0-9]+'            || echo "0")
@@ -3830,11 +4215,11 @@ probe_throughput() {
             local raw_d speed_d
             raw_d=$(curl -4 -s -k \
                 $_if_flag --noproxy '*' \
-                --connect-timeout 6 --max-time 30 \
-                -H "Range: bytes=0-1048575" \
+                --connect-timeout 6 --max-time 60 \
+                -H "Range: bytes=0-8388607" \
                 -o /dev/null \
                 -w "%{speed_download}" \
-                "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+                "https://speed.cloudflare.com/__down?bytes=8388608" 2>/dev/null)
             speed_d=$(printf '%s' "$raw_d" | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
             [ -n "$speed_d" ] && [ "$(awk "BEGIN{print (${speed_d} > 0) ? 1 : 0}")" = "1" ] && \
                 PROBE_SPEED_DIRECT_MBPS=$(awk "BEGIN{printf \"%.2f\", ${speed_d} * 8 / 1000000}")
@@ -4370,10 +4755,17 @@ _write_socks_state() {
     # Forward per-section TG results so Tunnel Health can read them from SOCKS_STATE_FILE
     _tg_sec_lines=$(grep "^tg_sec_" "$HEALTH_STATE_FILE" 2>/dev/null)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
-    # Authoritative route key is in MAIN_ROUTE_KEY_FILE, written by main process.
+    # Authoritative long-poll route is in POLL_ROUTE_KEY_FILE, written by POLL only.
     printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%s\n' \
         "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$_tier3_state" "$2" "$3" \
         "${_tg_sec_lines}" > "$SOCKS_STATE_FILE"
+    local _sr_poll _sr_poll_name _sr_fast _sr_fast_name
+    _sr_poll=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
+    _sr_poll_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo unknown)
+    _sr_fast=$(cat "$FAST_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
+    _sr_fast_name=$(cat "$FAST_ROUTE_FILE" 2>/dev/null || echo unknown)
+    printf 'poll_route=%s\npoll_route_name=%s\nfast_route=%s\nfast_route_name=%s\n' \
+        "$_sr_poll" "$_sr_poll_name" "$_sr_fast" "$_sr_fast_name" >> "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -5272,11 +5664,21 @@ start_health_daemon() {
                 fi
             fi
 
+            # Pick up LuCI log-level changes without restarting the bot. This is
+            # one UCI read per watchdog cycle, not one read per journal line.
+            _refresh_log_level_cache
+
             probe_cycle=$((probe_cycle + 1))
-            if [ "$probe_cycle" -ge "$PROBE_EVERY" ]; then
+            _wd_probe_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\r\n\t')
+            _wd_probe_due=0
+            case "${_wd_probe_route:-unknown}" in
+                tier1|unknown|"") [ "$probe_cycle" -ge "$PROBE_EVERY" ] && _wd_probe_due=1 ;;
+                *)                _wd_probe_due=1 ;;
+            esac
+            if [ "$_wd_probe_due" -eq 1 ]; then
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
-                _wd_log_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
+                _wd_log_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
                 logger -t podkop-bot "[Health] System OK | SOCKS: ${last_socks_state:-?} | sing-box: ${last_sb_state:-?} | Route: ${_wd_log_route}"
                 # Reap previous probe subshell before launching a new one.
                 # In BusyBox ash, background children become zombies until the parent
@@ -5386,7 +5788,7 @@ start_health_daemon() {
                         # (that alert already conveys the recovery — no duplicate needed)
                         if [ $((_now_tg - _recovery_ts)) -ge 30 ]; then
                             local _tg_route
-                            _tg_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
+                            _tg_route=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
                             case "$_tg_route" in
                                 ""|"Initializing..."|"Initializing") _tg_route="через SOCKS (восстановлен)" ;;
                             esac
@@ -5494,7 +5896,9 @@ start_health_daemon() {
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
                         { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
+                        local _wd_fb_n=0
                         for _fb in "$@"; do
+                            _wd_fb_n=$((_wd_fb_n + 1))
                             local _fb_ip _fb_port _fb_hp
                             # endpoint without mnemonic, then strip scheme and any user:pass@
                             _fb_hp=$(_proxy_endpoint "$_fb" | sed 's|socks5h\?://||; s|.*@||')
@@ -5504,7 +5908,7 @@ start_health_daemon() {
                                 curr_socks_state="up"
                                 _fb_ok=1
                                 _fb_alive="$_fb"
-                                logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback $(_proxy_display "$_fb") is alive."
+                                logger -t podkop-bot "[Watchdog] Primary SOCKS down; fallback route=tier2_${_wd_fb_n} is alive."
                                 break
                             fi
                         done
@@ -5603,14 +6007,14 @@ start_health_daemon() {
                 # If baseline is "up" but bot is already on degraded route,
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
-                    _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
-                    # Nudge if route is NOT a good SOCKS tier (tier1 or tier2_N).
-                    # Use negative match to handle unknown values, typos, stale files.
+                    _wd_cur_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                    # Nudge only an explicitly degraded POLL route. tier3 is healthy;
+                    # unknown/stale values are intentionally ignored until POLL resolves.
                     case "${_wd_cur_route:-unknown}" in
-                        tier1|tier2_*)
+                        tier1|tier2_*|tier3)
                             logger -t podkop-bot "[Watchdog] Route OK (${_wd_cur_route}), no action needed."
                             ;;
-                        *)
+                        tier4|tier5|fail)
                             logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$(date +%s)" > "${BOT_DIR}/last_nudge"
@@ -5693,10 +6097,10 @@ start_health_daemon() {
             # ------------------------------------------------------------------
             # Check E: Bot transport route degradation / recovery alert
             # Fires when bot route drops to tier4 (Direct) or tier5 (Emergency IP)
-            # and when it recovers back to tier1/tier2.
+            # and when it recovers back to tier1/tier2/tier3.
             # ------------------------------------------------------------------
             local _wd_bot_route
-            _wd_bot_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+            _wd_bot_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
             # tier3 belongs in the recovered branch, not in a gap between the two.
             # It used to match neither arm, so a bot that came back up through its
             # own proxy sent no recovery notice AND left last_bot_route_degraded=1 —
@@ -5712,7 +6116,7 @@ start_health_daemon() {
                         logger -t podkop-bot "[Watchdog] Bot route recovered: ${_wd_bot_route}"
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                             local _route_name
-                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             local _rec_route_txt
                             _rec_route_txt=$(printf '<b>[%s]</b> %s <b>Соединение бота восстановлено</b>\n\n<b>Способ подключения:</b> <code>%s</code>' \
                                 "$_hn" "$E_OK" "$_route_name")
@@ -5730,7 +6134,7 @@ start_health_daemon() {
                         logger -t podkop-bot "[Watchdog] Bot route degraded: ${_wd_bot_route}"
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                             local _route_name _deg_route_txt _deg_route_pl
-                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             # Reaching tier4 means every earlier tier failed — including
                             # the bot proxy, which is not a SOCKS proxy at all. Saying
                             # only "all SOCKS are down" hid that from anyone who had one
@@ -5757,20 +6161,20 @@ start_health_daemon() {
             # send IPC up every cycle to nudge main loop back to SOCKS discovery.
             # Per-cycle nudge: if SOCKS is up but bot route is degraded,
             # send IPC up so main loop rediscovers tier1 within one health interval.
-            # Reads MAIN_ROUTE_KEY_FILE — written by main process, never stale.
+            # Reads POLL_ROUTE_KEY_FILE — written by main process, never stale.
             # Nudge: if SOCKS (tier2+) is alive but bot route is degraded,
             # send IPC up to trigger SOCKS rediscovery.
-            # Throttled to once per 120s to avoid continuous LAST_ROUTE_FAST resets
-            # which would cause full discovery every poll cycle (recover old=fail loop).
+            # Throttled to once per 120s to avoid continuously resetting POLL
+            # discovery while a degraded route is still usable.
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
-                _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
-                # Negative match: nudge on anything that is NOT tier1/tier2_*
-                # Handles stale files with typos/old values from previous bot versions.
+                _wd_cur_route=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                # Only explicit degradation is actionable. Unknown/stale values do
+                # not prove a broken long-poll and therefore must not trigger rediscovery.
                 case "${_wd_cur_route:-unknown}" in
-                    tier1|tier2_*)
+                    tier1|tier2_*|tier3)
                         : # good route, no nudge needed
                         ;;
-                    *)
+                    tier4|tier5|fail)
                         local _now_nudge _last_nudge
                         _now_nudge=$(date +%s)
                         _last_nudge=$(cat "${BOT_DIR}/last_nudge" 2>/dev/null || echo 0)
@@ -13438,53 +13842,86 @@ _handle_fallback_socks() {
             ;;
 
         "cmd_test_fb_socks")
-            send_or_edit "$mid" "$(printf '%s Проверка SOCKS-узлов…' "$E_TIME")" ""
+            send_or_edit "$mid" "$(printf '%s Проверка транспортных каналов…' "$E_TIME")" ""
             _load_transport_ctx
             local n=0 _fb result_text=""
-            # Short timeouts for interactive test (3s connect / 5s total per endpoint)
-            _probe_fast() {
-                local _url="$1" _out _code _time
-                _out=$(curl -s -k -x "$_url" \
-                    --connect-timeout 3 --max-time 5 \
-                    -o /dev/null -w "%{http_code}:%{time_total}" \
+
+            # Deliberately diagnostic-only: this function never writes route state.
+            # gstatic measures generic egress; getMe proves THIS bot can use Telegram.
+            _probe_channel() {
+                local _pc_proxy="$1" _pc_out _pc_code _pc_time _pc_body
+                CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
+                CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="тайм-аут"
+
+                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                    -o /dev/null -w '%{http_code}:%{time_total}' \
                     "http://www.gstatic.com/generate_204" 2>/dev/null)
-                _code="${_out%%:*}"
-                _time="${_out#*:}"
-                if [ "$_code" = "204" ]; then
-                    awk -v t="$_time" 'BEGIN{printf "%d мс", int(t*1000)}'
-                else
-                    echo "timeout"
+                _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
+                if [ "$_pc_code" = "204" ]; then
+                    CH_INET_OK=1
+                    CH_INET_MS=$(awk -v t="${_pc_time:-0}" 'BEGIN{printf "%d", t*1000}')
                 fi
+
+                _pc_body="${BOT_DIR}/channel_tg_$$"
+                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                    -o "$_pc_body" -w '%{http_code}:%{time_total}' \
+                    "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
+                _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
+                CH_TG_CODE="${_pc_code:-000}"
+                if [ -n "$_pc_code" ] && [ "$_pc_code" != "000" ]; then
+                    CH_TG_REACH=1
+                    CH_TG_MS=$(awk -v t="${_pc_time:-0}" 'BEGIN{printf "%d", t*1000}')
+                    CH_TG_DETAIL="HTTP ${_pc_code}"
+                fi
+                if [ "$_pc_code" = "200" ] && jq -e '.ok == true and (.result.id != null)' "$_pc_body" >/dev/null 2>&1; then
+                    CH_TG_OK=1
+                    CH_TG_DETAIL="ok"
+                elif [ "$_pc_code" = "401" ]; then
+                    CH_TG_DETAIL="токен отклонён"
+                elif [ "$_pc_code" = "429" ]; then
+                    CH_TG_DETAIL="Telegram ответил 429"
+                fi
+                rm -f "$_pc_body" 2>/dev/null
             }
-            local lat; lat=$(_probe_fast "socks5h://${_t_auth}${_t_ip}:${_t_port}")
-            case "$lat" in timeout|fail) result_text="${result_text}${E_ERR} Основной Podkop: <code>$lat</code>\n" ;;
-                *) result_text="${result_text}${E_ON} Основной Podkop: <code>$lat</code>\n" ;; esac
+
+            _append_channel() {
+                local _ac_label="$1" _ac_show="$2" _ac_icon _ac_inet _ac_tg
+                if [ "$CH_TG_OK" = "1" ]; then
+                    _ac_icon="$E_ON"
+                elif [ "$CH_INET_OK" = "1" ] || [ "$CH_TG_REACH" = "1" ]; then
+                    _ac_icon="$E_YLW"
+                else
+                    _ac_icon="$E_ERR"
+                fi
+                [ "$CH_INET_OK" = "1" ] && _ac_inet="${CH_INET_MS} мс" || _ac_inet="нет"
+                if [ "$CH_TG_OK" = "1" ]; then
+                    _ac_tg="${CH_TG_MS} мс"
+                elif [ "$CH_TG_REACH" = "1" ]; then
+                    _ac_tg="${CH_TG_DETAIL} · ${CH_TG_MS} мс"
+                else
+                    _ac_tg="тайм-аут"
+                fi
+                result_text="${result_text}${_ac_icon} ${_ac_label}: Internet <code>${_ac_inet}</code> · Telegram <code>${_ac_tg}</code>${_ac_show:+ <i>${_ac_show}</i>}\n"
+            }
+
+            _probe_channel "socks5h://${_t_auth}${_t_ip}:${_t_port}"
+            _append_channel "Основной Podkop" ""
             for _fb in $_t_fb_socks; do
                 n=$((n + 1))
-                lat=$(_probe_fast "$(_proxy_endpoint "$_fb")")
+                _probe_channel "$(_proxy_endpoint "$_fb")"
                 local _fb_show; _fb_show=$(html_escape "$(_proxy_display "$_fb")")
-                case "$lat" in timeout|fail)
-                    result_text="${result_text}${E_ERR} Резервный №${n}: <code>$lat</code> <i>${_fb_show}</i>\n" ;;
-                    *) result_text="${result_text}${E_ON} Резервный №${n}: <code>$lat</code> <i>${_fb_show}</i>\n" ;;
-                esac
+                _append_channel "Резервный №${n}" "$_fb_show"
             done
-            # tier3 was missing here, so with an empty fallback list this screen
-            # tested the podkop mixed proxy and nothing else — while the bot proxy
-            # sat in the live chain untested. Every tier that can carry traffic is
-            # checked now.
             local _t3_test; _t3_test=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
             if [ -n "$_t3_test" ]; then
-                lat=$(_probe_fast "$(_proxy_endpoint "$_t3_test")")
+                _probe_channel "$(_proxy_endpoint "$_t3_test")"
                 local _t3_show; _t3_show=$(html_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3_test")")")
-                case "$lat" in timeout|fail)
-                    result_text="${result_text}${E_ERR} Прокси бота: <code>$lat</code> <i>${_t3_show}</i>\n" ;;
-                    *) result_text="${result_text}${E_ON} Прокси бота: <code>$lat</code> <i>${_t3_show}</i>\n" ;;
-                esac
+                _append_channel "Прокси бота" "$_t3_show"
             fi
-            unset -f _probe_fast
+            unset -f _probe_channel _append_channel
             [ -z "$result_text" ] && result_text="<i>Узлы не настроены.</i>"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>(gstatic 204, тайм-аут 3 с. Показывает, что канал живой; пройдёт ли через него Telegram — вопрос отдельный)</i>\n\n%b' "$E_TEST" "$result_text")" \
+                "$(printf '%s <b>Проверка доступности каналов</b>\n<i>Internet: gstatic 204. Telegram: реальный <code>getMe</code> текущего бота. Тайм-аут: 3 с connect / 5 с total.</i>\n\n%b' "$E_TEST" "$result_text")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Проверить снова\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fallback_socks_menu\"}]]}"
             ;;
 
@@ -13776,7 +14213,7 @@ EOF
             esac
             [ "$_h_tgt" = "ok" ] && _tg_ok=1
 
-            _sev=$(_status_severity "$podkop_running" "$sb_running" "$_h_tgt" "$_h_socks" "$LAST_ROUTE")
+            _sev=$(_status_severity "$podkop_running" "$sb_running" "$_h_tgt" "$_h_socks" "$LAST_ROUTE_POLL")
             # Override: empty SOCKS_STATE_FILE (watchdog not yet run) → pending, not degraded
             [ "$_socks_state" = "unknown" ] && [ "$_sev" = "degraded" ] && _sev="ok"
 
@@ -13911,6 +14348,7 @@ ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
 <i>бот v${BOT_VERSION}</i>")
             kb='{"inline_keyboard":['
             kb="${kb}[{\"text\":\"🧭 Подробнее\",\"callback_data\":\"cmd_runtime\"}],"
+            kb="${kb}[{\"text\":\"${E_MICRO} Полный тест Outbound\",\"callback_data\":\"ask_probe_outbound_status\"}],"
             if [ "$podkop_running" = "1" ]; then
                 kb="${kb}[{\"text\":\"♻️ Перезапустить Podkop\",\"callback_data\":\"ask_reload_podkop\"}],"
             else
@@ -14684,7 +15122,9 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             esac
 
             local bi_btn st_icon al_icon bc bc_icon ram_al ram_al_icon qh qh_icon qh_from qh_to
-            local wr wr_icon wr_day wr_time _wr_day_name
+            local wr wr_icon wr_day wr_time _wr_day_name log_lvl log_lvl_disp
+            log_lvl=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo "normal")
+            case "$log_lvl" in quiet) log_lvl_disp="Тихий" ;; debug) log_lvl_disp="Отладочный" ;; *) log_lvl="normal"; log_lvl_disp="Обычный" ;; esac
             wr=$(uci -q get podkop_bot.settings.weekly_report || echo "0")
             wr_day=$(uci -q get podkop_bot.settings.weekly_report_day || echo "7")
             wr_time=$(uci -q get podkop_bot.settings.weekly_report_time || echo "09:00")
@@ -14718,6 +15158,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
 {"inline_keyboard":[
   [{"text":"Подключение: ${tr_disp}","callback_data":"ask_set_tr_menu"}],
   [{"text":"Интервал: ${hi} с","callback_data":"set_bot_hi_${next_hi}"}],
+  [{"text":"${E_LOG} Журнал: ${log_lvl_disp}","callback_data":"log_level_menu"}],
   [{"text":"${E_NET} Прокси подключения${cp_sfx}","callback_data":"net_proxies_menu"}],
   [${bi_btn}],
   [{"text":"${st_icon} Сообщать о запуске","callback_data":"toggle_bot_st"}],
@@ -14752,6 +15193,7 @@ ${tr_chain}
 <b>Прокси бота:</b> <code>${cp_disp}</code>${cp_hint:+
 ${cp_hint}}
 <b>Сетевой интерфейс:</b> <code>${bi_disp}</code>
+<b>Системный журнал:</b> <code>${log_lvl_disp}</code>
 <code>────────────────────</code>
 <b>Время работы бота:</b> ${uptime_sys}
 <b>Запущен:</b> ${BOT_START_STR}
@@ -14810,6 +15252,22 @@ EOF
             uci set podkop_bot.settings.health_interval="$_new_hi"
             uci_commit_safe podkop_bot
             _handle_bot "bot_settings" "$mid" "" "" ;;
+        "log_level_menu")
+            local _ll _q _n _d
+            _ll=$(uci -q get podkop_bot.settings.log_level 2>/dev/null || echo normal)
+            _q="Тихий"; _n="Обычный"; _d="Отладочный"
+            case "$_ll" in quiet) _q="✓ Тихий" ;; debug) _d="✓ Отладочный" ;; *) _n="✓ Обычный" ;; esac
+            send_or_edit "$mid" "$(printf '%s <b>Подробность системного журнала</b>\n\n<b>Тихий</b> — только важные события, ошибки, безопасность и смена маршрута.\n<b>Обычный</b> — рекомендуемый режим: значимые события, изменения follower и редкая сводка.\n<b>Отладочный</b> — все проверки и транспортная телеметрия; журнал заполняется заметно быстрее.' "$E_LOG")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_q}\",\"callback_data\":\"set_log_level_quiet\"},{\"text\":\"${_n}\",\"callback_data\":\"set_log_level_normal\"}],[{\"text\":\"${_d}\",\"callback_data\":\"set_log_level_debug\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"}]]}"
+            ;;
+        "set_log_level_"*)
+            local _new_ll="${cmd#set_log_level_}"
+            case "$_new_ll" in quiet|normal|debug) ;; *) _new_ll="normal" ;; esac
+            uci set podkop_bot.settings.log_level="$_new_ll"
+            uci_commit_safe podkop_bot
+            _set_log_level_cache "$_new_ll"
+            _handle_bot "bot_settings" "$mid" "" ""
+            ;;
         "toggle_bot_st") toggle_uci_bool "podkop_bot.settings" "startup_notify"; _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_bot_al") toggle_uci_bool "podkop_bot.settings" "alert_notify";   _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_broadcast_alerts") toggle_uci_bool "podkop_bot.settings" "broadcast_alerts"; _handle_bot "bot_settings" "$mid" "" "" ;;
@@ -14910,11 +15368,14 @@ EOF
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "ask_probe_outbound"|"ask_probe_outbound_px_"*|"ask_probe_outbound_url")
+        "ask_probe_outbound"|"ask_probe_outbound_status"|"ask_probe_outbound_px_"*|"ask_probe_outbound_url")
             local sec proxy_mode active_px active_px_display text kb
             # Determine back target: px_view_N if came from proxy card, else diagnostics
             local _back_target="cmd_diagnostics"
             case "$cmd" in
+                ask_probe_outbound_status)
+                    _back_target="cmd_status"
+                    ;;
                 ask_probe_outbound_px_*)
                     local _px_idx="${cmd#ask_probe_outbound_px_}"
                     _back_target="px_view_${_px_idx}"
@@ -14946,7 +15407,7 @@ EOF
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
             [ "$proxy_mode" = "proxy:urltest" ] && mode_note=$(printf '\n<i>Режим URLTest: проверяется текущий автоматически выбранный прокси.</i>')
-            text=$(printf '%s <b>Проверить активный прокси</b>\n\nПроверка выполняется через активный прокси роутера:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность сервисов (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• скорость загрузки (короткая проверка на 32 КБ и тест на 1 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Проверка занимает 20–40 секунд и использует около 1,3 МБ трафика.</i>' \
+            text=$(printf '%s <b>Полный тест Outbound</b>\n\nЭто тот же полный тест, что <b>Диагностика → Проверить прокси</b>; отдельной второй реализации нет.\n\nПроверка выполняется через активный прокси роутера и не меняет маршруты или настройки:\n\n• внешний IP и геолокацию по данным GeoIP, Cloudflare и Google\n• доступность 12 сервисов (Telegram API, YouTube, ChatGPT, Claude, Gemini, GitHub, Netflix, Spotify, TikTok, Twitch, Apple, Discord)\n• скорость загрузки (32 КБ для выявления обрыва после ~16 КБ + выборка 8 МБ)\n\n<b>Активный прокси:</b> <code>%s</code>%s\n\n<i>Обычно 20–60 секунд. Создаёт кратковременную сетевую и небольшую CPU-нагрузку: 12 параллельных проверок сервисов, до 8 МБ через туннель и, если прямой WAN доступен, ещё до 8 МБ для сравнения скорости.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Запустить\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -14967,6 +15428,10 @@ EOF
             fi
             printf '%s' "$_now" > "$_probe_ts_file"
 
+            # The full probe can take tens of seconds. Run it outside the main
+            # Telegram polling loop so /start and other commands remain responsive.
+            (
+            logger -t podkop-bot "[Probe] background worker started: back=${_back} message=${mid:-new}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 1/4: геолокация…' "$E_MICRO")" ""
 
             # Collect context
@@ -14983,24 +15448,41 @@ EOF
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
             [ "$px_type" = "unknown" ] && px_type="Неизвестно"
 
+            local _j_type; _j_type=$(_journal_value "${px_type:-}")
+            logger -t podkop-bot "[Probe] context: section=${sec} mode=${proxy_mode} type=${_j_type}"
+
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
+            logger -t podkop-bot "[Probe] step 1/4 geo: start"
             probe_geo
+            local _j_exit_ip _j_country _j_cf_step1
+            _j_exit_ip=$(_journal_value "${PROBE_EXIT_IP:-}")
+            _j_country=$(_journal_value "${PROBE_COUNTRY:-}")
+            _j_cf_step1=$(_journal_value "${PROBE_CF_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] step 1/4 geo: done exit_ip=${_j_exit_ip} country=${_j_country} cf=${_j_cf_step1}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 2/4: геолокация Google…' "$E_MICRO")" ""
 
             # Step 2: Google
             PROBE_GOOGLE_COUNTRY=""
+            logger -t podkop-bot "[Probe] step 2/4 google: start"
             probe_google
+            local _j_google; _j_google=$(_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] step 2/4 google: done country=${_j_google}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 3/4: доступность сервисов…' "$E_MICRO")" ""
 
             # Step 3: Services
             PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
+            logger -t podkop-bot "[Probe] step 3/4 services: start"
             probe_services
+            local _probe_services_rc=$?
+            logger -t podkop-bot "[Probe] step 3/4 services: done rc=${_probe_services_rc} telegram_blocked=${PROBE_TG_BLOCKED:-0}"
             send_or_edit "$mid" "$(printf '%s <b>Проверка активного прокси…</b>\n\nШаг 4/4: скорость соединения…' "$E_MICRO")" ""
 
             # Step 4: Throughput
             PROBE_SPEED_MBPS=""; PROBE_SPEED_BYTES=0; PROBE_SPEED_SECS=""; PROBE_SPEED_STATUS=""
+            logger -t podkop-bot "[Probe] step 4/4 throughput: start (32KiB + up to 8MiB; direct comparison may add up to 8MiB)"
             probe_throughput
+            logger -t podkop-bot "[Probe] step 4/4 throughput: done status=${PROBE_SPEED_STATUS:-n/a} speed=${PROBE_SPEED_MBPS:-n/a}Mbps bytes=${PROBE_SPEED_BYTES:-0} direct=${PROBE_SPEED_DIRECT_MBPS:-n/a}Mbps"
 
             # ── Build result card ──────────────────────────────────────────
             local size_kb_disp size_unit
@@ -15112,8 +15594,15 @@ EOF
             esac
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
 
-            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
+            local _j_geo _j_cf _j_google_final
+            _j_geo=$(_journal_value "${PROBE_COUNTRY:-}")
+            _j_cf=$(_journal_value "${PROBE_CF_COUNTRY:-}")
+            _j_google_final=$(_journal_value "${PROBE_GOOGLE_COUNTRY:-}")
+            logger -t podkop-bot "[Probe] complete: section=${sec} mode=${proxy_mode} geo=${_j_geo} cf=${_j_cf} google=${_j_google_final} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
+            ) &
+            local _probe_worker_pid=$!
+            logger -t podkop-bot "[Probe] queued background worker pid=${_probe_worker_pid}"
             ;;
 
         "cmd_upstream_health")
@@ -15412,7 +15901,13 @@ EOF
             ;;
 
         "cmd_upload_bot_script")
-            echo "wait_bot_script_file" > "$STATE_FILE"
+            if [ "${user_id:-}" != "$ADMIN_ID" ] || [ "${chat_type:-}" != "private" ]; then
+                send_or_edit "$mid" "$(printf '%s Загрузка исполняемого скрипта разрешена только основному администратору в личном чате.' "$E_ERR")" ""
+                return
+            fi
+            {
+                printf 'wait_bot_script_file\n%s\n%s\n%s\n' "$user_id" "$chat_id" "$(date +%s)"
+            } > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте файл <code>podkop_bot.sh</code> как документ.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_maintenance\"}]]}"
@@ -15797,7 +16292,7 @@ EOF
 
             cp -f "$BOT_PATH" "${BOT_PATH}.bak" 2>/dev/null || true
             mv "$bot_tmp" "$BOT_PATH"
-            logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Backup at ${BOT_PATH}.bak. Перезапуск…"
+            logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Backup at ${BOT_PATH}.bak. Restarting."
 
             # Preserve offset outside BOT_DIR before restart.
             # The trap (INT/TERM/QUIT) runs rm -rf "$BOT_DIR" which would wipe
@@ -16079,7 +16574,7 @@ handle_command() {
         cmd_server_instances|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
-        ask_probe_outbound|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
+        ask_probe_outbound|ask_probe_outbound_status|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
         cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
         ask_restart_bot|do_restart_bot|\
         ask_restart_router_1|ask_restart_router_2)
@@ -16174,13 +16669,11 @@ if [ ! -f "$OFFSET_FILE" ] && [ -f "/tmp/podkop_bot_offset" ]; then
     logger -t podkop-bot "[Startup] Migrated offset from legacy path"
 fi
 
-# Pre-initialize route key file so watchdog nudge logic works from first cycle.
-# Without this, MAIN_ROUTE_KEY_FILE is empty until first api_request_fast succeeds,
-# and watchdog sees "unknown" → sends nudge → IPC up resets FAST/POLL → bot does
-# full discovery but may land on tier4 (Direct) before tier1 is confirmed reachable.
-# Setting "unknown" explicitly ensures nudge fires and triggers SOCKS-first rediscovery.
-printf 'unknown' > "$MAIN_ROUTE_KEY_FILE"
-printf 'Инициализация…' > "$MAIN_ROUTE_FILE"
+# Pre-initialize both route profiles. POLL starts as unknown and watchdog does
+# not treat unknown as degradation; the first completed getUpdates attempt becomes
+# authoritative. FAST is diagnostic only and can be populated independently.
+_write_route_state "poll" "unknown" "Инициализация…"
+_write_route_state "fast" "unknown" "Инициализация…"
 
 # Startup notification runs in background subprocess to not block the main loop
 send_startup_notification_async() {
@@ -16204,10 +16697,9 @@ send_startup_notification_async() {
     while [ "$i" -le 12 ]; do
         if api_request_fast "getMe" "{}" "5" >/dev/null; then
             load_bot_identity >/dev/null 2>&1
-            # Write initial route so watchdog subshell can read it immediately
-            _write_main_route "$LAST_ROUTE_FAST" "$LAST_ROUTE_NAME"
+            # api_request_fast already published the FAST diagnostic route.
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
-                logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
+                logger -t podkop-bot "Connected via route=${LAST_ROUTE_FAST} profile=fast"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Роутер")
                 p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
@@ -16253,7 +16745,7 @@ trap 'kill "$HEALTH_PID" 2>/dev/null
     # Remove volatile runtime state but preserve persistent files:
     # OFFSET_FILE (offset survives restart), ACTIVE_SECTION_FILE (user choice),
     # BOT_USERNAME_FILE / BOT_ID_FILE (identity cache).
-    rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE"         "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE"         "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$LAST_CMD_FILE" "$UNAUTH_FILE"         "${BOT_DIR}/last_nudge" "${BOT_DIR}/probe_ts" "${BOT_DIR}/pubip_refresh.lockdir"         "$PUBIP_CACHE" "$TAG_URI_CACHE" "$UCI_LINKS_CACHE" "$TAG_NAME_CACHE"         "$RELOAD_TS_FILE" "$RELOAD_LOCK" "$BOT_PID_FILE"
+    rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE"         "$POLL_REPROBE_TS_FILE" "$FAST_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$POLL_ROUTE_FILE" "$POLL_ROUTE_KEY_FILE" "$FAST_ROUTE_FILE" "$FAST_ROUTE_KEY_FILE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE"         "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$LAST_CMD_FILE" "$UNAUTH_FILE"         "${BOT_DIR}/last_nudge" "${BOT_DIR}/probe_ts" "${BOT_DIR}/pubip_refresh.lockdir"         "$PUBIP_CACHE" "$TAG_URI_CACHE" "$UCI_LINKS_CACHE" "$TAG_NAME_CACHE"         "$RELOAD_TS_FILE" "$RELOAD_LOCK" "$BOT_PID_FILE"
     rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.*         /tmp/podkop_ip[1-5].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null
     rm -f "$_LOCK_PID_FILE" 2>/dev/null
     exit' INT TERM QUIT
@@ -16266,6 +16758,7 @@ offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 while true; do
     UPDATES_FILE="/tmp/podkop_updates.$$"
 
+    _consume_poll_route_cmd
     api_poll_long "$offset" "50"
     response="$API_RESPONSE"
     [ -z "$response" ] && sleep 2 && continue
@@ -16318,33 +16811,35 @@ EOF
         [ -z "$BOT_USERNAME" ] && load_bot_identity >/dev/null 2>&1
         [ -z "$BOT_ID" ]       && load_bot_identity >/dev/null 2>&1
 
-        # Authorization check
+        # Authorization check. Allowlist is the security boundary; blocklists and
+        # rate limits only reduce abuse from actors that already failed it.
         if ! is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
-            if [ "$is_bot_sender" != "true" ] && [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
-                now=$(date +%s); count=1
-                [ -f "$UNAUTH_FILE" ] && count=$(( $(cut -d'|' -f1 "$UNAUTH_FILE") + 1 ))
-                echo "${count}|${now}|${u_name:-Unknown}|${user_id}" > "$UNAUTH_FILE"
-                logger -t podkop-bot "[Security] Unauthorized: user=@${u_name:-Unknown} id=${user_id} text=${text}"
+            if is_manually_blocked_actor "$user_id" "$sender_chat_id"; then
+                continue
+            fi
+            security_note_unauthorized "$user_id" "$sender_chat_id"
+            _sec_actor="user"; _sec_id="$user_id"
+            if [ -z "$_sec_id" ] || [ "$_sec_id" = "null" ]; then
+                _sec_actor="sender_chat"; _sec_id="$sender_chat_id"
+            fi
+            case "$SECURITY_EVENT" in
+                blocked) continue ;;
+                blocked_new)
+                    logger -t podkop-bot "[Security] unauthorized actor=${_sec_actor} id=${_sec_id:-unknown} action=temp_block duration=${SECURITY_BLOCK_SEC}s" ;;
+                *)
+                    logger -t podkop-bot "[Security] unauthorized actor=${_sec_actor} id=${_sec_id:-unknown} event=update" ;;
+            esac
+            if [ "$is_bot_sender" != "true" ] && [ "$SECURITY_EVENT" != "journal" ] && security_allow_alert; then
                 safe_u_name=$(html_escape "${u_name:-не указано}")
-                safe_chat_title=$(html_escape "${sender_chat_title:-без названия}")
-                safe_alert_text=$(html_escape "$text")
-                case "$chat_type" in
-                    private)    alert_chat_type="личный" ;;
-                    group)      alert_chat_type="группа" ;;
-                    supergroup) alert_chat_type="супергруппа" ;;
-                    channel)    alert_chat_type="канал" ;;
-                    *)          alert_chat_type="${chat_type:-неизвестно}" ;;
-                esac
-                if [ -n "$u_name" ] && [ "$u_name" != "null" ]; then
-                    alert_user_display="@${safe_u_name}"
-                else
-                    alert_user_display="имя пользователя не указано"
-                fi
+                safe_alert_text=$(printf '%.120s' "$text" | tr '\r\n\t' '   ')
+                safe_alert_text=$(html_escape "$safe_alert_text")
+                _sec_note=""
+                [ "$SECURITY_EVENT" = "blocked_new" ] && _sec_note="\n<b>Действие:</b> временная блокировка на 1 час"
+                [ "${SECURITY_SUPPRESSED:-0}" -gt 0 ] 2>/dev/null && _sec_note="${_sec_note}\n<b>Подавлено ранее:</b> ${SECURITY_SUPPRESSED}"
                 alert_txt=$(cat <<EOF
 ${E_WARN} <b>Попытка несанкционированного доступа</b>
-<b>Пользователь:</b> ${alert_user_display} (ID: <code>${user_id}</code>)
-<b>Чат:</b> ${alert_chat_type} | <b>Название:</b> ${safe_chat_title}
-<b>Сообщение:</b> <code>${safe_alert_text}</code>
+<b>Пользователь:</b> @${safe_u_name} (ID: <code>${_sec_id:-unknown}</code>)
+<b>Сообщение:</b> <code>${safe_alert_text}</code>${_sec_note}
 EOF
 )
                 alert_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$alert_txt" \
@@ -16381,21 +16876,25 @@ EOF
         _doc_file_id=$(printf '%s' "$update" | jq -r '.message.document.file_id // empty' 2>/dev/null)
         if [ -n "$_doc_file_id" ] && is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
             _cur_doc_state=$(head -n1 "$STATE_FILE" 2>/dev/null)
-            # Accept a bot-script upload whether or not wait_bot_script_file state
-            # is set — /tmp state can be cleared by a restart between pressing
-            # "Upload Bot Script" and sending the file. To avoid downloading every
-            # attachment an admin sends, gate on filename + size metadata BEFORE
-            # fetching. Safety of the install itself still depends on the admin
-            # gate (above) + shebang + BOT_VERSION + syntax check (below).
+            _upload_uid=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+            _upload_chat=$(sed -n '3p' "$STATE_FILE" 2>/dev/null)
+            _upload_ts=$(sed -n '4p' "$STATE_FILE" 2>/dev/null)
+            _upload_now=$(date +%s)
+            case "$_upload_ts" in ''|*[!0-9]*) _upload_ts=0 ;; esac
+            if [ "$_cur_doc_state" != "wait_bot_script_file" ] || \
+               [ "$chat_type" != "private" ] || [ "$user_id" != "$ADMIN_ID" ] || \
+               [ "$_upload_uid" != "$user_id" ] || [ "$_upload_chat" != "$chat_id" ] || \
+               [ $((_upload_now - _upload_ts)) -lt 0 ] || \
+               [ $((_upload_now - _upload_ts)) -gt "$UPLOAD_SESSION_TTL" ]; then
+                [ "$_cur_doc_state" = "wait_bot_script_file" ] && rm -f "$STATE_FILE"
+                continue
+            fi
             _doc_name=$(printf '%s' "$update" | jq -r '.message.document.file_name // empty' 2>/dev/null)
             _doc_size=$(printf '%s' "$update" | jq -r '.message.document.file_size // 0' 2>/dev/null)
             _doc_ok=0
             case "$_doc_name" in
-                podkop_bot*.sh|podkop_bot|*podkop_bot*.sh) _doc_ok=1 ;;
+                podkop_bot*.sh|podkop_bot) _doc_ok=1 ;;
             esac
-            # If explicitly waiting for a script (user just tapped Upload), accept
-            # any name — the intent is unambiguous.
-            [ "$_cur_doc_state" = "wait_bot_script_file" ] && _doc_ok=1
             case "$_doc_size" in ''|*[!0-9]*) _doc_size=0 ;; esac
             # Valid-looking bot script but too large: tell the user explicitly
             # instead of silently ignoring it (which would leave the wait state

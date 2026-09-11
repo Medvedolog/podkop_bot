@@ -1,6 +1,38 @@
 # Changelog
 
+## v0.19.17
+
+- **ANTI-FLAP:** fixed false POLL demotion to emergency Direct routes when the independent Telegram follower sample was incorrectly considered stale. Follower freshness now follows its real cadence, preserving one-event hysteresis without changing authoritative POLL/FAST separation. Field rollout on multiple routers showed a sharp drop in route flapping.
+- **DIAGNOSTICS/UI:** the full Outbound check covers 12 external services, runs in background without blocking Telegram polling, and the dedicated Telegram Bot API check remains available as a separate Runtime action.
+- **SECURITY:** bot-script update/upload is restricted to the primary administrator in a private chat with a fresh 5-minute upload session; anonymous sender_chat access is opt-in and repeated unauthorized actors are rate-limited/temporarily blocked.
+- **LOGGING:** selectable `quiet` / `normal` / `debug` journal verbosity is available from Telegram and LuCI; normal mode suppresses routine telemetry and logs follower state changes plus an hourly summary.
+
 ---
+## v0.19.16
+
+- **TRANSPORT:** the watchdog follower now probes Telegram `getMe` through tier1, every tier2 fallback/auto-section and tier3 concurrently instead of serially. While POLL is using a reserve/degraded route the follower refreshes every health tick; on tier1 it keeps the normal low-frequency cadence.
+- **ANTI-FLAP:** POLL demotion to Direct gets one-event hysteresis when the independent follower still has a fresh positive proxy sample. One failed long-poll cascade is held and retried; two consecutive failed cascades may demote. FAST state remains independent.
+- **JOURNAL:** localized route/probe fallback values are normalized to ASCII machine values before syslog; Telegram/LuCI localization is unchanged.
+
+## v0.19.15
+
+- **FIXED (critical): full Outbound probe no longer hangs forever at step 3/4.** `probe_services()` used a bare `wait` after its 12 parallel service workers. In the main bot shell that also waited for the long-lived health/watchdog daemon, so the function could never return. It now kills/reaps only the PIDs created by the service probe.
+- **RESPONSIVENESS:** the full Outbound probe now runs in a background worker. The Telegram long-poll loop remains free, so `/start` and other commands continue to be processed while the 20–60 second diagnostic is running.
+- **DIAGNOSTICS:** syslog now records probe start/context, each of the four stages, all 12 service outcomes (`status`, HTTP code, latency and optional geo hint), throughput result and final completion. Built-in journal event text is English only; localized route labels remain in the UI. Telegram bot tokens are never logged.
+
+## v0.19.14
+
+- **FIXED:** the Status button for the full Outbound probe is routed into the existing `ask_probe_outbound` / `cmd_probe_outbound_back_*` flow instead of falling through to the generic `ask_*` confirmation handler.
+
+## v0.19.13
+
+- **FIXED (transport-state): FAST and POLL no longer share authoritative route state.** `getUpdates` writes `poll_route*`; short Bot API calls write `fast_route*`. Watchdog degradation/recovery decisions use POLL only, so sending its own alert cannot manufacture a Direct → recovered pair. Legacy `main_route*` mirrors POLL for compatibility.
+- **FIXED: watchdog IPC can only be consumed by the main polling loop.** `ROUTE_CMD_FILE` is no longer read by the shared request engine, so `send_health_alert()` cannot consume the watchdog's own `up`/`down` command.
+- **FIXED: recovery and degraded-route reprobe state are profile-local.** A FAST success/failure cannot reset POLL recovery or postpone its SOCKS reprobe.
+- **FIXED: tier3 is consistently healthy.** Watchdog nudge now triggers only for explicit `tier4|tier5|fail`; a working custom/Opera proxy is not rediscovered every 120 seconds and `unknown` startup state is not treated as degradation.
+- **FIXED: Telegram 429 never demotes transport; FAST 409 never mutates POLL conflict state.** Only persistent POLL 409 can exceed `conflict_tolerance` and be treated as a possible second poller.
+- **DIAGNOSTICS:** structured state now includes separate `poll_route*` and `fast_route*` fields; `LAST_ROUTE_DOC` remains independent.
+
 ## v0.19.12
 
 - **FIXED (critical, 0.19.11 regression): settings could fail to save at all.** The shared UCI lock added in 0.19.11 **skipped the commit** whenever the lock could not be taken — `uci_commit_safe` had `flock … || exit 1`. The journal showed `uci commit failed (RC=1)`, implying the commit ran and failed, when in fact it never ran and the change was silently lost.
