@@ -2,13 +2,10 @@
 
 ## v0.19.17
 
-- **LOGGING:** added `quiet` / `normal` / `debug` journal verbosity, selectable from Telegram Bot Settings and LuCI through `podkop_bot.settings.log_level`. Normal is the default.
-- **LOGGING:** normal mode collapses follower telemetry to up/down transitions plus one compact hourly summary; debug retains every raw follower/probe line, while quiet keeps only operationally important events.
-- **LOGGING:** runtime level is shared through a tiny `/tmp` cache; Telegram changes apply immediately and LuCI changes are picked up by the watchdog without per-log-line UCI reads.
-- **SECURITY:** anonymous-admin sender_chat access is now opt-in (default off).
-- **SECURITY:** executable bot uploads require a fresh 5-minute session started by the primary admin in a private chat; extra admins and sender_chat identities cannot upload code.
-- **SECURITY:** unauthorized actors get per-actor temporary blocking after 5 attempts in 60 seconds plus a global alert limiter; manual UCI blocklists are supported via `blocked_user_ids` and `blocked_sender_chat_ids`.
-- **SECURITY:** attacker-controlled Telegram text is no longer written verbatim to syslog.
+- **ANTI-FLAP:** fixed false POLL demotion to emergency Direct routes when the independent Telegram follower sample was incorrectly considered stale. Follower freshness now follows its real cadence, preserving one-event hysteresis without changing authoritative POLL/FAST separation. Field rollout on multiple routers showed a sharp drop in route flapping.
+- **DIAGNOSTICS/UI:** the full Outbound check covers 12 external services, runs in background without blocking Telegram polling, and the dedicated Telegram Bot API check remains available as a separate Runtime action.
+- **SECURITY:** bot-script update/upload is restricted to the primary administrator in a private chat with a fresh 5-minute upload session; anonymous sender_chat access is opt-in and repeated unauthorized actors are rate-limited/temporarily blocked.
+- **LOGGING:** selectable `quiet` / `normal` / `debug` journal verbosity is available from Telegram and LuCI; normal mode suppresses routine telemetry and logs follower state changes plus an hourly summary.
 
 ---
 ## v0.19.16
