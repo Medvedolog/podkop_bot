@@ -1,0 +1,63 @@
+name: Fix Clash API under Bearhole
+
+on:
+  push:
+    branches:
+      - dev/0.19.18-poll-warp-rescue
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev/0.19.18-poll-warp-rescue
+          fetch-depth: 0
+      - name: Keep local Clash API outside system proxy
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('podkop_bot.sh')
+          s = p.read_text()
+          start = s.find('clash_request() {')
+          if start < 0:
+              raise SystemExit('clash_request not found')
+          end = s.find('\n}\n', start)
+          if end < 0:
+              raise SystemExit('clash_request end not found')
+          end += 3
+          body = s[start:end]
+          if "curl -q --noproxy '*'" in body:
+              print('already patched')
+          else:
+              n = body.count('curl -s ')
+              if n < 2:
+                  raise SystemExit(f'unexpected clash_request curl count: {n}')
+              body = body.replace('curl -s ', "curl -q --noproxy '*' -s ")
+              marker = 'clash_request() {\n'
+              body = body.replace(marker, marker + "    # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.\n", 1)
+              s = s[:start] + body + s[end:]
+              p.write_text(s)
+          PY
+          sh -n podkop_bot.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('podkop_bot.sh').read_text()
+          a=s.index('clash_request() {'); b=s.index('\n}\n',a)
+          body=s[a:b]
+          assert "curl -q --noproxy '*'" in body
+          PY
+      - name: Commit fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then exit 0; fi
+          git config user.name 'medvedolog-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add podkop_bot.sh
+          git commit -m '0.19.18: keep local Clash API outside Bearhole proxy'
+          git push origin HEAD:dev/0.19.18-poll-warp-rescue
