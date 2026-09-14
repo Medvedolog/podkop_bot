@@ -16017,7 +16017,7 @@ EOF
                 printf 'wait_bot_script_file\n%s\n%s\n%s\n' "$user_id" "$chat_id" "$(date +%s)"
             } > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте файл <code>podkop_bot.sh</code> как документ.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
+                "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте скрипт бота как документ. Имя файла может быть любым.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_maintenance\"}]]}"
             ;;
 
@@ -17007,22 +17007,19 @@ EOF
             fi
             _doc_name=$(printf '%s' "$update" | jq -r '.message.document.file_name // empty' 2>/dev/null)
             _doc_size=$(printf '%s' "$update" | jq -r '.message.document.file_size // 0' 2>/dev/null)
-            _doc_ok=0
-            case "$_doc_name" in
-                podkop_bot*.sh|podkop_bot) _doc_ok=1 ;;
-            esac
             case "$_doc_size" in ''|*[!0-9]*) _doc_size=0 ;; esac
-            # Valid-looking bot script but too large: tell the user explicitly
-            # instead of silently ignoring it (which would leave the wait state
-            # set and no feedback about why nothing happened).
-            if [ "$_doc_ok" = "1" ] && [ "$_doc_size" -gt 2097152 ]; then
+            # The explicit upload session is already bound to admin + private chat
+            # + chat/user IDs + TTL. Filename is cosmetic and must not be another
+            # security gate: Telegram/users routinely rename the same valid script.
+            # Accept any document here and decide only from size + file contents.
+            if [ "$_doc_size" -gt 2097152 ]; then
                 rm -f "$STATE_FILE"
                 set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
                 send_message "$(printf '%s Файл слишком большой (максимум 2 МБ). Загрузка отменена.' "$E_ERR")" ""
                 reset_chat_context
                 continue
             fi
-            if [ "$_doc_ok" = "1" ] && [ "$_doc_size" -le 2097152 ]; then
+            if [ "$_doc_size" -le 2097152 ]; then
                 rm -f "$STATE_FILE"
                 set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
                 send_message "$(printf '%s Загружаем отправленный скрипт…' "$E_TIME")" ""
@@ -17044,7 +17041,7 @@ EOF
                     reset_chat_context; continue
                 fi
 
-                if ! head -1 "$_bot_tmp" | grep -q '^#!' || ! grep -q '^BOT_VERSION=' "$_bot_tmp"; then
+                if ! head -1 "$_bot_tmp" | grep -q '^#!' || ! grep -q '^[[:space:]]*BOT_VERSION=' "$_bot_tmp"; then
                     rm -f "$_bot_tmp"
                     send_message "$(printf '%s Файл не похож на скрипт бота.' "$E_ERR")" ""
                     reset_chat_context; continue
