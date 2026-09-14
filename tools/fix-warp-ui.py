@@ -4,36 +4,42 @@ p = Path("podkop_bot.sh")
 s = p.read_text()
 
 
-def one(old: str, new: str, desc: str) -> None:
+def many(old: str, new: str, desc: str) -> None:
     global s
     n = s.count(old)
-    if n != 1:
-        raise SystemExit(f"{desc}: expected one anchor, got {n}")
-    s = s.replace(old, new, 1)
+    if n < 1:
+        raise SystemExit(f"{desc}: anchor missing")
+    s = s.replace(old, new)
+    print(f"{desc}: patched {n}")
 
 
-one(
+many(
     "                    tier3) printf 'прокси бота' ;;\n                    tier4) printf 'напрямую' ;;\n",
     "                    tier3) printf 'прокси бота' ;;\n                    warp_rescue) printf 'WARP Rescue' ;;\n                    tier4) printf 'напрямую' ;;\n",
     "route key display",
 )
 
-one(
+many(
     "            # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3, tier4, tier5.\n",
     "            # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3,\n            # warp_rescue, tier4 or tier5.\n",
     "settings chain comment",
 )
 
-# Bot Settings -> "Порядок подключения": insert WARP between tier3 and Direct.
-tier3_anchor = '$(_fmt_tier "tier3" "Прокси бота (${_cp_esc})")'
-a = s.find(tier3_anchor)
-if a < 0:
-    raise SystemExit("bot settings tier3 anchor missing")
-marker = '            if [ "$tr" != "socks" ]; then\n'
-b = s.find(marker, a)
-if b < 0:
-    raise SystemExit("bot settings direct marker missing")
-block = """            # WARP Rescue is a real transport tier between configured proxies and Direct.
+old = '''            if [ "$cp" != "Not set" ]; then
+                _cp_esc=$(html_escape "$cp")
+                tr_chain="${tr_chain}
+$(_fmt_tier "tier3" "Прокси бота (${_cp_esc})")"
+                _tier=$((_tier + 1))
+            fi
+            if [ "$tr" != "socks" ]; then
+'''
+new = '''            if [ "$cp" != "Not set" ]; then
+                _cp_esc=$(html_escape "$cp")
+                tr_chain="${tr_chain}
+$(_fmt_tier "tier3" "Прокси бота (${_cp_esc})")"
+                _tier=$((_tier + 1))
+            fi
+            # WARP Rescue is a real transport tier between configured proxies and Direct.
             # Dormant means Revolver is armed but its localhost SOCKS is not running yet.
             local _wr_enabled _wr_port _wr_state
             _wr_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
@@ -45,14 +51,12 @@ block = """            # WARP Rescue is a real transport tier between configured
 $(_fmt_tier "warp_rescue" "WARP Rescue (127.0.0.1:${_wr_port}, ${_wr_state})")"
                 _tier=$((_tier + 1))
             fi
-"""
-s = s[:b] + block + s[b:]
+            if [ "$tr" != "socks" ]; then
+'''
+many(old, new, "bot settings chain")
 
-# Proxy connection list: render the same runtime tier and its current state.
-old_comment = "            # tier4/tier5 always exist — say so, so the chain has no invisible parts.\n"
-if s.count(old_comment) != 1:
-    raise SystemExit(f"proxy chain final tiers comment: expected one anchor, got {s.count(old_comment)}")
-block = r'''            # WARP Rescue is owned by Revolver, but belongs in this ordered runtime chain.
+old = "            # tier4/tier5 always exist — say so, so the chain has no invisible parts.\n"
+new = r'''            # WARP Rescue is owned by Revolver, but belongs in this ordered runtime chain.
             local _wr_enabled _wr_port _wr_state _wr_lat
             _wr_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
             if [ "$_wr_enabled" = "1" ]; then
@@ -73,18 +77,23 @@ block = r'''            # WARP Rescue is owned by Revolver, but belongs in this 
 
             # Direct and emergency IPs are the final two tiers.
 '''
-s = s.replace(old_comment, block, 1)
+many(old, new, "proxy chain WARP row")
 
-# "Проверить все": enabled Rescue must be a real test, not an invisible tier.
-probe_anchor = '            local _t3_test; _t3_test=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)\n'
-a = s.find(probe_anchor)
-if a < 0:
-    raise SystemExit("test-all tier3 anchor missing")
-marker = "            unset -f _probe_channel _append_channel\n"
-b = s.find(marker, a)
-if b < 0:
-    raise SystemExit("test-all cleanup marker missing")
-block = r'''            # Manual "Проверить все" includes the real WARP runtime tier.
+old = '''            local _t3_test; _t3_test=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
+            if [ -n "$_t3_test" ]; then
+                _probe_channel "$(_proxy_endpoint "$_t3_test")"
+                local _t3_show; _t3_show=$(html_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3_test")")")
+                _append_channel "Прокси бота" "$_t3_show"
+            fi
+            unset -f _probe_channel _append_channel
+'''
+new = r'''            local _t3_test; _t3_test=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
+            if [ -n "$_t3_test" ]; then
+                _probe_channel "$(_proxy_endpoint "$_t3_test")"
+                local _t3_show; _t3_show=$(html_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3_test")")")
+                _append_channel "Прокси бота" "$_t3_show"
+            fi
+            # Manual "Проверить все" includes the real WARP runtime tier.
             local _wr_test_enabled _wr_test_proxy
             _wr_test_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
             if [ "$_wr_test_enabled" = "1" ]; then
@@ -98,7 +107,8 @@ block = r'''            # Manual "Проверить все" includes the real W
                     _append_channel "WARP Rescue" "Revolver не поднял SOCKS"
                 fi
             fi
+            unset -f _probe_channel _append_channel
 '''
-s = s[:b] + block + s[b:]
+many(old, new, "check-all WARP probe")
 
 p.write_text(s)
