@@ -1,0 +1,85 @@
+name: apply-state-nav-fix
+
+on:
+  push:
+    branches:
+      - dev/0.19.17-security-hardening
+    paths:
+      - .github/workflows/apply-state-nav-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.17-security-hardening
+          fetch-depth: 0
+
+      - name: Patch pending-input navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('podkop_bot.sh')
+          text = path.read_text()
+          old = '''        # Universal exit: /cancel or Menu always clears state
+          case "$1" in
+              /cancel|cancel|/menu|/start|main_menu|"🏠 Меню"|"🏠Menu")
+                  rm -f "$STATE_FILE"
+                  case "$1" in /cancel|cancel)
+                      send_message "$(printf '%s Действие отменено.' "$E_BACK")" "" ;;
+                  esac
+                  _handle_bot "main_menu" "$mid" "" ""
+                  return ;;
+          esac
+          '''
+          new = '''        # Persistent keyboard navigation must win over pending text input.
+          # normalize_reply_button() maps the reply-keyboard Status button to
+          # cmd_status before we get here; without this escape it is consumed by
+          # states such as wait_admin_id and validated as the pending value.
+          case "$1" in
+              /cancel|cancel|/menu|/start|main_menu|"🏠 Меню"|"🏠Menu")
+                  rm -f "$STATE_FILE"
+                  case "$1" in /cancel|cancel)
+                      send_message "$(printf '%s Действие отменено.' "$E_BACK")" "" ;;
+                  esac
+                  _handle_bot "main_menu" "$mid" "" ""
+                  return ;;
+              cmd_status)
+                  rm -f "$STATE_FILE"
+                  _handle_bot "cmd_status" "$mid" "" ""
+                  return ;;
+          esac
+          '''
+          if old not in text:
+              raise SystemExit('target block not found or already changed')
+          if text.count(old) != 1:
+              raise SystemExit(f'target block count is {text.count(old)}, expected 1')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Validate shell syntax and regression guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n podkop_bot.sh
+          dash -n podkop_bot.sh
+          grep -A18 'Persistent keyboard navigation must win' podkop_bot.sh | grep -q 'cmd_status)'
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-state-nav-fix.yml
+          git add podkop_bot.sh
+          git commit -m "fix(bot): let Status escape pending input state"
+          git push origin HEAD:dev/0.19.17-security-hardening
