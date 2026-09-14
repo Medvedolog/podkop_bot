@@ -16417,6 +16417,14 @@ handle_command() {
     # State machine: intercept plain text (not callbacks) for multi-step input
     if [ -f "$STATE_FILE" ] && [ -z "$cb_id" ]; then
         local state; state=$(head -n 1 "$STATE_FILE")
+        # Persistent keyboard navigation must win over pending text input.
+        # normalize_reply_button() maps Status to cmd_status before dispatch.
+        if [ "$1" = "cmd_status" ]; then
+            rm -f "$STATE_FILE"
+            _handle_bot "cmd_status" "$mid" "" ""
+            return
+        fi
+
         # Universal exit: /cancel or Menu always clears state
         case "$1" in
             /cancel|cancel|/menu|/start|main_menu|"🏠 Меню"|"🏠Menu")
