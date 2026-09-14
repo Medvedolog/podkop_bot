@@ -1,0 +1,76 @@
+name: Fix manual bot upload gate
+
+on:
+  push:
+    branches:
+      - dev/0.19.18-poll-warp-rescue
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev/0.19.18-poll-warp-rescue
+          fetch-depth: 0
+      - name: Relax filename gate and validate content instead
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('podkop_bot.sh')
+          s = p.read_text()
+
+          old_prompt = '''Отправьте файл <code>podkop_bot.sh</code> как документ.\\
+\\
+<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.'''
+          new_prompt = '''Отправьте скрипт бота как документ. Имя файла может быть любым.\\
+\\
+<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.'''
+          if old_prompt not in s:
+              raise SystemExit('upload prompt anchor not found')
+          s = s.replace(old_prompt, new_prompt, 1)
+
+          old_gate = '''            _doc_ok=0
+            case "$_doc_name" in
+                podkop_bot*.sh|podkop_bot) _doc_ok=1 ;;
+            esac
+'''
+          new_gate = '''            # The explicit upload session is the gate: private chat, primary
+            # admin, matching chat/user and a short TTL. A filename is not a
+            # security boundary; accept the document and validate its contents
+            # below (shebang, BOT_VERSION and BusyBox ash syntax).
+            _doc_ok=1
+'''
+          if old_gate not in s:
+              raise SystemExit('filename gate anchor not found')
+          s = s.replace(old_gate, new_gate, 1)
+
+          old_comment = '''            # Valid-looking bot script but too large: tell the user explicitly
+            # instead of silently ignoring it (which would leave the wait state
+            # set and no feedback about why nothing happened).
+'''
+          new_comment = '''            # Reject oversized documents explicitly. Filename is deliberately
+            # irrelevant here; downloaded content is the authoritative check.
+'''
+          if old_comment not in s:
+              raise SystemExit('size comment anchor not found')
+          s = s.replace(old_comment, new_comment, 1)
+
+          p.write_text(s)
+          PY
+          sh -n podkop_bot.sh
+          grep -Fq 'Имя файла может быть любым' podkop_bot.sh
+          grep -Fq '_doc_ok=1' podkop_bot.sh
+          ! grep -Fq 'podkop_bot*.sh|podkop_bot' podkop_bot.sh
+
+          rm -f .github/workflows/fix-manual-upload-01918.yml
+          git config user.name 'medvedolog-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add podkop_bot.sh .github/workflows/fix-manual-upload-01918.yml
+          git commit -m 'fix(bot): accept manual script upload regardless of filename'
+          git push origin HEAD:dev/0.19.18-poll-warp-rescue
