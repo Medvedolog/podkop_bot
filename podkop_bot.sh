@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.17
+# Podkop Telegram Bot v0.19.18
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -10,8 +10,8 @@
 # 'podkop' package (sing-box wrapper). Written in strict POSIX ash.
 #
 # KEY SUBSYSTEMS:
-# 1. 5-Tier Fallback Транспорт: Podkop SOCKS5 -> Резервные SOCKS -> Custom Proxy
-#    -> Direct -> Emergency IPs. Atomic IPC via mv for watchdog <-> main loop.
+# 1. Fallback Транспорт: Podkop SOCKS5 -> Резервные SOCKS -> Custom Proxy
+#    -> WARP Rescue -> Direct -> Emergency IPs. Atomic IPC via mv for watchdog <-> main loop.
 # 2. UCI Native Core: direct uci read/write, protected by flock.
 #    uci_list_clean + set -f replaces eval for safe list splitting.
 # 3. Dynamic State Machine: STATE_FILE for multi-step text inputs
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.17"
+BOT_VERSION="0.19.18"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -533,7 +533,7 @@ _write_route_state() {
             LAST_ROUTE_POLL="$_key"
             LAST_ROUTE_POLL_NAME="$_name"
             case "$_key" in
-                tier1|tier2_*|tier3) POLL_PROXY_FAIL_STREAK=0 ;;
+                tier1|tier2_*|tier3|warp_rescue) POLL_PROXY_FAIL_STREAK=0 ;;
             esac
             LAST_ROUTE="$_key"
             LAST_ROUTE_NAME="$_name"
@@ -1363,6 +1363,7 @@ url_decode() {
 #       tier1               Podkop SOCKS5 (primary)
 #       tier2_N             fallback_socks list (UCI list, N entries)
 #       tier3               custom_proxy (single legacy entry)
+#       warp_rescue         WARP Rescue localhost SOCKS (optional)
 #       tier4               Direct
 #       tier5               Emergency hardcoded Telegram IPs
 #   — Sticky-route fast path: each profile remembers its last working tier
@@ -1995,7 +1996,70 @@ resolve_tg_emergency_ips() {
     printf '%s' "${_out# }"
 }
 
-# _try_all_tiers: full cascade including custom/direct/emergency.
+
+# PODKOP_TRANSPORT_PATCH_V2
+# WARP Rescue transport provider.  The revolver owns the WARP process; the bot
+# only consumes its localhost SOCKS endpoint and may ask the controller to arm
+# it when Rescue was explicitly enabled by the operator.
+_WARP_RESCUE_CONFIG="/etc/podkop_bot/warpscout.conf"
+_WARP_RESCUE_PID_FILE="${BOT_DIR}/warpscout_rescue_socks.pid"
+_WARP_RESCUE_TRIGGER_TS_FILE="${BOT_DIR}/warp_rescue_trigger_ts"
+
+_warp_rescue_cfg_get() {
+    [ -r "$_WARP_RESCUE_CONFIG" ] || return 1
+    sed -n "s/^$1=//p" "$_WARP_RESCUE_CONFIG" 2>/dev/null | head -1
+}
+
+_warp_rescue_pid_alive() {
+    [ -s "$_WARP_RESCUE_PID_FILE" ] || return 1
+    local _p
+    _p=$(cat "$_WARP_RESCUE_PID_FILE" 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_p" 2>/dev/null
+}
+
+_warp_rescue_proxy() {
+    local _allow_start="${1:-0}" _enabled _port _now _last=0 _resp _i
+    _enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+    [ "$_enabled" = "1" ] || return 1
+    _port=$(_warp_rescue_cfg_get socks_port 2>/dev/null || true)
+    case "$_port" in ''|*[!0-9]*) _port=18191 ;; esac
+
+    if ! _warp_rescue_pid_alive; then
+        [ "$_allow_start" = "1" ] || return 1
+        _now=$(date +%s 2>/dev/null || echo 0)
+        [ -r "$_WARP_RESCUE_TRIGGER_TS_FILE" ] && _last=$(cat "$_WARP_RESCUE_TRIGGER_TS_FILE" 2>/dev/null || echo 0)
+        case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+        if [ $((_now - _last)) -ge 20 ] 2>/dev/null; then
+            printf '%s\n' "$_now" > "$_WARP_RESCUE_TRIGGER_TS_FILE"
+            _resp=$(ubus call podkop_bot_warpscout_rescue trigger '{}' 2>/dev/null || true)
+            printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1 || return 1
+        fi
+        _i=0
+        while ! _warp_rescue_pid_alive && [ "$_i" -lt 10 ]; do
+            sleep 1
+            _i=$((_i + 1))
+        done
+    fi
+    _warp_rescue_pid_alive || return 1
+    printf 'socks5h://127.0.0.1:%s' "$_port"
+}
+
+_try_warp_rescue() {
+    local _args="$1" _max_time="$2" _ct="$3" _proxy
+    [ "$_t_policy" != "direct" ] || return 1
+    _proxy=$(_warp_rescue_proxy 1) || return 1
+    logger -t podkop-bot "[Transport] Trying WARP Rescue for ${_ROUTE_PROFILE:-unknown}"
+    if _try_curl "-x $_proxy" "$_max_time" "$_args" "$_ct"; then
+        ROUTE_KEY="warp_rescue"
+        ROUTE_NAME="WARP Rescue"
+        return 0
+    fi
+    logger -t podkop-bot "[Transport] WARP Rescue failed for ${_ROUTE_PROFILE:-unknown}"
+    return 1
+}
+
+# _try_all_tiers: full cascade including custom/WARP/direct/emergency.
 # Sets ROUTE_KEY and ROUTE_NAME on success.
 _try_all_tiers() {
     local args="$1" max_time="$2" ct_fast="$3"
@@ -2031,22 +2095,27 @@ _try_all_tiers() {
         # Same reasoning as above: a refusal is not a fault of this proxy.
         [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
     fi
-    # POLL-only demotion hysteresis.  If the independent follower has a
-    # fresh positive proxy sample, one failed long-poll cascade is treated as transient.
-    # The next POLL retries the proxy stack; two consecutive failures still allow Direct.
+    # WARP Rescue is a genuine runtime tier, not diagnostics decoration.  It is
+    # attempted after configured proxies and before Direct.
+    if _try_warp_rescue "$args" "$max_time" "$ct_fast"; then
+        return 0
+    fi
+    [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
+
+    # POLL-only demotion guard.  If the independent follower still proves at
+    # least one proxy route can reach Telegram with a fresh getMe, a failed 50s
+    # getUpdates is an idle-tunnel/POLL failure, not proof that the proxy path is
+    # dead.  Never fall through to Direct on that evidence alone.  Full discovery
+    # is repeated on the next POLL, so another healthy proxy can take over.
     if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then
         if _poll_follower_has_fresh_proxy; then
             POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))
-            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then
-                _TG_NO_DEMOTE=1
-                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold"
-                return 1
-            fi
-            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote"
-        else
-            POLL_PROXY_FAIL_STREAK=0
-            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
+            _TG_NO_DEMOTE=1
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"
+            return 1
         fi
+        POLL_PROXY_FAIL_STREAK=0
+        logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
     fi
 
     # tier4: direct
@@ -2136,8 +2205,18 @@ _route_request() {
                     eval "$_rvar=tier3"; return 0
                 }
                 ;;
+            warp_rescue)
+                local _warp_proxy=""
+                _warp_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
+                [ -n "$_warp_proxy" ] && \
+                _try_curl "-x $_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                    LAST_ROUTE="warp_rescue"; LAST_ROUTE_NAME="WARP Rescue"
+                    _write_route_state "$_ROUTE_PROFILE" "warp_rescue" "$LAST_ROUTE_NAME"
+                    eval "$_rvar=warp_rescue"; return 0
+                }
+                ;;
             tier4)
-                # On degraded path (tier4): periodically try SOCKS tiers before using direct.
+                # On degraded path (tier4): periodically try proxy tiers before using direct.
                 # Mirrors tier5 reprobe logic — prevents sticking on Direct when tier2
                 # recovers but tier1 is still down (Telegram accessible directly).
                 local _now _last_reprobe
@@ -2156,6 +2235,8 @@ _route_request() {
                     elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
                         ROUTE_KEY="tier3"; ROUTE_NAME="Прокси бота (${_t_custom})"
+                    elif _try_warp_rescue "$_args" "$_max" "2"; then
+                        :
                     else
                         ROUTE_KEY=""
                     fi
@@ -2189,6 +2270,8 @@ _route_request() {
                     elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
                         ROUTE_KEY="tier3"; ROUTE_NAME="Прокси бота (${_t_custom})"
+                    elif _try_warp_rescue "$_args" "$_max" "2"; then
+                        :
                     else
                         ROUTE_KEY=""
                     fi
@@ -2468,6 +2551,16 @@ probe_all_socks_write() {
         ) & _pids="$_pids $!"
     fi
 
+    local _warp_follow=""
+    _warp_follow=$(_warp_rescue_proxy 0 2>/dev/null || true)
+    if [ -n "$_warp_follow" ]; then
+        _slots="$_slots warp_rescue"
+        (
+            _lat=$(probe_telegram_proxy_latency "$_warp_follow")
+            printf 'warp_rescue=%s\n' "$_lat" > "$_probe_dir/warp_rescue"
+        ) & _pids="$_pids $!"
+    fi
+
     # Reap exactly our workers; never use a bare wait in the bot shell.
     for _pid in $_pids; do wait "$_pid" 2>/dev/null || true; done
 
@@ -2506,7 +2599,7 @@ _poll_follower_has_fresh_proxy() {
     [ "$_max_age" -lt 150 ] && _max_age=150
     [ "$_max_age" -gt 1200 ] && _max_age=1200
     [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1
-    grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
+    grep -Eq '^(tier(1|2_[0-9]+|3)|warp_rescue)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
 }
 
 # Journal values must stay ASCII/machine-readable even when UI fallback text is localized.
@@ -2565,6 +2658,15 @@ api_document() {
                 LAST_ROUTE_DOC="tier3"; return 0
             }
         fi
+        local _warp_doc=""
+        _warp_doc=$(_warp_rescue_proxy 1 2>/dev/null || true)
+        if [ -n "$_warp_doc" ]; then
+            res=$(_do_curl_doc "-x $_warp_doc")
+            _is_telegram_response "$res" && {
+                unset -f _do_curl_doc
+                LAST_ROUTE_DOC="warp_rescue"; return 0
+            }
+        fi
     fi
     if [ "$_t_policy" != "socks" ]; then
         res=$(_do_curl_doc "$_t_ifflag")
@@ -2612,6 +2714,12 @@ get_tg_latency() {
             ;;
         tier3)
             p_args="$if_flag -x ${custom_url}"
+            ;;
+        warp_rescue)
+            local _warp_lat=""
+            _warp_lat=$(_warp_rescue_proxy 0 2>/dev/null || true)
+            [ -n "$_warp_lat" ] || { echo "Нет данных"; return; }
+            p_args="-x $_warp_lat"
             ;;
         tier4)
             p_args="$if_flag"
@@ -6011,7 +6119,7 @@ start_health_daemon() {
                     # Nudge only an explicitly degraded POLL route. tier3 is healthy;
                     # unknown/stale values are intentionally ignored until POLL resolves.
                     case "${_wd_cur_route:-unknown}" in
-                        tier1|tier2_*|tier3)
+                        tier1|tier2_*|tier3|warp_rescue)
                             logger -t podkop-bot "[Watchdog] Route OK (${_wd_cur_route}), no action needed."
                             ;;
                         tier4|tier5|fail)
@@ -6109,7 +6217,7 @@ start_health_daemon() {
             # is worse than no alerting, so tier3 now clears the flag like any
             # other working route; the message names the actual route in use.
             case "${_wd_bot_route:-unknown}" in
-                tier1|tier2_*|tier3)
+                tier1|tier2_*|tier3|warp_rescue)
                     # Good route — if previously degraded, send recovery alert
                     if [ "${last_bot_route_degraded:-0}" = "1" ]; then
                         last_bot_route_degraded=0
@@ -6171,7 +6279,7 @@ start_health_daemon() {
                 # Only explicit degradation is actionable. Unknown/stale values do
                 # not prove a broken long-poll and therefore must not trigger rediscovery.
                 case "${_wd_cur_route:-unknown}" in
-                    tier1|tier2_*|tier3)
+                    tier1|tier2_*|tier3|warp_rescue)
                         : # good route, no nudge needed
                         ;;
                     tier4|tier5|fail)
