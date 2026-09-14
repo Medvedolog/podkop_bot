@@ -3074,14 +3074,15 @@ delete_message() {
 # connection but then hangs on the response (e.g. sing-box under high load, OOM).
 # connect-timeout 3 alone only covers the TCP handshake, not the full transfer.
 clash_request() {
+    # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.
     local endpoint="$1" method="${2:-GET}" data="$3"
     local secret tmp_body
     secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
-            curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
         else
-            curl -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
         fi
     else
         local rc
