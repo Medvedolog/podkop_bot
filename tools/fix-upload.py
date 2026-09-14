@@ -36,14 +36,8 @@ if old not in s:
     raise SystemExit('accept condition anchor missing')
 s = s.replace(old, new, 1)
 
-old = '''Отправьте файл <code>podkop_bot.sh</code> как документ.\
-\
-<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\
-'''
-new = '''Отправьте файл скрипта как документ. Имя файла может быть любым.\
-\
-<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\
-'''
+old = 'Отправьте файл <code>podkop_bot.sh</code> как документ.'
+new = 'Отправьте скрипт бота как документ. Имя файла может быть любым.'
 if old not in s:
     raise SystemExit('prompt anchor missing')
 s = s.replace(old, new, 1)
