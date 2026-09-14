@@ -2,6 +2,7 @@
 
 ## v0.19.17
 
+- **FIXED (state machine):** persistent reply-keyboard Status now escapes pending text input. Previously, while a flow such as `wait_admin_id` was active, pressing Status could be consumed as `STATE_INPUT` and validated as a Telegram ID, producing “Invalid ID”. `cmd_status` now clears the pending state and dispatches the normal Status handler.
 - **ANTI-FLAP:** fixed false POLL demotion to emergency Direct routes when the independent Telegram follower sample was incorrectly considered stale. Follower freshness now follows its real cadence, preserving one-event hysteresis without changing authoritative POLL/FAST separation. Field rollout on multiple routers showed a sharp drop in route flapping.
 - **DIAGNOSTICS/UI:** the full Outbound check covers 12 external services, runs in background without blocking Telegram polling, and the dedicated Telegram Bot API check remains available as a separate Runtime action.
 - **SECURITY:** bot-script update/upload is restricted to the primary administrator in a private chat with a fresh 5-minute upload session; anonymous sender_chat access is opt-in and repeated unauthorized actors are rate-limited/temporarily blocked.
