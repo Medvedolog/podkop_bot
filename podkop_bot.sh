@@ -2035,11 +2035,6 @@ _warp_rescue_proxy() {
             _resp=$(ubus call podkop_bot_warpscout_rescue trigger '{}' 2>/dev/null || true)
             printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1 || return 1
         fi
-        _i=0
-        while ! _warp_rescue_pid_alive && [ "$_i" -lt 10 ]; do
-            sleep 1
-            _i=$((_i + 1))
-        done
     fi
     _warp_rescue_pid_alive || return 1
     printf 'socks5h://127.0.0.1:%s' "$_port"
@@ -2110,12 +2105,16 @@ _try_all_tiers() {
     if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then
         if _poll_follower_has_fresh_proxy; then
             POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))
-            _TG_NO_DEMOTE=1
-            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"
-            return 1
+            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then
+                _TG_NO_DEMOTE=1
+                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"
+                return 1
+            fi
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote_after_streak"
+        else
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
         fi
         POLL_PROXY_FAIL_STREAK=0
-        logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
     fi
 
     # tier4: direct
