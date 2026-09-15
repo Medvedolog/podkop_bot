@@ -5943,7 +5943,8 @@ start_health_daemon() {
                [ -n "${last_sb_pid:-}" ] && [ -n "$curr_sb_pid" ] && \
                [ "$curr_sb_pid" != "$last_sb_pid" ]; then
                 logger -t podkop-bot "[Watchdog] sing-box restarted between checks (PID ${last_sb_pid} -> ${curr_sb_pid})."
-                printf '%s\n' "$(date +%s)" >> "$SB_RESTART_LOG" 2>/dev/null
+                # Restart statistics remain owned by _traffic_accum_tick(); do not
+                # append SB_RESTART_LOG here or one restart may be counted twice.
                 printf 'up' > "$ROUTE_CMD_FILE"
                 if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                     local _restart_route_key _restart_route_name _restart_txt _restart_pl
