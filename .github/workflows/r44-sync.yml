@@ -1,0 +1,30 @@
+name: r44-sync
+on:
+  push:
+    branches: [dev/0.19.18-poll-warp-rescue]
+    paths:
+      - scripts/apply-r44-proxy-ui.sh
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.18-poll-warp-rescue
+      - name: Apply deterministic proxy UI patch
+        run: |
+          scripts/apply-r44-proxy-ui.sh podkop_bot.sh
+          sh -n podkop_bot.sh
+      - name: Commit synchronized bot
+        run: |
+          if git diff --quiet -- podkop_bot.sh; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add podkop_bot.sh
+          git commit -m 'fix(bot): sync WARP proxy UI and Telegram card'
+          git push origin HEAD:dev/0.19.18-poll-warp-rescue
