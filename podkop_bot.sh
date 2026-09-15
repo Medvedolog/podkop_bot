@@ -5929,10 +5929,43 @@ start_health_daemon() {
             fi
 
             # ------------------------------------------------------------------
-            # Check B: sing-box process liveness
+            # Check B: sing-box process liveness + PID transition detection.
+            # A fast backend update may restart sing-box entirely between two
+            # watchdog ticks, so state can look running -> running while PID
+            # changes. Treat that as a real restart and alert separately.
             # ------------------------------------------------------------------
-            if pidof sing-box >/dev/null 2>&1; then curr_sb_state="running"
+            local curr_sb_pid=""
+            curr_sb_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+            if [ -n "$curr_sb_pid" ]; then curr_sb_state="running"
             else curr_sb_state="stopped"; fi
+
+            if [ "$curr_sb_state" = "running" ] && [ "$last_sb_state" = "running" ] && \
+               [ -n "${last_sb_pid:-}" ] && [ -n "$curr_sb_pid" ] && \
+               [ "$curr_sb_pid" != "$last_sb_pid" ]; then
+                logger -t podkop-bot "[Watchdog] sing-box restarted between checks (PID ${last_sb_pid} -> ${curr_sb_pid})."
+                printf '%s\n' "$(date +%s)" >> "$SB_RESTART_LOG" 2>/dev/null
+                printf 'up' > "$ROUTE_CMD_FILE"
+                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    local _restart_route_key _restart_route_name _restart_txt _restart_pl
+                    _restart_route_key=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\
+\r\t ')
+                    _restart_route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null)
+                    [ -n "$_restart_route_name" ] || _restart_route_name="${_restart_route_key:-unknown}"
+                    case "${_restart_route_key:-unknown}" in
+                        tier2_*|tier3|warp_rescue)
+                            _restart_txt=$(printf '<b>[%s]</b> %s <b>sing-box перезапущен</b>\n\nВо время перезапуска бот сохранил связь через резервный канал.\n<b>Резерв:</b> <code>%s</code>\n<b>PID:</b> <code>%s → %s</code>\n\n<i>Проверяю основной SOCKS и возвращаю бота на него.</i>' \
+                                "$_hn" "$E_WARN" "$(html_escape "$_restart_route_name")" "$last_sb_pid" "$curr_sb_pid")
+                            ;;
+                        *)
+                            _restart_txt=$(printf '<b>[%s]</b> %s <b>sing-box перезапущен</b>\n\n<b>PID:</b> <code>%s → %s</code>\n<b>Текущий канал бота:</b> <code>%s</code>\n\n<i>Проверяю маршруты после перезапуска.</i>' \
+                                "$_hn" "$E_WARN" "$last_sb_pid" "$curr_sb_pid" "$(html_escape "$_restart_route_name")")
+                            ;;
+                    esac
+                    _restart_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_restart_txt" \
+                        '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                    send_health_alert "$_restart_pl"
+                fi
+            fi
 
             if [ "$curr_sb_state" != "$last_sb_state" ]; then
                 if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
@@ -5962,6 +5995,7 @@ start_health_daemon() {
                 fi
                 last_sb_state="$curr_sb_state"
             fi
+            last_sb_pid="$curr_sb_pid"
 
             # ------------------------------------------------------------------
             # Check C: SOCKS upstream via probe_socks_upstream (3 endpoints)
