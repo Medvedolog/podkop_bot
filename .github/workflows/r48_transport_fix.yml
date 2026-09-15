@@ -1,0 +1,49 @@
+name: r48 transport regressions fix
+
+on:
+  push:
+    branches: [dev/0.19.18-poll-warp-rescue]
+    paths: ['.github/workflows/r48_transport_fix.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev/0.19.18-poll-warp-rescue
+          fetch-depth: 0
+      - name: Patch transport regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('podkop_bot.sh')
+          s=p.read_text()
+          old='''        _i=0\n        while ! _warp_rescue_pid_alive && [ "$_i" -lt 10 ]; do\n            sleep 1\n            _i=$((_i + 1))\n        done\n'''
+          if old not in s:
+              raise SystemExit('WARP Rescue blocking wait anchor not found')
+          s=s.replace(old,'',1)
+          old='''        if _poll_follower_has_fresh_proxy; then\n            POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))\n            _TG_NO_DEMOTE=1\n            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"\n            return 1\n        fi\n        POLL_PROXY_FAIL_STREAK=0\n        logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"\n'''
+          new='''        if _poll_follower_has_fresh_proxy; then\n            POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))\n            if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then\n                _TG_NO_DEMOTE=1\n                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"\n                return 1\n            fi\n            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote_after_streak"\n        else\n            logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"\n        fi\n        POLL_PROXY_FAIL_STREAK=0\n'''
+          if old not in s:
+              raise SystemExit('POLL hysteresis anchor not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          sh -n podkop_bot.sh
+          ! grep -Fq 'while ! _warp_rescue_pid_alive' podkop_bot.sh
+          grep -Fq 'action=demote_after_streak' podkop_bot.sh
+          git diff --check
+      - name: Commit fix
+        run: |
+          set -e
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add podkop_bot.sh
+          git commit -m '0.19.18: make WARP Rescue non-blocking and bound POLL hold'
+          git push origin HEAD:dev/0.19.18-poll-warp-rescue
