@@ -13724,6 +13724,12 @@ _handle_fallback_socks() {
                 _wr_port=$(_warp_rescue_cfg_get socks_port 2>/dev/null || true)
                 case "$_wr_port" in ''|*[!0-9]*) _wr_port=18191 ;; esac
                 _wr_lat=$(grep '^warp_rescue=' "$SOCKS_PROBE_FILE" 2>/dev/null | cut -d= -f2 | cut -d' ' -f1)
+                local _wr_ep _wr_node _wr_loc _wr_meta
+                _wr_ep=$(sed -n 's/^endpoint=//p' /tmp/podkop_bot/warpscout_rescue.state 2>/dev/null | head -n1)
+                [ -z "$_wr_ep" ] && _wr_ep=$(_warp_rescue_cfg_get active_endpoint 2>/dev/null || true)
+                _wr_meta=$(awk -F'|' -v e="$_wr_ep" '$1==e {print $6 "|" $7; exit}' /etc/podkop_bot/warpscout-shortlist.tsv 2>/dev/null)
+                _wr_node=${_wr_meta%%|*}; _wr_loc=${_wr_meta#*|}
+                [ "$_wr_loc" = "$_wr_meta" ] && _wr_loc=""
                 if _warp_rescue_pid_alive; then
                     _wr_state="ON-AIR${_wr_lat:+ · $_wr_lat}"
                 else
@@ -13734,6 +13740,12 @@ _handle_fallback_socks() {
 \
 <code>warp_rescue</code>%s WARP Rescue <code>socks5h://127.0.0.1:%s</code> — <i>%s</i>' \
                     "$list_text" "$_row_lbl" "$_wr_port" "$_wr_state")
+                if [ -n "$_wr_ep" ]; then
+                    local _wr_desc="Сервер выхода: $_wr_ep"
+                    [ -n "$_wr_loc" ] && _wr_desc="${_wr_desc} · $_wr_loc"
+                    [ -n "$_wr_node" ] && _wr_desc="${_wr_desc} · $_wr_node"
+                    list_text=$(printf '%s\n<i>%s</i>' "$list_text" "$_wr_desc")
+                fi
             fi
 
             # Direct and emergency IPs are the final two tiers.
@@ -13747,6 +13759,7 @@ _handle_fallback_socks() {
             [ -z "$_t3" ] && _add_t3_btn=",{\"text\":\"${E_ADD} Прокси бота\",\"callback_data\":\"cmd_custom_proxy\"}"
             text=$(printf '%s <b>Прокси подключения</b>\n\nБот пробует каналы сверху вниз, пока один не ответит. %s — активный сейчас.\nАдрес может быть <code>socks5h://</code>, <code>socks5://</code> или <code>http://</code>.\n\n%s' \
                 "$E_NET" "$E_PLAY" "$list_text")
+            text=$(printf '%s' "$text" | sed 's/\\$//') # r44-proxy-ui-sync
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} SOCKS\",\"callback_data\":\"cmd_fb_socks_add\"}${_add_t3_btn}],[{\"text\":\"${E_TEST} Проверить все\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"net_proxies_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -15306,6 +15319,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             local cp_sfx="" _cp_n=1 _cp_fb
             for _cp_fb in $_t_fb_socks; do _cp_n=$((_cp_n + 1)); done
             [ "$cp" != "Not set" ] && _cp_n=$((_cp_n + 1))
+            [ "$(_warp_rescue_cfg_get enabled 2>/dev/null || true)" = "1" ] && _cp_n=$((_cp_n + 1)) # r44-proxy-ui-sync
             cp_sfx=" · ${_cp_n}"
             [ "$bi" = "Not set" ]                 && bi_btn="{\"text\":\"${E_ADD} Привязать интерфейс\",\"callback_data\":\"cmd_bind_iface\"}"                 || bi_btn="{\"text\":\"${E_DEL} Отвязать интерфейс\",\"callback_data\":\"cmd_clear_bind_iface\"}"
             [ "$st" = "1" ] && st_icon="$E_ON" || st_icon="$E_OFF"
