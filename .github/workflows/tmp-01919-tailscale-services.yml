@@ -1,0 +1,180 @@
+name: tmp-01919-tailscale-services
+on:
+  push:
+    branches:
+      - dev/0.19.19-tailscale-multiprovider
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.19-tailscale-multiprovider
+      - name: Patch 0.19.19 baseline
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('podkop_bot.sh')
+          s = p.read_text()
+
+          # Start 0.19.19 proper.
+          s = s.replace('Podkop Telegram Bot v0.19.18', 'Podkop Telegram Bot v0.19.19', 1)
+          s = s.replace('BOT_VERSION="0.19.18"', 'BOT_VERSION="0.19.19"', 1)
+
+          # Fix the standalone-confirm regression from the 0.19.18 multiprovider prototype.
+          old = '''        "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
+            local _ts_confirmed=0 _ts_target _ts_payload
+            case "$cmd" in
+                ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;
+            esac
+            _ts_target="${cmd##*_}"
+            if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
+                _ts_payload="${cmd#ts_e_}"
+'''
+          new = '''        "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
+            # Standalone confirmation belongs only to enabling the whole tsnet
+            # identity. accept-routes / exit-node mutate an existing node and must
+            # never be remapped through ts_ec_.
+            local _ts_confirmed=0 _ts_target _ts_payload
+            case "$cmd" in
+                ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;
+            esac
+            case "$cmd" in
+                ts_e_*)
+                    _ts_target="${cmd##*_}"
+                    if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
+                        _ts_payload="${cmd#ts_e_}"
+'''
+          if old in s:
+              s = s.replace(old, new, 1)
+              marker = '''                    return
+                fi
+            fi
+
+            local _ts_kind'''
+              replacement = '''                        return
+                    fi
+                    ;;
+            esac
+
+            local _ts_kind'''
+              if marker not in s:
+                  raise SystemExit('confirm-flow closing marker not found')
+              s = s.replace(marker, replacement, 1)
+
+          # Add direct UCI fallback if an older backend mismatch would otherwise
+          # hide a native Forkop Tailscale section.
+          find_anchor = '''    if [ -r /etc/podkop-bot/tsnet.json ]; then
+        TS_EXIST_PROVIDER=$(_ts_provider_kind)
+        TS_EXIST_SECTION="podkop-bot-tailscale"
+        return 0
+    fi
+'''
+          if 'Always retain a direct UCI fallback' not in s and find_anchor in s:
+              repl = find_anchor + '''    # Always retain a direct UCI fallback. Bot/backend version skew must not
+    # make an existing native Tailscale server disappear and invite duplication.
+    local _uci_s
+    _uci_s=$(_ts_find_native_section 2>/dev/null || true)
+    if [ -n "$_uci_s" ]; then
+        TS_EXIST_PROVIDER="native"
+        TS_EXIST_SECTION="$_uci_s"
+        return 0
+    fi
+'''
+              s = s.replace(find_anchor, repl, 1)
+
+          # Standalone tailscaled is a service in its own right, not a managed
+          # sing-box tsnet endpoint. Discover it independently for every variant.
+          anchor = '''            local _si_total=$((_si_count + _ts_managed_present))
+            if [ "$_si_total" -eq 0 ]; then
+'''
+          if anchor not in s:
+              raise SystemExit('services total anchor not found')
+          repl = '''            local _ts_standalone_present_flag=0 _ts_standalone_running_flag=0 _ts_standalone_ip=""
+            if _ts_standalone_present; then
+                _ts_standalone_present_flag=1
+                if _ts_standalone_running; then
+                    _ts_standalone_running_flag=1
+                    _ts_standalone_ip=$(ip -4 -o addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+                fi
+            fi
+
+            local _si_total=$((_si_count + _ts_managed_present + _ts_standalone_present_flag))
+            if [ "$_si_total" -eq 0 ]; then
+'''
+          s = s.replace(anchor, repl, 1)
+
+          # Empty-state creation button: supported providers only. Podkop Plus is
+          # orphaned and deliberately observation-only for Tailscale.
+          old_empty = '''$(if singbox_supports_tailscale && _ts_backend_control_available; then printf '[{"text":"\\xe2\\x9e\\x95 Tailscale","callback_data":"ts_add"}],'; fi)'''
+          new_empty = '''$(if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available; then printf '[{"text":"\\xe2\\x9e\\x95 Tailscale","callback_data":"ts_add"}],'; fi)'''
+          s = s.replace(old_empty, new_empty)
+
+          # Render standalone tailscaled before managed tsnet. Both are displayed
+          # when both exist so the user can see the two independent identities.
+          render_anchor = '''            # Non-native managed tsnet card. Identity existence is not treated as
+            # proof of continuous control-plane connectivity; live activity comes
+            # only from backend runtime evidence.
+'''
+          if render_anchor not in s:
+              raise SystemExit('render anchor not found')
+          standalone_card = '''            # Standalone tailscaled is deliberately read-only here. It is independent
+            # from sing-box tsnet and may coexist with it as a second identity.
+            if [ "$_ts_standalone_present_flag" = 1 ]; then
+                if [ "$_ts_standalone_running_flag" = 1 ]; then
+                    _text="${_text}\\n\\n${E_ON} <b>Tailscale</b> · <code>standalone</code>"
+                    _text="${_text}\\n    🔗 Служба tailscaled: работает"
+                    [ -n "$_ts_standalone_ip" ] && _text="${_text}\\n    📍 Tailnet IP: <code>$(html_escape "$_ts_standalone_ip")</code>"
+                else
+                    _text="${_text}\\n\\n${E_YLW} <b>Tailscale</b> · <code>standalone</code>"
+                    _text="${_text}\\n    🔗 Установлен, но tailscaled не запущен"
+                fi
+                _text="${_text}\\n    ℹ️ Отдельный системный Tailscale; это не tsnet внутри sing-box"
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text="${_text}\\n    ℹ️ Podkop Plus: только наблюдение; создание встроенного tsnet не поддерживается"
+                fi
+            fi
+
+'''
+          s = s.replace(render_anchor, standalone_card + render_anchor, 1)
+
+          # Backend observer warning should not claim that installing a backend will
+          # unlock management on orphaned Podkop Plus.
+          obs = '''                _text_nl="${_text_nl}\\n\\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED} (luci-app-podkop-bot r60+)."
+'''
+          obs_new = '''                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text_nl="${_text_nl}\\n\\nℹ️ <b>Tailscale: режим наблюдения.</b> Podkop Plus больше не поддерживается для создания встроенного tsnet."
+                else
+                    _text_nl="${_text_nl}\\n\\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED}."
+                fi
+'''
+          if obs in s:
+              s = s.replace(obs, obs_new, 1)
+
+          # Creation row: never expose it on Podkop Plus.
+          create_cond = '''            if singbox_supports_tailscale && _ts_backend_control_available; then
+                _ts_existing=$(_ts_find_existing)
+'''
+          if create_cond in s:
+              s = s.replace(create_cond, '''            if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available; then
+                _ts_existing=$(_ts_find_existing)
+''', 1)
+
+          p.write_text(s)
+          PY
+          sh -n podkop_bot.sh
+          grep -q 'BOT_VERSION="0.19.19"' podkop_bot.sh
+          grep -q 'Tailscale</b> · <code>standalone</code>' podkop_bot.sh
+          git diff --check
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add podkop_bot.sh
+          git commit -m 'feat: start 0.19.19 Tailscale service discovery' || exit 0
+          git push
