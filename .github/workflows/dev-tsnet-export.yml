@@ -1,0 +1,28 @@
+name: dev-tsnet-export
+
+on:
+  push:
+    branches: [dev/0.19.18-tailscale-multiprovider]
+    paths: ['.github/workflows/dev-tsnet-export.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate and stage standalone
+        run: |
+          set -eu
+          sh -n podkop_bot.sh
+          mkdir -p out
+          cp podkop_bot.sh out/podkop_bot-0.19.18-tailscale-multiprovider.sh
+          chmod 0755 out/podkop_bot-0.19.18-tailscale-multiprovider.sh
+          sha256sum out/podkop_bot-0.19.18-tailscale-multiprovider.sh > out/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: podkop_bot-0.19.18-tailscale-multiprovider
+          path: out/
+          if-no-files-found: error
