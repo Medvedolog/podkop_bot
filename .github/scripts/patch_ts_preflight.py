@@ -33,6 +33,8 @@ if '_ts_standalone_running()' not in s:
         raise SystemExit('tailscale marker not found')
     s = s.replace(marker, helper + '\n' + marker, 1)
 
+# Creation wizard: ordinary ts_add checks tailscaled; the explicit confirmation
+# callback enters the exact same existing wizard body.
 if 'ts_add_confirm' not in s:
     rx = re.compile(r'(?m)^([ \t]*)(?:"ts_add"\)|ts_add\))[ \t]*$')
     m = rx.search(s)
@@ -51,15 +53,35 @@ if 'ts_add_confirm' not in s:
     )
     s = s[:m.start()] + guard + s[m.end():]
 
+# Enabling an existing tsnet endpoint gets the same gate. The existing source
+# currently groups ts_e_* with the other Tailscale toggles in one case pattern,
+# so find that pattern line generically and add ts_ec_* beside ts_e_*.
 if 'ts_ec_' not in s:
-    rx = re.compile(r'(?m)^([ \t]*)(?:"ts_e_"\*\)|ts_e_\*\))[ \t]*$')
-    m = rx.search(s)
-    if not m:
-        raise SystemExit('ts_e_* case not found')
-    ind = m.group(1)
+    lines = s.splitlines(keepends=True)
+    offset = 0
+    found = None
+    for line in lines:
+        stripped = line.strip()
+        if ('ts_e_' in stripped and stripped.endswith(')') and
+                'callback_data' not in stripped and '=' not in stripped):
+            found = (offset, line)
+            break
+        offset += len(line)
+    if not found:
+        samples = [ln.strip() for ln in s.splitlines() if 'ts_e_' in ln][:8]
+        raise SystemExit('ts_e_* case not found; samples=' + repr(samples))
+
+    pos, line = found
+    if '"ts_e_"*' in line:
+        new_line = line.replace('"ts_e_"*', '"ts_e_"*|"ts_ec_"*', 1)
+    elif 'ts_e_*' in line:
+        new_line = line.replace('ts_e_*', 'ts_e_*|ts_ec_*', 1)
+    else:
+        raise SystemExit('unsupported ts_e case syntax: ' + line.strip())
+
+    ind = line[:len(line) - len(line.lstrip())]
     body = ind + '    '
     guard = (
-        ind + '"ts_e_"*|"ts_ec_"*)\n' +
         body + 'local _ts_confirmed=0 _ts_target _ts_payload\n' +
         body + 'case "$cmd" in\n' +
         body + '    ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;\n' +
@@ -71,8 +93,8 @@ if 'ts_ec_' not in s:
         body + '        "$(printf \'%s <b>Standalone Tailscale уже запущен.</b>\\n\\nВключить одновременно встроенный tsnet sing-box? Оба узла останутся самостоятельными.\' "$E_WARN")" \\\n' +
         body + '        "{\\"inline_keyboard\\":[[{\\"text\\":\\"⚠️ Включить всё равно\\",\\"callback_data\\":\\"ts_ec_${_ts_payload}\\"}],[{\\"text\\":\\"${E_BACK} Отмена\\",\\"callback_data\\":\\"cmd_server_instances\\"}]]}"\n' +
         body + '    return\n' +
-        body + 'fi'
+        body + 'fi\n'
     )
-    s = s[:m.start()] + guard + s[m.end():]
+    s = s[:pos] + new_line + guard + s[pos + len(line):]
 
 path.write_text(s)
