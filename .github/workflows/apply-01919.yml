@@ -1,0 +1,27 @@
+name: Apply 0.19.19 bot patch
+on:
+  push:
+    branches: [dev/0.19.19-tailscale-multiprovider]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: "!contains(github.event.head_commit.message, 'bot: start 0.19.19')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.19-tailscale-multiprovider
+      - name: Apply and validate
+        run: |
+          patch -p1 < tools/01919.patch
+          sh -n podkop_bot.sh
+          test "$(grep '^BOT_VERSION=' podkop_bot.sh | cut -d\" -f2)" = "0.19.19"
+      - name: Commit result and remove helper
+        run: |
+          rm -f tools/01919.patch .github/workflows/apply-01919.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'bot: start 0.19.19 Tailscale multiprovider'
+          git push
