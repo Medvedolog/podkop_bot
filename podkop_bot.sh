@@ -10789,6 +10789,29 @@ _fk_cond_human() {
     esac
 }
 
+# Detect a classic standalone Tailscale installation separately from sing-box
+# tsnet. A running tailscaled is not an automatic error, but creating/enabling a
+# second Tailscale node must require an explicit operator confirmation.
+_ts_standalone_present() {
+    [ -x /etc/init.d/tailscale ] || [ -x /etc/init.d/tailscaled ] || \
+        command -v tailscaled >/dev/null 2>&1 || command -v tailscale >/dev/null 2>&1
+}
+
+_ts_standalone_running() {
+    local _svc _c _cl
+    for _svc in /etc/init.d/tailscale /etc/init.d/tailscaled; do
+        [ -x "$_svc" ] || continue
+        "$_svc" running >/dev/null 2>&1 && return 0
+        "$_svc" status >/dev/null 2>&1 && return 0
+    done
+    for _c in /proc/[0-9]*/cmdline; do
+        [ -r "$_c" ] || continue
+        _cl=$(tr '\0' ' ' < "$_c" 2>/dev/null) || continue
+        case "$_cl" in *tailscaled*) return 0 ;; esac
+    done
+    return 1
+}
+
 # ── Tailscale server management (Forkop) ──────────────────────────────────────
 # Read-only rendering of tailscale servers already lives in cmd_server_instances.
 # This block adds the write path: create a server, and toggle the two flags that
@@ -12104,7 +12127,13 @@ ${_ip}"; fi
             send_or_edit "$mid" "$(printf '%s <b>Интервал автообновления</b>\n\nОтправьте интервал: <code>12h</code>, <code>1d</code>, <code>30m</code>.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
             ;;
-        "ts_add")
+        "ts_add"|"ts_add_confirm")
+            if [ "$cmd" = "ts_add" ] && _ts_standalone_running; then
+                send_or_edit "$mid" \
+                    "$(printf '%s <b>Уже работает отдельный Tailscale (tailscaled).</b>\n\nForkop запустит второй узел через встроенный tsnet sing-box. Это допустимо, но может дать два узла, пересекающиеся маршруты или неожиданный выбор exit node.\n\nПродолжить всё равно?' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"⚠️ Продолжить всё равно\",\"callback_data\":\"ts_add_confirm\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                return
+            fi
             # The bot deliberately manages at most one Tailscale endpoint. Forkop
             # itself can represent more, but accidental duplicates create multiple
             # tsnet identities/state directories and are almost never intended.
@@ -12139,7 +12168,19 @@ ${_ip}"; fi
                 "$(printf '%s <b>Адрес контрол-сервера</b>\n\nОтправьте адрес, например <code>https://headscale.example.com</code>.\n\n<i>Для облачного Tailscale отправьте <code>https://controlplane.tailscale.com</code>.</i>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
             ;;
-        "ts_e_"*|"ts_x_"*|"ts_r_"*)
+        "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
+            local _ts_confirmed=0 _ts_target _ts_payload
+            case "$cmd" in
+                ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;
+            esac
+            _ts_target="${cmd##*_}"
+            if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
+                _ts_payload="${cmd#ts_e_}"
+                send_or_edit "$mid" \
+                    "$(printf '%s <b>Standalone Tailscale уже запущен.</b>\n\nВключить одновременно встроенный tsnet sing-box? Оба узла останутся самостоятельными.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"⚠️ Включить всё равно\",\"callback_data\":\"ts_ec_${_ts_payload}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                return
+            fi
             # Toggles on an existing node: advertise_exit_node / accept_routes.
             # callback = ts_<x|r>_<section>_<0|1>
             local _rest _sn _nv _key
