@@ -1,0 +1,46 @@
+name: debug-r59-router
+on:
+  push:
+    branches: [dev/0.19.18-tailscale-multiprovider]
+    paths: ['.github/workflows/debug-r59-router.yml']
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev/0.19.18-tailscale-multiprovider
+      - name: Extract routing
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          L=Path('podkop_bot.sh').read_text().splitlines()
+          idx=[]
+          for i,l in enumerate(L):
+              if ('_handle_bot' in l or 'callback_query' in l or 'callback_data' in l or 'cmd_server_instances' in l or 'ts_ld_' in l or 'ts_ldc_' in l or 'ts_add' in l):
+                  idx.append(i)
+          # Keep only likely routing blocks and all Tailscale blocks, but cap contexts individually.
+          selected=[]
+          for i in idx:
+              if i > 11500 or 'ts_ld' in L[i] or 'ts_add' in L[i]:
+                  selected.append(i)
+          ranges=[]
+          for i in selected:
+              a=max(0,i-8); b=min(len(L),i+9)
+              if ranges and a <= ranges[-1][1]: ranges[-1]=(ranges[-1][0],max(ranges[-1][1],b))
+              else: ranges.append((a,b))
+          out=[]
+          for a,b in ranges:
+              out.append(f'=== {a+1}-{b} ===')
+              out += [f'{j+1}: {L[j]}' for j in range(a,b)]
+          Path('.github/debug-r59-router.txt').write_text('\n'.join(out)+'\n')
+          PY
+      - name: Commit
+        run: |
+          git config user.name medvedolog
+          git config user.email tenkayyy8@gmail.com
+          git add .github/debug-r59-router.txt
+          git commit -m 'ci: capture r59 router snippets'
+          git push origin HEAD:dev/0.19.18-tailscale-multiprovider
