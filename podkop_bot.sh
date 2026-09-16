@@ -1161,9 +1161,9 @@ is_singbox_extended() {
 # exists to avoid. On extended builds — the common case, and the only one most
 # routers have — we never reach it.
 singbox_supports_tailscale() {
-    is_singbox_extended && return 0
-    command -v sing-box >/dev/null 2>&1 || return 1
-    sing-box version 2>/dev/null | grep -q 'with_tailscale'
+    [ -r /usr/lib/podkop_bot/tsnet-provider.sh ] || return 1
+    . /usr/lib/podkop_bot/tsnet-provider.sh
+    tsnet_capable
 }
 
 # reply_keyboard_main: persistent bottom navigation keyboard JSON
@@ -10812,6 +10812,17 @@ _ts_standalone_running() {
     return 1
 }
 
+# Shared tsnet backend for Telegram. Native Forkop, Forkop X and classic Podkop
+# converge on the same provider abstraction used by LuCI.
+_ts_backend_call() {
+    local _method="$1" _payload="${2:-{}}"
+    [ -x /usr/libexec/rpcd/podkop_bot_tailscale ] || return 1
+    printf '%s' "$_payload" | /usr/libexec/rpcd/podkop_bot_tailscale call "$_method" 2>/dev/null
+}
+_ts_backend_status() { _ts_backend_call status '{}'; }
+_ts_backend_provider() { _ts_backend_status | jq -r '.provider // "none"' 2>/dev/null; }
+_ts_backend_native() { [ "$(_ts_backend_provider)" = "forkop-native" ]; }
+
 # ── Tailscale server management (Forkop) ──────────────────────────────────────
 # Read-only rendering of tailscale servers already lives in cmd_server_instances.
 # This block adds the write path: create a server, and toggle the two flags that
@@ -10942,12 +10953,15 @@ _ts_pending_clear() {
 # The bot intentionally supports one managed Tailscale endpoint per router; LuCI
 # remains available for advanced users who deliberately need more than one.
 _ts_find_existing() {
-    uci -q show "$PODKOP_UCI" 2>/dev/null | \
-        sed -n "s/^${PODKOP_UCI}\.\(.*\)\.protocol='tailscale'$/\1/p" | head -n 1
+    local _st
+    _st=$(_ts_backend_status 2>/dev/null) || return 1
+    [ "$(printf '%s' "$_st" | jq -r '.configured // false' 2>/dev/null)" = "true" ] || return 1
+    printf '%s' "$_st" | jq -r '.section // "podkop-bot-tailscale"' 2>/dev/null
 }
 
 # _ts_gen_name: unused UCI section name for a new tailscale server.
 _ts_gen_name() {
+    if ! _ts_backend_native; then printf '%s' "podkop-bot-tailscale"; return 0; fi
     local _i=1 _n _state_dir
     while [ "$_i" -lt 100 ]; do
         _n="server_ts_${_i}"
@@ -10967,6 +10981,7 @@ _ts_gen_name() {
 # Stages the whole server in one transaction. Any staging failure reverts.
 _ts_create() {
     local _n="$1" _url="$2" _key="$3" _exit="$4" _host="$5"
+    _ts_backend_native || return 0
     uci -q set "${PODKOP_UCI}.${_n}=server" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_n}.protocol" "tailscale"            || return 1
     # Created DISABLED on purpose. Enabling a tailscale endpoint makes sing-box
@@ -10994,6 +11009,13 @@ _ts_create() {
 #          5=read-back mismatch+rollback OK, 6=read-back mismatch+rollback failed.
 _ts_commit_created_disabled() {
     local _n="$1" _url="$2" _key="$3" _exit="$4" _host="$5"
+    if ! _ts_backend_native; then
+        local _payload _r
+        _payload=$(jq -cn --arg u "$_url" --arg k "$_key" --arg h "$_host" '{control_url:$u,auth_key:$k,hostname:$h,advertise_exit_node:false,confirm_standalone:true}') || return 1
+        _r=$(_ts_backend_call create "$_payload") || return 1
+        [ "$(printf '%s' "$_r" | jq -r '.ok // false' 2>/dev/null)" = "true" ]
+        return
+    fi
     local _bak="${BOT_DIR}/ts_cfg_bak.$$" _ok=1
 
     mkdir -p "$BOT_DIR" 2>/dev/null || true
@@ -11503,8 +11525,7 @@ _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
     local sec=$(get_active_section)
     if [ "$PODKOP_VARIANT" != "forkop" ]; then
-        _handle_settings "section_settings" "$mid" "" ""
-        return
+        case "$cmd" in ts_*|STATE_INPUT) ;; *) _handle_settings "section_settings" "$mid" "" ""; return ;; esac
     fi
 
     if [ "$cmd" = "STATE_INPUT" ]; then
@@ -12142,8 +12163,14 @@ ${_ip}"; fi
             if [ -n "$_existing_ts" ]; then
                 _ts_pending_clear; rm -f "$STATE_FILE"
                 local _existing_h _existing_en
-                _existing_h=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.tailscale_hostname" 2>/dev/null)
-                _existing_en=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.enabled" 2>/dev/null)
+                if _ts_backend_native; then
+                    _existing_h=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.tailscale_hostname" 2>/dev/null)
+                    _existing_en=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.enabled" 2>/dev/null)
+                else
+                    local _bst; _bst=$(_ts_backend_status)
+                    _existing_h=$(printf '%s' "$_bst" | jq -r '.hostname // empty')
+                    [ "$(printf '%s' "$_bst" | jq -r '.enabled // false')" = true ] && _existing_en=1 || _existing_en=0
+                fi
                 [ -n "$_existing_h" ] || _existing_h="$_existing_ts"
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Tailscale уже настроен</b>\n\nУзел: <code>%s</code>\nСостояние: <b>%s</b>\n\n<i>Второй Tailscale-узел через бота не создаётся, чтобы случайно не зарегистрировать дубликат.</i>' "$E_WARN" "$(html_escape "$_existing_h")" "$([ "$_existing_en" = "1" ] && printf 'включён' || printf 'выключен')")" \
@@ -12190,6 +12217,18 @@ ${_ip}"; fi
                 *)      _rest="${cmd#ts_r_}"; _key="tailscale_accept_routes" ;;
             esac
             _sn="${_rest%_[01]}"; _nv="${_rest##*_}"
+            if ! _ts_backend_native; then
+                if [ "$_key" != "enabled" ]; then CB_ANSWER_TEXT="В MVP для Podkop/Forkop X доступно только подключение tsnet"; return; fi
+                local _confirm=false _payload _br
+                [ "$_ts_confirmed" = "1" ] && _confirm=true
+                _payload=$(jq -cn --argjson e "$([ "$_nv" = 1 ] && echo true || echo false)" --argjson c "$_confirm" '{enabled:$e,confirm_standalone:$c}')
+                _br=$(_ts_backend_call set_enabled "$_payload")
+                if [ "$(printf '%s' "$_br" | jq -r '.ok // false')" != true ]; then
+                    send_message "$(printf '%s Не удалось изменить Tailscale: <code>%s</code>' "$E_WARN" "$(html_escape "$(printf '%s' "$_br" | jq -r '.reason // "backend_error"')")")" ""; return
+                fi
+                [ "$_nv" = 1 ] && send_message "$(printf '%s <b>Tailscale включён</b>. tsnet применяется fail-open overlay, не блокируя основной сервис.' "$E_OK")" "" || send_message "$(printf '%s Tailscale выключен.' "$E_OK")" ""
+                return
+            fi
             if [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" != "tailscale" ]; then
                 send_message "$(printf '%s Секция не найдена — откройте список заново.' "$E_WARN")" ""
                 return
@@ -14728,7 +14767,7 @@ EOF
             if [ "$_si_count" -eq 0 ]; then
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Службы</b>\n\n<i>Серверы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
-                    "{\"inline_keyboard\":[$(if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[$(if singbox_supports_tailscale; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -14966,7 +15005,7 @@ EOF
             # is a Forkop feature) and only when the sing-box build can actually serve
             # it — offering a button that always errors is worse than no button.
             local _ts_row="" _ts_existing=""
-            if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then
+            if singbox_supports_tailscale; then
                 _ts_existing=$(_ts_find_existing)
                 [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale\",\"callback_data\":\"ts_add\"}],"
             fi
