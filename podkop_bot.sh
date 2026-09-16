@@ -10844,12 +10844,27 @@ _ts_standalone_running() {
     return 1
 }
 
-# Shared tsnet backend for Telegram. Native Forkop, Forkop X and classic Podkop
-# converge on the same provider abstraction used by LuCI.
+# Shared tsnet backend for Telegram. The standalone bot is deliberately
+# read-only for Tailscale unless a compatible controller backend is installed.
+TS_BACKEND_API_REQUIRED=1
+TS_BACKEND_PATH=/usr/libexec/rpcd/podkop_bot_tailscale
+
+_ts_backend_api_version() {
+    [ -x "$TS_BACKEND_PATH" ] || return 1
+    "$TS_BACKEND_PATH" list 2>/dev/null | jq -r '.api_version // 0' 2>/dev/null
+}
+_ts_backend_control_state() {
+    [ -x "$TS_BACKEND_PATH" ] || { printf '%s' missing; return 1; }
+    local _v
+    _v=$(_ts_backend_api_version 2>/dev/null)
+    [ "$_v" = "$TS_BACKEND_API_REQUIRED" ] || { printf '%s' incompatible; return 1; }
+    printf '%s' ready
+}
+_ts_backend_control_available() { [ "$(_ts_backend_control_state 2>/dev/null)" = ready ]; }
 _ts_backend_call() {
     local _method="$1" _payload="${2:-{}}"
-    [ -x /usr/libexec/rpcd/podkop_bot_tailscale ] || return 1
-    printf '%s' "$_payload" | /usr/libexec/rpcd/podkop_bot_tailscale call "$_method" 2>/dev/null
+    _ts_backend_control_available || return 2
+    printf '%s' "$_payload" | "$TS_BACKEND_PATH" call "$_method" 2>/dev/null
 }
 _ts_backend_status() { _ts_backend_call status '{}'; }
 _ts_backend_provider() { _ts_backend_status | jq -r '.provider // "none"' 2>/dev/null; }
@@ -11127,7 +11142,7 @@ _si_ts_registered_global() {
 
 _ts_create_fail_msg() {
     case "$1" in
-        1) printf '%s Не удалось сохранить Tailscale в UCI — изменение отменено.' "$E_ERR" ;;
+        1) printf '%s Не удалось сохранить Tailscale через backend — изменение отменено.' "$E_ERR" ;;
         3) printf '%s Не удалось создать резервную копию Forkop — Tailscale не добавлен.' "$E_ERR" ;;
         5) printf '%s Проверка сохранённой Tailscale-секции не прошла — конфигурация восстановлена.' "$E_WARN" ;;
         6) printf '%s Проверка Tailscale-секции не прошла и откат файла Forkop не удался. Не включайте узел до проверки конфигурации.' "$E_ERR" ;;
@@ -14876,7 +14891,7 @@ EOF
             if [ "$_si_count" -eq 0 ]; then
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Службы</b>\n\n<i>Серверы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
-                    "{\"inline_keyboard\":[$(if singbox_supports_tailscale; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[$(if singbox_supports_tailscale && _ts_backend_control_available; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -15055,7 +15070,9 @@ EOF
                 # Per-node toggles for tailscale: exit node + accept routes.
                 # Built while rendering so the labels match what the card shows.
                 [ "$_proto" = "tailscale" ] && {
-                    if [ "$_ts_legacy" = 1 ]; then
+                    if ! _ts_backend_control_available; then
+                        : # observer mode: render status only, never mutation buttons
+                    elif [ "$_ts_legacy" = 1 ]; then
                         _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"🗑 Удалить старую Tailscale-секцию\",\"callback_data\":\"ts_ld_${_s}\"}],"
                     else
                         local _ex_cur _rt_cur _ex_lbl _rt_lbl
@@ -15121,11 +15138,21 @@ EOF
             # two-byte sequence backslash-n; every other byte (UTF-8 emoji, stray '\') passes through.
             local _text_nl
             _text_nl=$(printf '%s' "$_text" | awk '{gsub(/\\n/,"\n")}1')
+            if ! _ts_backend_control_available; then
+                local _ts_ctl_state _ts_ctl_note
+                _ts_ctl_state=$(_ts_backend_control_state 2>/dev/null)
+                if [ "$_ts_ctl_state" = incompatible ]; then
+                    _ts_ctl_note="Установленный backend имеет несовместимую версию API."
+                else
+                    _ts_ctl_note="Backend управления не установлен."
+                fi
+                _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED} (luci-app-podkop-bot r60+)."
+            fi
             # Tailscale row: offered only on Forkop (config server + protocol=tailscale
             # is a Forkop feature) and only when the sing-box build can actually serve
             # it — offering a button that always errors is worse than no button.
             local _ts_row="" _ts_existing=""
-            if singbox_supports_tailscale; then
+            if singbox_supports_tailscale && _ts_backend_control_available; then
                 _ts_existing=$(_ts_find_existing)
                 [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale\",\"callback_data\":\"ts_add\"}],"
             fi
@@ -16938,7 +16965,16 @@ handle_command() {
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|\
         fkutf_*|fkufm_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
         ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
-            _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;
+            if _ts_backend_control_available; then
+                _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id"
+            else
+                case "$(_ts_backend_control_state 2>/dev/null)" in
+                    incompatible) CB_ANSWER_TEXT="Tailscale: backend API несовместим — только наблюдение" ;;
+                    *)            CB_ANSWER_TEXT="Tailscale: backend не установлен — только наблюдение" ;;
+                esac
+                _handle_bot "cmd_server_instances" "$mid" "" ""
+            fi
+            ;;
 
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
