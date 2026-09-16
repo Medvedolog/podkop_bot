@@ -12293,8 +12293,11 @@ ${_ip}"; fi
                     send_message "$(printf '%s Не удалось удалить устаревшую Tailscale-секцию.' "$E_ERR")" ""; return
                 fi
             fi
-            send_message "$(printf '%s Устаревшая Tailscale-секция удалена. Forkop X и sing-box не перезапускались.%s' "$E_OK" "$([ "$_purge" = 1 ] && printf ' Старый state также удалён.' || true)")" ""
-            _handle_bot "cmd_server_instances" "$mid" "" ""
+            local _cleanup_tail
+            _cleanup_tail="$([ "$_purge" = 1 ] && printf ' Старый state также удалён.' || true)"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Старая Tailscale-секция удалена.</b>\n\nForkop X и sing-box не перезапускались.%s\n\nМожно сразу создать новый tsnet через установленный sing-box.' "$E_OK" "$_cleanup_tail")" \
+                "{\"inline_keyboard\":[[{\"text\":\"➕ Создать новое tsnet\",\"callback_data\":\"ts_add\"}],[{\"text\":\"${E_SRV} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
             ;;
         "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
             local _ts_confirmed=0 _ts_target _ts_payload
@@ -16934,7 +16937,7 @@ handle_command() {
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|\
         fkutf_*|fkufm_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
-        ts_add|ts_e_*|ts_x_*|ts_r_*)
+        ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
             _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;
 
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
