@@ -1,0 +1,58 @@
+name: apply-export-r59
+on:
+  push:
+    branches: [dev/0.19.18-tailscale-multiprovider]
+    paths: ['.github/workflows/apply-export-r59.yml']
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: dev/0.19.18-tailscale-multiprovider
+      - name: Apply r59 bot fix
+        run: |
+          set -eu
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('podkop_bot.sh')
+          s=p.read_text()
+          old='''        ts_add|ts_e_*|ts_x_*|ts_r_*)\n            _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;'''
+          new='''        ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)\n            _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;'''
+          if old not in s:
+              raise SystemExit('router pattern not found')
+          s=s.replace(old,new,1)
+          old2='''            send_message "$(printf '%s Устаревшая Tailscale-секция удалена. Forkop X и sing-box не перезапускались.%s' "$E_OK" "$([ "$_purge" = 1 ] && printf ' Старый state также удалён.' || true)")" ""\n            _handle_bot "cmd_server_instances" "$mid" "" ""\n            ;;'''
+          new2='''            local _cleanup_tail\n            _cleanup_tail="$([ "$_purge" = 1 ] && printf ' Старый state также удалён.' || true)"\n            send_or_edit "$mid" \\\n                "$(printf '%s <b>Старая Tailscale-секция удалена.</b>\\n\\nForkop X и sing-box не перезапускались.%s\\n\\nМожно сразу создать новый tsnet через установленный sing-box.' "$E_OK" "$_cleanup_tail")" \\\n                "{\\"inline_keyboard\\":[[{\\"text\\":\\"➕ Создать новое tsnet\\",\\"callback_data\\":\\"ts_add\\"}],[{\\"text\\":\\"${E_SRV} К службам\\",\\"callback_data\\":\\"cmd_server_instances\\"}]]}"\n            ;;'''
+          if old2 not in s:
+              raise SystemExit('cleanup success block not found')
+          s=s.replace(old2,new2,1)
+          p.write_text(s)
+          PY
+          sh -n podkop_bot.sh
+          grep -Fq 'ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)' podkop_bot.sh
+          grep -Fq '➕ Создать новое tsnet' podkop_bot.sh
+          ! grep -E '^[[:space:]]*sing-box[[:space:]]+version' podkop_bot.sh
+      - name: Commit r59 bot
+        run: |
+          set -eu
+          git config user.name medvedolog
+          git config user.email tenkayyy8@gmail.com
+          git add podkop_bot.sh
+          git commit -m 'fix: route Tailscale legacy cleanup callbacks'
+          git push origin HEAD:dev/0.19.18-tailscale-multiprovider
+      - name: Export standalone
+        run: |
+          set -eu
+          mkdir -p out
+          cp podkop_bot.sh out/podkop_bot-0.19.18-tailscale-multiprovider-r59.sh
+          chmod 0755 out/podkop_bot-0.19.18-tailscale-multiprovider-r59.sh
+          (cd out && sha256sum podkop_bot-0.19.18-tailscale-multiprovider-r59.sh > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: podkop_bot-0.19.18-tailscale-multiprovider-r59
+          path: out/
+          if-no-files-found: error
