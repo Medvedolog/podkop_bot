@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.18
+# Podkop Telegram Bot v0.19.19
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.18"
+BOT_VERSION="0.19.19"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -11025,8 +11025,11 @@ _ts_find_existing() {
             return 0
         fi
     fi
-    if [ "$(_ts_provider_kind)" = forkop-x ]; then
-        _sec=$(uci -q show forkop 2>/dev/null | sed -n "s/^forkop\.\([^.=]*\)\.protocol='tailscale'$/\1/p" | head -n 1)
+    # Backend may be missing or API-incompatible during a staged upgrade.
+    # Keep the old direct-UCI fallback for every Forkop flavour so a native
+    # Tailscale section cannot become invisible and be accidentally duplicated.
+    if [ "$PODKOP_VARIANT" = "forkop" ]; then
+        _sec=$(uci -q show "$PODKOP_UCI" 2>/dev/null | sed -n "s/^${PODKOP_UCI}\.\([^.=]*\)\.protocol='tailscale'$/\1/p" | head -n 1)
         [ -n "$_sec" ] || return 1
         printf '%s' "$_sec"
         return 0
@@ -12316,17 +12319,25 @@ ${_ip}"; fi
             ;;
         "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
             local _ts_confirmed=0 _ts_target _ts_payload
+            # Standalone tailscaled conflict confirmation applies only when the
+            # managed tsnet node itself is being enabled. Changing flags on an
+            # already existing node (exit-node / accept-routes) does not create
+            # another identity and must never be remapped through ts_ec_.
             case "$cmd" in
                 ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;
             esac
-            _ts_target="${cmd##*_}"
-            if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
-                _ts_payload="${cmd#ts_e_}"
-                send_or_edit "$mid" \
-                    "$(printf '%s <b>Standalone Tailscale уже запущен.</b>\n\nВключить одновременно встроенный tsnet sing-box? Оба узла останутся самостоятельными.' "$E_WARN")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"⚠️ Включить всё равно\",\"callback_data\":\"ts_ec_${_ts_payload}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
-                return
-            fi
+            case "$cmd" in
+                ts_e_*)
+                    _ts_target="${cmd##*_}"
+                    if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
+                        _ts_payload="${cmd#ts_e_}"
+                        send_or_edit "$mid" \
+                            "$(printf '%s <b>Standalone Tailscale уже запущен.</b>\n\nВключить одновременно встроенный tsnet sing-box? Оба узла останутся самостоятельными.' "$E_WARN")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"⚠️ Включить всё равно\",\"callback_data\":\"ts_ec_${_ts_payload}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                        return
+                    fi
+                    ;;
+            esac
             # Toggles on an existing node: advertise_exit_node / accept_routes.
             # callback = ts_<x|r>_<section>_<0|1>
             local _rest _sn _nv _key
@@ -14888,10 +14899,58 @@ EOF
             local _s
             for _s in $_si_sections; do _si_count=$((_si_count+1)); done
 
-            if [ "$_si_count" -eq 0 ]; then
+            # Forkop X / classic Podkop keep the managed tsnet outside UCI server
+            # sections. Use the same backend status as LuCI. Without a compatible
+            # backend inspect only non-secret managed-state fields and stay read-only.
+            local _ts_managed_status='' _ts_managed_present=0 _ts_managed_backend=0
+            local _ts_managed_provider='' _ts_managed_host='' _ts_managed_url=''
+            local _ts_managed_enabled=false _ts_managed_registered=false
+            local _ts_managed_applied=false _ts_managed_sb=false _ts_managed_active=0
+            local _ts_managed_runtime=unknown _ts_managed_accept=false _ts_managed_exit=false
+            if _ts_backend_control_available; then
+                _ts_managed_status=$(_ts_backend_status 2>/dev/null || true)
+                if [ -n "$_ts_managed_status" ] &&                    [ "$(printf '%s' "$_ts_managed_status" | jq -r '.configured // false' 2>/dev/null)" = true ] &&                    [ "$(printf '%s' "$_ts_managed_status" | jq -r '.provider // "none"' 2>/dev/null)" != forkop-native ]; then
+                    _ts_managed_present=1; _ts_managed_backend=1
+                    _ts_managed_provider=$(printf '%s' "$_ts_managed_status" | jq -r '.provider // "none"' 2>/dev/null)
+                    _ts_managed_host=$(printf '%s' "$_ts_managed_status" | jq -r '.hostname // empty' 2>/dev/null)
+                    _ts_managed_url=$(printf '%s' "$_ts_managed_status" | jq -r '.control_url // empty' 2>/dev/null)
+                    _ts_managed_enabled=$(printf '%s' "$_ts_managed_status" | jq -r '.enabled // false' 2>/dev/null)
+                    _ts_managed_registered=$(printf '%s' "$_ts_managed_status" | jq -r '.registered // false' 2>/dev/null)
+                    _ts_managed_applied=$(printf '%s' "$_ts_managed_status" | jq -r '.runtime_applied // false' 2>/dev/null)
+                    _ts_managed_sb=$(printf '%s' "$_ts_managed_status" | jq -r '.singbox_running // false' 2>/dev/null)
+                    _ts_managed_active=$(printf '%s' "$_ts_managed_status" | jq -r '.active_connections // 0' 2>/dev/null)
+                    _ts_managed_runtime=$(printf '%s' "$_ts_managed_status" | jq -r '.runtime_state // "unknown"' 2>/dev/null)
+                    _ts_managed_accept=$(printf '%s' "$_ts_managed_status" | jq -r '.accept_routes // false' 2>/dev/null)
+                    _ts_managed_exit=$(printf '%s' "$_ts_managed_status" | jq -r '.advertise_exit_node // false' 2>/dev/null)
+                fi
+            elif [ -r /etc/podkop-bot/tsnet.json ] && [ "$(_ts_provider_kind)" != forkop-native ]; then
+                _ts_managed_present=1; _ts_managed_provider=$(_ts_provider_kind)
+                _ts_managed_host=$(jq -r '.hostname // empty' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_url=$(jq -r '.control_url // empty' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_enabled=$(jq -r '.enabled // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_accept=$(jq -r '.accept_routes // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_exit=$(jq -r '.advertise_exit_node // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+            fi
+
+            # Standalone tailscaled is a service in its own right. It must be
+            # visible even when Podkop/Forkop has no `config server` sections and
+            # even on legacy/orphaned Podkop Plus. Detection and permission to
+            # create a second sing-box tsnet node are deliberately separate.
+            local _ts_standalone_present_flag=0 _ts_standalone_running_flag=0
+            _ts_standalone_present && _ts_standalone_present_flag=1
+            [ "$_ts_standalone_present_flag" = 1 ] && _ts_standalone_running && _ts_standalone_running_flag=1
+
+            local _si_total=$((_si_count + _ts_managed_present + _ts_standalone_present_flag))
+            if [ "$_si_total" -eq 0 ]; then
+                local _ts_empty_add=''
+                # Podkop Plus is intentionally observer-only: it is orphaned and
+                # we do not create a new tsnet integration for it.
+                if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
+                    _ts_empty_add='[{"text":"➕ Tailscale через sing-box","callback_data":"ts_add"}],'
+                fi
                 send_or_edit "$mid" \
-                    "$(printf '%s <b>Службы</b>\n\n<i>Серверы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
-                    "{\"inline_keyboard\":[$(if singbox_supports_tailscale && _ts_backend_control_available; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                    "$(printf '%s <b>Службы</b>\n\n<i>Серверы и Tailscale-службы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
+                    "{\"inline_keyboard\":[${_ts_empty_add}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -14950,13 +15009,84 @@ EOF
             }
 
             local _text
-            _text="${E_SRV} <b>Службы</b> (${_si_count})\n"
+            _text="${E_SRV} <b>Службы</b> (${_si_total})\n"
             _text="${_text}<code>────────────────────</code>"
 
             # Compute sing-box liveness once (used by tailscale status); avoids one
             # pgrep per server inside the loop.
             local _sb_alive=0
             pgrep -f sing-box >/dev/null 2>&1 && _sb_alive=1
+
+            # Classic standalone tailscaled card. Read-only by design: this bot
+            # does not take ownership of a separately installed Tailscale daemon.
+            if [ "$_ts_standalone_present_flag" = 1 ]; then
+                local _tss_icon _tss_state _tss_ip _tss_iface
+                if [ "$_ts_standalone_running_flag" = 1 ]; then
+                    _tss_icon="${E_ON}"; _tss_state="<b>работает</b>"
+                else
+                    _tss_icon="${E_OFF}"; _tss_state="установлен, но не запущен"
+                fi
+                _tss_iface=$(ip -4 -o addr 2>/dev/null | awk '$2 ~ /^tailscale/ {print $2; exit}')
+                _tss_ip=$(ip -4 -o addr 2>/dev/null | awk '$2 ~ /^tailscale/ {split($4,a,"/"); print a[1]; exit}')
+                _text="${_text}\n\n${_tss_icon} <b>Tailscale</b> · <code>standalone</code>"
+                _text="${_text}\n    🔗 ${_tss_state}"
+                _text="${_text}\n    🧩 Отдельная служба <code>tailscaled</code>"
+                [ -n "$_tss_iface" ] && _text="${_text}\n    🔌 Интерфейс: <code>$(html_escape "$_tss_iface")</code>"
+                [ -n "$_tss_ip" ] && _text="${_text}\n    📍 <code>$(html_escape "$_tss_ip")</code>"
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text="${_text}\n    ℹ️ Podkop Plus: только наблюдение; новый tsnet через sing-box здесь не создаётся"
+                elif [ "$_ts_managed_present" = 0 ] && [ "$(_ts_provider_kind)" != none ]; then
+                    _text="${_text}\n    ℹ️ Можно добавить отдельный tsnet через sing-box; это будет второй Tailscale-узел"
+                fi
+            fi
+
+            # Non-native managed tsnet card. Identity existence is not treated as
+            # proof of continuous control-plane connectivity; live activity comes
+            # only from backend runtime evidence.
+            if [ "$_ts_managed_present" = 1 ]; then
+                local _tm_icon _tm_state _tm_integration _tm_en_lbl
+                case "$_ts_managed_runtime" in
+                    active)   _tm_icon="${E_ON}";  _tm_state="<b>есть активный Tailscale-трафик</b>" ;;
+                    ready)    _tm_icon="${E_ON}";  _tm_state="endpoint применён · sing-box работает" ;;
+                    starting)
+                        if [ "$_ts_managed_applied" = true ] && [ "$_ts_managed_sb" = true ]; then
+                            _tm_icon="${E_ON}"; _tm_state="endpoint работает · identity ещё не подтверждена диагностикой"
+                        else
+                            _tm_icon="${E_YLW}"; _tm_state="запускается"
+                        fi ;;
+                    degraded) _tm_icon="${E_YLW}"; _tm_state="настроен, но endpoint сейчас не применён" ;;
+                    failed)   _tm_icon="${E_ERR}"; _tm_state="настроен, но sing-box не работает" ;;
+                    disabled) _tm_icon="${E_OFF}"; _tm_state="настроен, но выключен" ;;
+                    *)
+                        if [ "$_ts_managed_enabled" = true ]; then _tm_icon="${E_YLW}"; _tm_state="настроен · runtime-статус недоступен"
+                        else _tm_icon="${E_OFF}"; _tm_state="настроен, но выключен"; fi ;;
+                esac
+                case "$_ts_managed_provider" in
+                    forkop-x) _tm_integration="Forkop X · safe overlay" ;;
+                    podkop) _tm_integration="Podkop · safe overlay" ;;
+                    *) _tm_integration="$(html_escape "$_ts_managed_provider") · overlay" ;;
+                esac
+                _text="${_text}\n\n${_tm_icon} <b>Tailscale</b> · <code>tsnet</code>"
+                _text="${_text}\n    🔗 ${_tm_state}"
+                _text="${_text}\n    🧩 Интеграция: ${_tm_integration}"
+                [ -n "$_ts_managed_host" ] && _text="${_text}\n    🏷 Узел: <code>$(html_escape "$_ts_managed_host")</code>"
+                case "$_ts_managed_url" in ""|"https://controlplane.tailscale.com") : ;; *) _text="${_text}\n    🛰 Сервер управления: <code>$(html_escape "$_ts_managed_url")</code>" ;; esac
+                if [ "$_ts_managed_backend" = 1 ]; then
+                    [ "$_ts_managed_applied" = true ] && _text="${_text}\n    ✅ Endpoint применён в sing-box" || _text="${_text}\n    ⚠️ Endpoint не найден в текущем конфиге sing-box"
+                    [ "$_ts_managed_sb" = true ] && _text="${_text}\n    ⚙️ sing-box: работает" || _text="${_text}\n    ⚙️ sing-box: не работает"
+                    [ "$_ts_managed_registered" = true ] && _text="${_text}\n    💾 Identity: создана" || _text="${_text}\n    💾 Identity: ещё не создана"
+                    case "$_ts_managed_active" in ''|*[!0-9]*) _ts_managed_active=0 ;; esac
+                    [ "$_ts_managed_active" -gt 0 ] && _text="${_text}\n    📊 Активных соединений Tailscale: ${_ts_managed_active}"
+                else
+                    _text="${_text}\n    ℹ️ Runtime-диагностика недоступна без совместимого backend"
+                fi
+                [ "$_ts_managed_accept" = true ] && _text="${_text}\n    📥 принимает маршруты"
+                [ "$_ts_managed_exit" = true ] && _text="${_text}\n    🚪 анонсирует выходной узел"
+                if [ "$_ts_managed_backend" = 1 ]; then
+                    [ "$_ts_managed_enabled" = true ] && _tm_en_lbl="${E_ON} Узел включён" || _tm_en_lbl="${E_OFF} Узел выключен"
+                    _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_tm_en_lbl")\",\"callback_data\":\"ts_e_podkop-bot-tailscale_$([ "$_ts_managed_enabled" = true ] && echo 0 || echo 1)\"}],"
+                fi
+            fi
 
             for _s in $_si_sections; do
                 local _proto _enabled _listen _port _pubhost _security _sni _routing_mode _routing_sec _ts_legacy=0
@@ -15129,7 +15259,11 @@ EOF
             done
 
             rm -f "$_conn_map_file"
-            _text="${_text}\n\n<i>Статус: 🟢 принимает подключения · 🟡 включён, но порт не найден · ⚫ выключен</i>"
+            if [ "$_ts_managed_present" = 1 ]; then
+                _text="${_text}\n\n<i>Tailscale: runtime-статус берётся из общего LuCI/backend; identity сама по себе не считается доказательством постоянного подключения.</i>"
+            else
+                _text="${_text}\n\n<i>Статус: 🟢 принимает подключения · 🟡 включён, но порт не найден · ⚫ выключен</i>"
+            fi
 
             # Render: convert our literal "\n" markers to real newlines WITHOUT the
             # fragile `printf '%b'` (which also interprets \t \xNN \c etc. that may appear
@@ -15146,15 +15280,21 @@ EOF
                 else
                     _ts_ctl_note="Backend управления не установлен."
                 fi
-                _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED} (luci-app-podkop-bot r60+)."
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> Podkop Plus оставляем read-only; создание встроенного tsnet для него не поддерживаем."
+                else
+                    _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED}."
+                fi
             fi
             # Tailscale row: offered only on Forkop (config server + protocol=tailscale
             # is a Forkop feature) and only when the sing-box build can actually serve
             # it — offering a button that always errors is worse than no button.
             local _ts_row="" _ts_existing=""
-            if singbox_supports_tailscale && _ts_backend_control_available; then
+            # Creation capability is stricter than discovery. Standalone
+            # tailscaled is always shown, but Podkop Plus remains observer-only.
+            if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
                 _ts_existing=$(_ts_find_existing)
-                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale\",\"callback_data\":\"ts_add\"}],"
+                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
             fi
             send_or_edit "$mid" "$_text_nl" \
                 "{\"inline_keyboard\":[${_ts_row}${_ts_toggle_rows}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
