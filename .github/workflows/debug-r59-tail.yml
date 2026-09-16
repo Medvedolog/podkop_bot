@@ -1,0 +1,23 @@
+name: debug-r59-tail
+on:
+  push:
+    branches: [dev/0.19.18-tailscale-multiprovider]
+    paths: ['.github/workflows/debug-r59-tail.yml']
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev/0.19.18-tailscale-multiprovider
+      - name: Extract tail
+        run: sed -n '17200,17580p' podkop_bot.sh > .github/debug-r59-tail.txt
+      - name: Commit
+        run: |
+          git config user.name medvedolog
+          git config user.email tenkayyy8@gmail.com
+          git add .github/debug-r59-tail.txt
+          git commit -m 'ci: capture r59 callback tail'
+          git push origin HEAD:dev/0.19.18-tailscale-multiprovider
