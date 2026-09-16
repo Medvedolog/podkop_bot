@@ -14331,7 +14331,7 @@ EOF
             kb="${kb}[{\"text\":\"${E_SET} Настройки\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"${E_RST} Перезапустить\",\"callback_data\":\"ask_reload_podkop\"}],"
             kb="${kb}[{\"text\":\"${E_BOT} Настройки бота\",\"callback_data\":\"bot_settings\"},${_stop_start}],"
             case "$PODKOP_VARIANT" in
-                plus|forkop)
+                original|plus|forkop)
                     kb="${kb}[{\"text\":\"${E_SRV} Службы\",\"callback_data\":\"cmd_server_instances\"}],"
                     ;;
             esac
@@ -14744,7 +14744,7 @@ EOF
             # Plus and Forkop expose this model; no write operations are performed.
             # Clash /connections is used only optionally for live traffic stats.
             case "$PODKOP_VARIANT" in
-                plus|forkop) : ;;
+                original|plus|forkop) : ;;
                 *)
                     send_or_edit "$mid" \
                         "$(printf '%s Раздел «Службы» доступен в Podkop Plus и Forkop.' "$E_WARN")" \
