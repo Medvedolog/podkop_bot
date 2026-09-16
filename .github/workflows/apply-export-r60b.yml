@@ -1,0 +1,42 @@
+name: apply-export-r60b
+on:
+  push:
+    branches: [dev/0.19.18-tailscale-multiprovider]
+    paths:
+      - '.github/workflows/apply-export-r60b.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: dev/0.19.18-tailscale-multiprovider
+      - name: Apply patch
+        run: python3 .github/r60_patch.py
+      - name: Validate
+        run: |
+          sh -n podkop_bot.sh
+          grep -Fq 'TS_BACKEND_API_REQUIRED=1' podkop_bot.sh
+          grep -Fq 'Tailscale: режим наблюдения.' podkop_bot.sh
+          grep -Fq 'singbox_supports_tailscale && _ts_backend_control_available' podkop_bot.sh
+      - name: Commit
+        run: |
+          git config user.name medvedolog
+          git config user.email tenkayyy8@gmail.com
+          git add podkop_bot.sh
+          git commit -m 'fix: make standalone Tailscale management capability-gated'
+          git push origin HEAD:dev/0.19.18-tailscale-multiprovider
+      - name: Export
+        run: |
+          cp podkop_bot.sh podkop_bot-0.19.18-tailscale-multiprovider-r60.sh
+          sha256sum podkop_bot-0.19.18-tailscale-multiprovider-r60.sh > podkop_bot-0.19.18-tailscale-multiprovider-r60.SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: podkop_bot-0.19.18-tailscale-multiprovider-r60
+          path: |
+            podkop_bot-0.19.18-tailscale-multiprovider-r60.sh
+            podkop_bot-0.19.18-tailscale-multiprovider-r60.SHA256SUMS
+          if-no-files-found: error
