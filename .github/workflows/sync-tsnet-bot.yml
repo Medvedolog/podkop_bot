@@ -1,0 +1,30 @@
+name: sync-tsnet-bot
+on:
+  push:
+    branches:
+      - dev/0.19.18-tailscale-multiprovider
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    if: ${{ !contains(github.event.head_commit.message || '', '[tsnet-sync]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/0.19.18-tailscale-multiprovider
+          fetch-depth: 0
+      - name: Fetch canonical vendored bot
+        run: |
+          curl -fL --retry 3 -o podkop_bot.sh 'https://raw.githubusercontent.com/Medvedolog/luci-app-podkop-bot/dev/0.19.18-tailscale-multiprovider/root/usr/lib/podkop_bot/podkop_bot'
+          chmod 755 podkop_bot.sh
+          sh -n podkop_bot.sh
+      - name: Commit
+        run: |
+          if git diff --quiet -- podkop_bot.sh; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add podkop_bot.sh
+          git commit -m 'bot: sync multiprovider tsnet backend [tsnet-sync]'
+          git push origin HEAD:dev/0.19.18-tailscale-multiprovider
