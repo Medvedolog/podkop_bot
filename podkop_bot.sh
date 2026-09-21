@@ -84,6 +84,14 @@ _detect_podkop_variant() {
     echo "original"
 }
 
+_forkop_display_name() {
+    if [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\\.protocol='tailscale'\\$"; then
+        printf 'Forkop'
+    else
+        printf 'Forkop X'
+    fi
+}
+
 # _apply_variant_env: re-applies all variant-dependent variables after
 # _detect_podkop_variant() runs. Called after do_update_podkop to handle
 # podkop-evolution → NetShift migration in the same session.
@@ -93,7 +101,7 @@ _apply_variant_env() {
             PODKOP_UCI="forkop"
             PODKOP_BIN="/usr/bin/forkop"
             PODKOP_PKG="forkop"
-            PODKOP_DISPLAY_NAME="Forkop"
+            PODKOP_DISPLAY_NAME="$(_forkop_display_name)"
             PODKOP_GITHUB_REPO="ushan0v/forkop"
             PODKOP_INIT="/etc/init.d/forkop"
             PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
