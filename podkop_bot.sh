@@ -1095,10 +1095,22 @@ SB_RESTART_LOG="${BOT_DIR}/sb_restart_log"
 # an upstream DNS-failover storm no longer reads as sing-box dying repeatedly.
 SB_RELOAD_LOG="${BOT_DIR}/sb_reload_log"
 get_singbox_version_display() {
+    # Cache key is the sing-box binary's inode:mtime:size (same signature style
+    # as tsnet_capable() in tsnet-provider.sh) so a package replace/downgrade —
+    # e.g. Forkop switching the installed build from -extended to standard —
+    # invalidates the cache instead of serving a stale version string forever.
+    local _sb_bin _sb_key
+    _sb_bin=$(command -v sing-box 2>/dev/null)
+    if [ -n "$_sb_bin" ]; then
+        _sb_key=$(stat -c '%i:%Y:%s' "$_sb_bin" 2>/dev/null)
+        [ -n "$_sb_key" ] || _sb_key=$(ls -ln "$_sb_bin" 2>/dev/null | awk '{print $5":"$6":"$7":"$8}')
+    fi
+
     # Skip cache if it contains a negative result — unknown must not be persisted.
     if [ -s "$SB_VER_CACHE" ]; then
-        _cached_sbv=$(cat "$SB_VER_CACHE" 2>/dev/null)
-        if [ -n "$_cached_sbv" ] && [ "$_cached_sbv" != "unknown" ]; then
+        local _cached_key _cached_sbv
+        IFS='|' read -r _cached_key _cached_sbv < "$SB_VER_CACHE" 2>/dev/null
+        if [ -n "$_cached_sbv" ] && [ "$_cached_sbv" != "unknown" ] && [ "$_cached_key" = "$_sb_key" ]; then
             printf '%s' "$_cached_sbv"; return
         fi
     fi
@@ -1134,7 +1146,7 @@ get_singbox_version_display() {
     # would hide a valid version on the next call after state-file appears).
     if [ "$ver" != "unknown" ]; then
         mkdir -p "$BOT_DIR" 2>/dev/null
-        printf '%s' "$ver" > "$SB_VER_CACHE" 2>/dev/null
+        printf '%s|%s' "$_sb_key" "$ver" > "$SB_VER_CACHE" 2>/dev/null
     else
         rm -f "$SB_VER_CACHE" 2>/dev/null
     fi
@@ -5744,6 +5756,13 @@ start_health_daemon() {
         # Auto-switch debounce: batch rapid URLTest flapping into one summary
         local _sw_count=0 _sw_first_ts=0 _sw_pending_to="" _sw_old_disp=""
         local _SW_WINDOW=120   # seconds: batch switches within this window
+        # sing-box restart-flap guard: reported on hardware (AX3000T, low free
+        # RAM) as 13 PID-change alerts in well under an hour. The first couple
+        # of restarts still alert individually — that is real, useful signal
+        # (e.g. a config apply) — only a genuine flap loop goes quiet.
+        local _sbf_count=0 _sbf_first_ts=0 _sbf_last_ts=0 _sbf_flapping=0
+        local _SBF_WINDOW=600     # seconds: window the threshold is counted over
+        local _SBF_THRESHOLD=3    # restarts within the window that count as flapping
         # Track tier1 SOCKS state separately from effective transport state.
         # Allows alerting when tier1 goes down even if tier2 keeps bot reachable.
         local last_tier1_state="up"
@@ -5978,7 +5997,33 @@ start_health_daemon() {
                 # Restart statistics remain owned by _traffic_accum_tick(); do not
                 # append SB_RESTART_LOG here or one restart may be counted twice.
                 printf 'up' > "$ROUTE_CMD_FILE"
-                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+
+                # Flap accounting: reset the counter once the window has elapsed
+                # since the first restart in the current burst.
+                local _sbf_now; _sbf_now=$(date +%s)
+                if [ "$_sbf_count" -eq 0 ] || [ $(( _sbf_now - _sbf_first_ts )) -ge "$_SBF_WINDOW" ]; then
+                    _sbf_count=1; _sbf_first_ts=$_sbf_now
+                else
+                    _sbf_count=$(( _sbf_count + 1 ))
+                fi
+                _sbf_last_ts=$_sbf_now
+
+                if [ "$_sbf_count" -ge "$_SBF_THRESHOLD" ]; then
+                    if [ "$_sbf_flapping" -eq 0 ]; then
+                        _sbf_flapping=1
+                        logger -t podkop-bot "[Watchdog] sing-box flapping: ${_sbf_count} restarts in $(( (_sbf_now - _sbf_first_ts) / 60 + 1 )) min. Suppressing further per-restart alerts."
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _sbf_pl
+                            _sbf_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
+                                "$(printf '<b>[%s]</b> %s <b>sing-box флапает</b>\n\n<b>Перезапусков:</b> %s за %d мин\n\n<i>Дальнейшие уведомления о перезапусках приостановлены, пока процесс не стабилизируется. Частые причины: нехватка ОЗУ (OOM-killer) или нестабильный сервер в URLTest.</i>' \
+                                    "$_hn" "$E_WARN" "$_sbf_count" "$(( (_sbf_now - _sbf_first_ts) / 60 + 1 ))")" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_sbf_pl"
+                        fi
+                    fi
+                    # Flapping: skip the per-restart alert below, already covered
+                    # by the flap notice above.
+                elif [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                     local _restart_route_key _restart_route_name _restart_txt _restart_pl
                     _restart_route_key=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\
 \r\t ')
@@ -5997,6 +6042,18 @@ start_health_daemon() {
                     _restart_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_restart_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$_restart_pl"
+                fi
+            elif [ "$_sbf_flapping" -eq 1 ] && [ $(( $(date +%s) - _sbf_last_ts )) -ge "$_SBF_WINDOW" ]; then
+                # No new restart for a full window: the flap has settled.
+                local _sbf_total=$_sbf_count _sbf_recover_pl
+                _sbf_flapping=0; _sbf_count=0
+                logger -t podkop-bot "[Watchdog] sing-box restart flap settled: ${_sbf_total} restarts total."
+                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    _sbf_recover_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
+                        "$(printf '<b>[%s]</b> %s <b>sing-box стабилизировался</b>\n\nВсего перезапусков за флап: <b>%s</b>. Новых перезапусков больше нет — уведомления возобновлены.' \
+                            "$_hn" "$E_OK" "$_sbf_total")" \
+                        '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                    send_health_alert "$_sbf_recover_pl"
                 fi
             fi
 
@@ -10873,7 +10930,14 @@ _ts_provider_kind() {
     _p=$(_ts_backend_provider 2>/dev/null)
     case "$_p" in forkop-native|forkop-x|podkop) printf '%s' "$_p"; return 0 ;; esac
     if [ "$PODKOP_VARIANT" = "forkop" ]; then
-        [ -r /usr/lib/singbox/servers.uc ] && printf '%s' forkop-native || printf '%s' forkop-x
+        # See tsnet-provider.sh:tsnet_provider() for why this checks
+        # usr/lib/forkop/singbox/servers.uc (the real installed path) and a
+        # live protocol='tailscale' UCI section, not usr/lib/singbox/servers.uc.
+        if [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\.protocol='tailscale'\$"; then
+            printf '%s' forkop-native
+        else
+            printf '%s' forkop-x
+        fi
         return 0
     fi
     [ "$PODKOP_VARIANT" = "original" ] && { printf '%s' podkop; return 0; }

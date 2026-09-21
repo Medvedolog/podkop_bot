@@ -11,7 +11,7 @@
 [![Telegram](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/BotFather)
 [![интерфейс](https://img.shields.io/badge/интерфейс-русский-C73E3A?style=flat-square)](#-главное-меню)
 
-[**Установка**](#-быстрая-установка) · [Как это выглядит](#-как-это-выглядит-в-telegram) · [Возможности](#-возможности) · [Поддержка форков](#-поддержка-форков-podkop) · [Веб-интерфейс](#-веб-интерфейс--luci-app-podkop-bot) · [История изменений](CHANGELOG_RUS.md)
+[**Установка**](#-быстрая-установка) · [Как это выглядит](#-как-это-выглядит-в-telegram) · [Возможности](#-возможности) · [Поддержка форков](#-поддержка-форков-podkop) · [Веб-интерфейс](#web-ui) · [История изменений](CHANGELOG_RUS.md)
 
 </div>
 
@@ -23,7 +23,7 @@
 
 > 🇷🇺 **Интерфейс бота — русский.** Начиная с v0.18.x все кнопки, карточки и уведомления переведены; переключателя языка нет, английской версии интерфейса тоже. Английскими остаются только технические термины, которые переводить и не стоит: названия протоколов, поля UCI, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`. Старые английские команды (`Menu`, `Status`) бот по-прежнему понимает — если у вас в чате осталась клавиатура от прежней версии, она не сломается.
 
-> 🖥️ **Не всё удобно делать в чате.** Для настроек бота есть отдельная LuCI-панель — **[luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot)**: токен, admin_ids, транспорт, алерты, расписания отчётов и Runtime Info в браузере. Ставится тем же `install.sh` с флагом `--with-luci`, подробности — [ниже](#-веб-интерфейс--luci-app-podkop-bot).
+> 🖥️ **Не всё удобно делать в чате.** Для настроек бота есть отдельная LuCI-панель — **[Podkop BearGuard](https://github.com/Medvedolog/luci-app-podkop-bearguard)** (`luci-app-podkop-bot`): токен, admin_ids, транспорт, алерты, расписания отчётов и Runtime Info в браузере. Ставится тем же `install.sh` с флагом `--with-luci`, подробности — [ниже](#web-ui).
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md) (English: [CHANGELOG.md](CHANGELOG.md))
 
@@ -48,7 +48,7 @@
 📅  Отчёт за неделю        — стабильность, трафик, подписка и версии в одном сообщении
 📤  Загрузить скрипт       — установка новой версии бота файлом через Telegram, без GitHub
 🔕  Режим тишины           — уведомления о сбоях молчат в заданные часы
-🖥️  Веб-интерфейс (LuCI)   — настройка бота в браузере через luci-app-podkop-bot
+🖥️  Веб-интерфейс (LuCI)   — Podkop BearGuard (`luci-app-podkop-bot`)
 ```
 
 **Только на Podkop Plus и Forkop:**
@@ -307,11 +307,13 @@ ash install.sh --unattended \
 4. Атомарно подменяет файл и перезапускает сервис
 5. Если новая версия не стартовала — сам возвращает предыдущую
 
-### 🖥️ Веб-интерфейс — luci-app-podkop-bot
+<a id="web-ui"></a>
+
+### 🖥️ Веб-интерфейс — Podkop BearGuard (`luci-app-podkop-bot`)
 
 Вбивать длинный токен и списки admin_ids с телефона — удовольствие ниже среднего. Для таких задач есть отдельный пакет LuCI: настройки бота (токен, admin_ids, транспорт, уведомления, расписания отчётов) и сводка состояния — в обычной веб-панели роутера, с нормальной клавиатурой.
 
-Репозиторий: **https://github.com/Medvedolog/luci-app-podkop-bot**
+Репозиторий: **https://github.com/Medvedolog/luci-app-podkop-bearguard**
 
 Ставится тем же `install.sh`: после установки или обновления бота он сам спросит, нужен ли веб-интерфейс. В unattended-режиме вопрос пропускается флагом `--with-luci`:
 
@@ -609,7 +611,7 @@ MIT
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
-The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for [luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot) rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure). The same installer can also fetch and install luci-app-podkop-bot itself (`--with-luci` flag, or standalone via `--action update-luci`) — a LuCI web UI for bot configuration and a browser-friendly Runtime Info view, for anyone who'd rather not do everything through Telegram.
+The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for [Podkop BearGuard](https://github.com/Medvedolog/luci-app-podkop-bearguard) (`luci-app-podkop-bot`) rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure). The same installer can also fetch and install Podkop BearGuard (`luci-app-podkop-bot`) itself (`--with-luci` flag, or standalone via `--action update-luci`) — a LuCI web UI for bot configuration and a browser-friendly Runtime Info view, for anyone who'd rather not do everything through Telegram.
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Меню | 📊 Статус`) is available at all times including during watchdog alerts.
 
