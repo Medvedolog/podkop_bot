@@ -1606,64 +1606,24 @@ _try_curl() {
 _resolve_primary_section() {
     local _s _me _en _sec=""
     local _all="${1:-}"
-    [ -n "$_all" ] || _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep -E '^[^.]+\.[^.=]+=section
+    [ -n "$_all" ] || _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null | grep -E '^[^.]+\.[^.=]+=section$' | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     for _s in $_all; do
         section_is_proxy "$_s" || continue
         # Skip disabled sections: enabled=0 with mixed_proxy_enabled=1 does not
-        # carry live transport and must not be picked as primary (also improves
-        # tier1 transport selection).
+        # carry live transport and must not be picked as primary.
         _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
         [ -z "$_en" ] && _en=1
         [ "$_en" = "1" ] || continue
         _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
         if [ "$_me" = "1" ]; then
-            _sec="$_s"; break
+            _sec="$_s"
+            break
         fi
     done
     [ -z "$_sec" ] && _sec=$(get_active_section)
     [ -z "$_sec" ] && _sec="main"
     echo "$_sec"
 }
-
-
-# Call at the top of each transport function.
-# IMPORTANT: tier1 is always the PRIMARY proxy section (connection_type=proxy,
-# mixed_proxy_enabled=1), NOT the active UI section. Active section affects which
-# proxies are managed in the bot UI, but bot transport to Telegram must use the
-# main tunnel, not e.g. awg_main/WARP which may not route Telegram.
-# ── Fallback-proxy record helpers ────────────────────────────────────────────
-# A fallback_socks record may carry an optional local mnemonic after '#' and
-# optional user:pass credentials:  socks5h://user:pass@host:port#Name
-# ORDER MATTERS: strip '#mnemonic' FIRST, then work with the endpoint.
-#
-# _proxy_endpoint  — everything before the first '#' (goes into curl -x as-is,
-#                    credentials preserved — the bot needs them to connect).
-# _proxy_mnemonic  — everything after the first '#', or '' if none.
-# _mask_proxy      — hide the password for logs/UI: user:pass@ -> user:***@
-# _ru_plural COUNT ONE FEW MANY — Russian numeral agreement.
-# "1 страна", "2 страны", "5 стран". Printing the noun unchanged after a number
-# reads as machine translation, and it is the first thing a Russian reader trips
-# over. 11-14 are the exception that a naive last-digit rule gets wrong. \
-        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
-    for _s in $_all; do
-        section_is_proxy "$_s" || continue
-        # Skip disabled sections: enabled=0 with mixed_proxy_enabled=1 does not
-        # carry live transport and must not be picked as primary (also improves
-        # tier1 transport selection).
-        _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
-        [ -z "$_en" ] && _en=1
-        [ "$_en" = "1" ] || continue
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
-        if [ "$_me" = "1" ]; then
-            _sec="$_s"; break
-        fi
-    done
-    [ -z "$_sec" ] && _sec=$(get_active_section)
-    [ -z "$_sec" ] && _sec="main"
-    echo "$_sec"
-}
-
 
 # Call at the top of each transport function.
 # IMPORTANT: tier1 is always the PRIMARY proxy section (connection_type=proxy,
