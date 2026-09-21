@@ -738,6 +738,39 @@ forkop_children_by_type_and_owner() {
     '
 }
 
+forkop_child_counts() {
+    local _parent="$1"
+    [ "$PODKOP_VARIANT" = "forkop" ] || { printf '0 0 0'; return 1; }
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v want="$_parent" '
+        {
+            k=$1
+            sub("^" p, "", k)
+            v=$2
+            gsub(/\047/, "", v)
+            dot=index(k, ".")
+            if (!dot) {
+                order[++n]=k
+                type[k]=v
+            } else {
+                sec=substr(k, 1, dot-1)
+                opt=substr(k, dot+1)
+                if (opt == "section") owner[sec]=v
+            }
+        }
+        END {
+            subn=utn=ifn=0
+            for (i=1; i<=n; i++) {
+                sec=order[i]
+                if (owner[sec] != want) continue
+                if (type[sec] == "subscription_url") subn++
+                else if (type[sec] == "urltest") utn++
+                else if (type[sec] == "section_interface") ifn++
+            }
+            printf "%d %d %d\n", subn, utn, ifn
+        }
+    '
+}
+
 forkop_child_count() {
     local _count
     _count=$(forkop_children_by_type_and_owner "$1" "$2" 2>/dev/null | awk 'NF { n++ } END { print n+0 }')
@@ -922,10 +955,10 @@ get_section_type() {
         [ -z "$ct" ] && ct="connection"
         case "$ct" in
             connection|proxy|outbound|vpn)
-                local _sub_n _ut_n _if_n
-                _sub_n=$(forkop_child_count subscription_url "$sec")
-                _ut_n=$(forkop_child_count urltest "$sec")
-                _if_n=$(forkop_child_count section_interface "$sec")
+                local _sub_n _ut_n _if_n _child_counts
+                _child_counts=$(forkop_child_counts "$sec")
+                set -- ${_child_counts:-0 0 0}
+                _sub_n=${1:-0}; _ut_n=${2:-0}; _if_n=${3:-0}
                 # Preserve the existing single-value API for old views.
                 # URLTest takes display precedence, then subscription, then
                 # bound interface. Supported writes use native Forkop fields.
@@ -2991,10 +3024,6 @@ is_reply_to_bot() {
 # SECTION 4: Messaging Functions
 # ==============================================================================
 
-# _validate_kb: check reply_markup JSON is valid before passing to jq --argjson.
-# Invalid kb silently kills the whole jq payload, leaving the card un-sent.
-# On failure: logs the bad JSON with calling context, clears kb so card sends without buttons.
-
 send_message() {
     local txt="$1" kb="$2" payload="" resp new_mid
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
@@ -3121,9 +3150,9 @@ send_or_edit() {
     local mid="$1" txt="$2" kb="$3"
     if [ -n "$mid" ] && [ "$mid" != "null" ] && [ "$mid" != "0" ]; then
         # Check if a health alert was sent after this menu card
-        local alert_mid menu_mid
-        alert_mid=$(cat "$LAST_ALERT_MSG_FILE" 2>/dev/null)
-        menu_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        local alert_mid="" menu_mid=""
+        [ -f "$LAST_ALERT_MSG_FILE" ] && IFS= read -r alert_mid < "$LAST_ALERT_MSG_FILE"
+        [ -f "$LAST_MENU_MSG_FILE" ] && IFS= read -r menu_mid < "$LAST_MENU_MSG_FILE"
         # Validate as integers — empty or non-numeric values crash ash with -gt
         case "$alert_mid" in ''|*[!0-9]*) alert_mid=0 ;; esac
         case "$menu_mid"  in ''|*[!0-9]*) menu_mid=0  ;; esac
@@ -4826,9 +4855,11 @@ check_health() {
         local _dc_ok=0; _dc_i=0
         for _dc_ip in $_dc_ips; do
             _dc_i=$((_dc_i+1))
-            [ -f "${_dc_dir}/dc_${_dc_i}" ] && \
-                [ "$(cat "${_dc_dir}/dc_${_dc_i}")" = "ok" ] && \
-                _dc_ok=$((_dc_ok + 1))
+            if [ -f "${_dc_dir}/dc_${_dc_i}" ]; then
+            local _dc_result=""
+            IFS= read -r _dc_result < "${_dc_dir}/dc_${_dc_i}"
+            [ "$_dc_result" = "ok" ] && _dc_ok=$((_dc_ok + 1))
+        fi
         done
         rm -rf "$_dc_dir" 2>/dev/null || true
         if [ "$_dc_total" -gt 0 ] && [ "$_dc_ok" -gt 0 ] && [ $((_dc_ok*2)) -ge "$_dc_total" ]; then
@@ -4895,22 +4926,32 @@ check_health() {
     local _rn=0
     for _fbe in $_fb_list; do
         _rn=$((_rn + 1))
-        local _rf="${_probe_dir}/fb_${_rn}"
-        [ -f "$_rf" ] && [ "$(cat "$_rf")" = "ok" ] && _tier2=ok || \
-            { [ "$_tier2" = "none" ] && _tier2=fail; }
+        local _rf="${_probe_dir}/fb_${_rn}" _rf_result=""
+        if [ -f "$_rf" ]; then
+            IFS= read -r _rf_result < "$_rf"
+            [ "$_rf_result" = "ok" ] && _tier2=ok || { [ "$_tier2" = "none" ] && _tier2=fail; }
+        fi
     done
     for _auto_rec in ${_t_auto_socks:-}; do
         _s=${_auto_rec%%|*}
         local _rf="${_probe_dir}/sec_${_s}"
         [ -f "$_rf" ] || continue
-        local _sec_result; _sec_result=$(cat "$_rf")
+        local _sec_result=""
+        IFS= read -r _sec_result < "$_rf"
         _tier2_results="${_tier2_results}tg_sec_${_s}=${_sec_result}\n"
         [ "$_sec_result" = "ok" ] && _tier2=ok
     done
     [ "$_probe_any" = "0" ] && _tier2=none
     rm -rf "$_probe_dir" 2>/dev/null || true
 
-    # Write atomically via tmp+mv — prevents watchdog reading truncated file
+    # Export the values for this watchdog process too. Consumers in the same
+    # tick must not re-parse the file we are about to write.
+    HEALTH_TG_DIRECT="$_direct"
+    HEALTH_TG_TRANSPORT="$_transport"
+    HEALTH_TG_TIER2="$_tier2"
+    HEALTH_TG_SEC_LINES="$_tier2_results"
+
+    # Write atomically for external/read-only consumers.
     printf 'tg_direct=%s\ntg_transport=%s\ntg_tier2=%s\n%b' \
         "$_direct" "$_transport" "$_tier2" "$_tier2_results" \
         > "${HEALTH_STATE_FILE}.tmp" && mv "${HEALTH_STATE_FILE}.tmp" "$HEALTH_STATE_FILE" 2>/dev/null
@@ -4923,16 +4964,21 @@ _write_socks_state() {
     # Args: $1=tg_aggregate(ok|fail)  $2=socks(up|down)  $3=last_ok_route
     # Reads tg_direct/tg_transport from HEALTH_STATE_FILE (written by check_health).
     # Keeps tg= for backward compat with any external tooling.
-    local _tg_direct _tg_transport _tg_tier2 _tg_sec_lines _tier3_state
-    _tg_direct=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-    _tg_transport=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-    _tg_tier2=$(grep "^tg_tier2=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    local _tg_direct="${HEALTH_TG_DIRECT:-?}" _tg_transport="${HEALTH_TG_TRANSPORT:-?}"
+    local _tg_tier2="${HEALTH_TG_TIER2:-none}" _tg_sec_lines="${HEALTH_TG_SEC_LINES:-}" _tier3_state
     # tier3 (bot proxy) had no health signal anywhere: not here, not in the alert
     # state machine, not in the support bundle. When the bot kept dropping to
     # Direct there was no way to tell whether the custom proxy had even answered.
     # Derive it from the latency probe: a measured value means it responded.
     if [ -n "$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)" ]; then
-        _tier3_state=$(grep "^tier3=" "$SOCKS_PROBE_FILE" 2>/dev/null | cut -d= -f2 | cut -d' ' -f1)
+        _tier3_state=""
+        if [ -f "$SOCKS_PROBE_FILE" ]; then
+            while IFS='=' read -r _sk _sv; do
+                [ "$_sk" = "tier3" ] || continue
+                _tier3_state=${_sv%% *}
+                break
+            done < "$SOCKS_PROBE_FILE"
+        fi
         case "${_tier3_state:-}" in
             '')        _tier3_state="unknown" ;;
             timeout)   _tier3_state="fail" ;;
@@ -4941,18 +4987,16 @@ _write_socks_state() {
     else
         _tier3_state="none"
     fi
-    # Forward per-section TG results so Tunnel Health can read them from SOCKS_STATE_FILE
-    _tg_sec_lines=$(grep "^tg_sec_" "$HEALTH_STATE_FILE" 2>/dev/null)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
-    # Authoritative long-poll route is in POLL_ROUTE_KEY_FILE, written by POLL only.
-    printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%s\n' \
-        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$_tier3_state" "$2" "$3" \
-        "${_tg_sec_lines}" > "$SOCKS_STATE_FILE"
-    local _sr_poll _sr_poll_name _sr_fast _sr_fast_name
-    _sr_poll=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
-    _sr_poll_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo unknown)
-    _sr_fast=$(cat "$FAST_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
-    _sr_fast_name=$(cat "$FAST_ROUTE_FILE" 2>/dev/null || echo unknown)
+    # Authoritative route files are tiny; read them with ash builtins.
+    printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%b\n' \
+        "$1" "$_tg_direct" "$_tg_transport" "$_tg_tier2" "$_tier3_state" "$2" "$3" \
+        "$_tg_sec_lines" > "$SOCKS_STATE_FILE"
+    local _sr_poll=unknown _sr_poll_name=unknown _sr_fast=unknown _sr_fast_name=unknown
+    [ -f "$POLL_ROUTE_KEY_FILE" ] && IFS= read -r _sr_poll < "$POLL_ROUTE_KEY_FILE"
+    [ -f "$POLL_ROUTE_FILE" ] && IFS= read -r _sr_poll_name < "$POLL_ROUTE_FILE"
+    [ -f "$FAST_ROUTE_KEY_FILE" ] && IFS= read -r _sr_fast < "$FAST_ROUTE_KEY_FILE"
+    [ -f "$FAST_ROUTE_FILE" ] && IFS= read -r _sr_fast_name < "$FAST_ROUTE_FILE"
     printf 'poll_route=%s\npoll_route_name=%s\nfast_route=%s\nfast_route_name=%s\n' \
         "$_sr_poll" "$_sr_poll_name" "$_sr_fast" "$_sr_fast_name" >> "$SOCKS_STATE_FILE"
 }
@@ -5969,9 +6013,7 @@ start_health_daemon() {
                 fi
             fi
             # TG is "reachable" if either path works (direct OK or transport OK).
-            local _tgd _tgt
-            _tgd=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-            _tgt=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            local _tgd="${HEALTH_TG_DIRECT:-?}" _tgt="${HEALTH_TG_TRANSPORT:-?}"
             curr_tg_state="${_tgd}/${_tgt}"
             if [ "$_tgd" = "ok" ] || [ "$_tgt" = "ok" ]; then
                 tg_fail_streak=0
@@ -17495,7 +17537,7 @@ $_upd_flat
 EOF
         [ -z "$id" ] && continue
         offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
-        text=$(printf '%s' "$_raw_text")
+        text="$_raw_text"
         [ "$message_thread_id" = "null" ] && message_thread_id=""
 
         [ -z "$BOT_USERNAME" ] && load_bot_identity >/dev/null 2>&1
@@ -17688,7 +17730,7 @@ EOF
                     esac
                 fi
             fi
-            safe_text=$(echo "$_audit_text" | tr '\n' ' ' | tr '|' '_')
+            safe_text=$(printf '%s' "$_audit_text" | tr '\n|' ' _')
             echo "${now}|${u_name:-Unknown}|${safe_text}" > "$LAST_CMD_FILE"
 
             set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
