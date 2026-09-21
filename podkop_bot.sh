@@ -709,23 +709,33 @@ CB_ANSWER_TEXT=""
 # option section='<parent>'. These helpers are read-only and never create legacy
 # parent options.
 forkop_children_by_type_and_owner() {
-    local _type="$1" _parent="$2" _child _owner
+    local _type="$1" _parent="$2"
     [ "$PODKOP_VARIANT" = "forkop" ] || return 1
-    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$_type" '
+    # One UCI dump is enough: collect section type + owner in the same awk pass.
+    # Preserve declaration order because child ordering is user-visible elsewhere.
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$_type" -v want="$_parent" '
         {
+            k=$1
+            sub("^" p, "", k)
             v=$2
             gsub(/\047/, "", v)
-            if (v == t) {
-                k=$1
-                sub("^" p, "", k)
-                print k
+            dot=index(k, ".")
+            if (!dot) {
+                order[++n]=k
+                type[k]=v
+            } else {
+                sec=substr(k, 1, dot-1)
+                opt=substr(k, dot+1)
+                if (opt == "section") owner[sec]=v
             }
         }
-    ' | while IFS= read -r _child; do
-        [ -n "$_child" ] || continue
-        _owner=$(uci -q get "${PODKOP_UCI}.${_child}.section" 2>/dev/null)
-        [ "$_owner" = "$_parent" ] && printf '%s\n' "$_child"
-    done
+        END {
+            for (i=1; i<=n; i++) {
+                sec=order[i]
+                if (type[sec] == t && owner[sec] == want) print sec
+            }
+        }
+    '
 }
 
 forkop_child_count() {
@@ -1433,14 +1443,11 @@ url_decode() {
 _resolve_mixed_listen_ip_by_port() {
     local _port="$1" _ip=""
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
-        _ip=$(jq -r --arg p "$_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
-        [ -z "$_ip" ] && _ip=$(jq -r --arg p "$_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
+        _ip=$(jq -r --arg p "$_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
     fi
     case "$_ip" in
         ""|0.0.0.0|::|"[::]") uci -q get network.lan.ipaddr 2>/dev/null || echo "127.0.0.1" ;;
@@ -1453,15 +1460,11 @@ get_proxy_ip() {
     sec=$(get_active_section)
     m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
-        sb_ip=$(jq -r --arg p "$m_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
-        # Fallback: match any inbound on that port regardless of type
-        [ -z "$sb_ip" ] && sb_ip=$(jq -r --arg p "$m_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
+        sb_ip=$(jq -r --arg p "$m_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
         if [ -n "$sb_ip" ]; then
             if [ "$sb_ip" = "0.0.0.0" ] || [ "$sb_ip" = "::" ]; then
                 lan_ip=$(uci -q get network.lan.ipaddr)
@@ -1569,9 +1572,46 @@ _try_curl() {
 # Returns section name via stdout; falls back to active section then "main".
 _resolve_primary_section() {
     local _s _me _en _sec=""
-    local _all
-    _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep -E '^[^.]+\.[^.=]+=section$' \
+    local _all="${1:-}"
+    [ -n "$_all" ] || _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+        | grep -E '^[^.]+\.[^.=]+=section
+    for _s in $_all; do
+        section_is_proxy "$_s" || continue
+        # Skip disabled sections: enabled=0 with mixed_proxy_enabled=1 does not
+        # carry live transport and must not be picked as primary (also improves
+        # tier1 transport selection).
+        _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
+        [ -z "$_en" ] && _en=1
+        [ "$_en" = "1" ] || continue
+        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
+        if [ "$_me" = "1" ]; then
+            _sec="$_s"; break
+        fi
+    done
+    [ -z "$_sec" ] && _sec=$(get_active_section)
+    [ -z "$_sec" ] && _sec="main"
+    echo "$_sec"
+}
+
+
+# Call at the top of each transport function.
+# IMPORTANT: tier1 is always the PRIMARY proxy section (connection_type=proxy,
+# mixed_proxy_enabled=1), NOT the active UI section. Active section affects which
+# proxies are managed in the bot UI, but bot transport to Telegram must use the
+# main tunnel, not e.g. awg_main/WARP which may not route Telegram.
+# ── Fallback-proxy record helpers ────────────────────────────────────────────
+# A fallback_socks record may carry an optional local mnemonic after '#' and
+# optional user:pass credentials:  socks5h://user:pass@host:port#Name
+# ORDER MATTERS: strip '#mnemonic' FIRST, then work with the endpoint.
+#
+# _proxy_endpoint  — everything before the first '#' (goes into curl -x as-is,
+#                    credentials preserved — the bot needs them to connect).
+# _proxy_mnemonic  — everything after the first '#', or '' if none.
+# _mask_proxy      — hide the password for logs/UI: user:pass@ -> user:***@
+# _ru_plural COUNT ONE FEW MANY — Russian numeral agreement.
+# "1 страна", "2 страны", "5 стран". Printing the noun unchanged after a number
+# reads as machine translation, and it is the first thing a Russian reader trips
+# over. 11-14 are the exception that a naive last-digit rule gets wrong. \
         | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     for _s in $_all; do
         section_is_proxy "$_s" || continue
@@ -1636,12 +1676,11 @@ _proxy_display() {
 _load_transport_ctx() {
     _t_policy=$(uci -q get podkop_bot.settings.transport || echo "auto")
 
-    # Find primary section via shared helper
-    local _primary_sec; _primary_sec=$(_resolve_primary_section)
-    local _all_secs
-    _all_secs=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+    # Enumerate sections once. The primary resolver consumes this same snapshot.
+    _t_all_secs=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
         | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
         | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
+    local _primary_sec; _primary_sec=$(_resolve_primary_section "$_t_all_secs")
 
     _t_sec="$_primary_sec"
     _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
@@ -1650,14 +1689,11 @@ _load_transport_ctx() {
     # Resolve actual listen IP from config.json for tier1
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
         local _sb_ip
-        _sb_ip=$(jq -r --arg p "$_t_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -1)
-        [ -z "$_sb_ip" ] && _sb_ip=$(jq -r --arg p "$_t_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -1)
+        _sb_ip=$(jq -r --arg p "$_t_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
         if [ -n "$_sb_ip" ]; then
             [ "$_sb_ip" = "0.0.0.0" ] || [ "$_sb_ip" = "::" ] || _t_ip="$_sb_ip"
         fi
@@ -1671,15 +1707,18 @@ _load_transport_ctx() {
     local _fb_raw
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
+    _t_explicit_fb_socks=""
+    _t_auto_socks=""
     if [ -n "$_fb_raw" ]; then
         { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
-        _t_fb_socks="$*"
+        _t_explicit_fb_socks="$*"
+        _t_fb_socks="$_t_explicit_fb_socks"
     fi
 
     # Auto-add mixed_proxy from OTHER sections as additional fallback tiers.
     # Each section with mixed_proxy_enabled=1 and a different port = independent
     # transport path (e.g. awg_main/WARP on 2081 can reach Telegram even if main/2080 fails).
-    for _s in $_all_secs; do
+    for _s in $_t_all_secs; do
         [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
         local _me _mp _ct
         _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
@@ -1694,7 +1733,10 @@ _load_transport_ctx() {
         for _ex in $_t_fb_socks; do
             [ "$(_proxy_endpoint "$_ex")" = "$_auto_fb" ] && { _already=1; break; }
         done
-        [ "$_already" = "0" ] && _t_fb_socks="${_t_fb_socks:+$_t_fb_socks }${_auto_fb}"
+        if [ "$_already" = "0" ]; then
+            _t_fb_socks="${_t_fb_socks:+$_t_fb_socks }${_auto_fb}"
+            _t_auto_socks="${_t_auto_socks:+$_t_auto_socks }${_s}|${_auto_fb}"
+        fi
     done
 }
 
@@ -2202,11 +2244,10 @@ _try_all_tiers() {
 # $1=curl_args  $2=max_time  $3=ct_sticky  $4=ct_full  $5=route_var (LAST_ROUTE_FAST|LAST_ROUTE_POLL)
 # Updates the named route variable and LAST_ROUTE/LAST_ROUTE_NAME (for UI display).
 _route_request() {
-    local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5"
+    local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5" _ctx_loaded="${6:-0}"
     local _last ROUTE_KEY ROUTE_NAME
 
-
-    _load_transport_ctx
+    [ "$_ctx_loaded" = "1" ] || _load_transport_ctx
     case "$_rvar" in
         LAST_ROUTE_POLL) _reprobe_file="$POLL_REPROBE_TS_FILE" ;;
         *)               _reprobe_file="$FAST_REPROBE_TS_FILE" ;;
@@ -2402,7 +2443,7 @@ _route_request() {
 # api_request_fast: sendMessage, editMessageText, answerCallbackQuery, deleteMessage
 # connect-timeout: 2s sticky / 3s full   max-time: 8s
 api_request_fast() {
-    local method="$1" payload="$2" max_time="${3:-8}" tmp final_args
+    local method="$1" payload="$2" max_time="${3:-8}" tmp final_args _ctx_loaded=0
     _ROUTE_PROFILE="fast"
     API_RESPONSE=""
     tmp=$(mktemp /tmp/podkop_req.XXXXXX 2>/dev/null) || return 1
@@ -2411,6 +2452,7 @@ api_request_fast() {
     # Recovery mode: try SOCKS tiers first before sticky (mirrors api_poll_long behaviour)
     if [ "${FAST_RECOVERY_MODE:-0}" -gt 0 ]; then
         _load_transport_ctx
+        _ctx_loaded=1
         local ROUTE_KEY ROUTE_NAME
         # Use reduced max_time so all SOCKS tiers fit within one fast request budget.
         # Default max_time=8s with ct=3s means tier1 alone can consume all 8s before
@@ -2430,7 +2472,7 @@ api_request_fast() {
             logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
         fi
     fi
-    if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST"; then
+    if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST" "$_ctx_loaded"; then
         _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
     fi
     _restore_poll_compat; rm -f "$tmp"; return 1
@@ -2442,14 +2484,15 @@ api_request() { api_request_fast "$@"; }
 # connect-timeout: 3s sticky / 4s full   max-time: 65s (50s poll + buffer)
 # Recovery mode: if POLL_RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
 api_poll_long() {
-    local offset="$1" poll_timeout="${2:-50}"
+    local offset="$1" poll_timeout="${2:-50}" _ctx_loaded=0
     _ROUTE_PROFILE="poll"
     local args="-X GET ${API_URL}/getUpdates?offset=${offset}&timeout=${poll_timeout}"
     API_RESPONSE=""
-    _load_transport_ctx
 
     # Recovery mode: aggressively try SOCKS tiers, skip sticky
     if [ "$POLL_RECOVERY_MODE" -gt 0 ]; then
+        _load_transport_ctx
+        _ctx_loaded=1
         POLL_RECOVERY_MODE=$((POLL_RECOVERY_MODE - 1))
         logger -t podkop-bot "[Transport] Probing SOCKS tiers (recovery mode)..."
         local ROUTE_KEY ROUTE_NAME
@@ -2465,7 +2508,7 @@ api_poll_long() {
         # SOCKS still down in recovery — fall through to full cascade
     fi
 
-    _route_request "$args" "65" "5" "6" "LAST_ROUTE_POLL"
+    _route_request "$args" "65" "5" "6" "LAST_ROUTE_POLL" "$_ctx_loaded"
 }
 
 # api_poll: backward-compat wrapper
@@ -2951,28 +2994,23 @@ is_reply_to_bot() {
 # _validate_kb: check reply_markup JSON is valid before passing to jq --argjson.
 # Invalid kb silently kills the whole jq payload, leaving the card un-sent.
 # On failure: logs the bad JSON with calling context, clears kb so card sends without buttons.
-_validate_kb() {
-    local _kb="$1" _ctx="${2:-unknown}"
-    [ -z "$_kb" ] || [ "$_kb" = "null" ] && return 0
-    if ! printf '%s' "$_kb" | jq -e . >/dev/null 2>&1; then
-        logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${_ctx}): $(printf '%s' "$_kb" | head -c 120)"
-        return 1
-    fi
-    return 0
-}
 
 send_message() {
-    local txt="$1" kb="$2" payload resp new_mid
-    _validate_kb "$kb" "${cmd:-send}" || kb=""
+    local txt="$1" kb="$2" payload="" resp new_mid
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" --argjson kb "$kb" \
-                '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber),reply_markup:$kb}')
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber),reply_markup:$kb}' 2>/dev/null) || payload=""
         else
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --argjson kb "$kb" \
-                '{chat_id:$cid,text:$txt,parse_mode:"HTML",reply_markup:$kb}')
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML",reply_markup:$kb}' 2>/dev/null) || payload=""
         fi
-    else
+        if [ -z "$payload" ]; then
+            logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${cmd:-send}): $(printf '%s' "$kb" | head -c 120)"
+            kb=""
+        fi
+    fi
+    if [ -z "$kb" ] || [ "$kb" = "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" \
                 '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber)}')
@@ -2997,13 +3035,17 @@ send_message() {
 }
 
 edit_message() {
-    local mid="$1" txt="$2" kb="$3" payload
+    local mid="$1" txt="$2" kb="$3" payload=""
     [ -z "$mid" ] && { send_message "$txt" "$kb"; return; }
-    _validate_kb "$kb" "${cmd:-edit}" || kb=""
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" --argjson kb "$kb" \
-            '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}')
-    else
+            '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}' 2>/dev/null) || payload=""
+        if [ -z "$payload" ]; then
+            logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${cmd:-edit}): $(printf '%s' "$kb" | head -c 120)"
+            kb=""
+        fi
+    fi
+    if [ -z "$kb" ] || [ "$kb" = "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" \
             '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML"}')
     fi
@@ -4685,21 +4727,24 @@ _traffic_stats_init() {
 _traffic_accum_tick() {
     local _conn _cur_dl _cur_ul
     _conn=$(clash_request "/connections" 2>/dev/null)
-    _cur_dl=$(printf '%s' "$_conn" | jq -r '.downloadTotal // empty' 2>/dev/null)
-    _cur_ul=$(printf '%s' "$_conn" | jq -r '.uploadTotal // empty' 2>/dev/null)
+    local _traffic_totals
+    _traffic_totals=$(printf '%s' "$_conn" | jq -r '[.downloadTotal // "", .uploadTotal // ""] | map(tostring) | join("|")' 2>/dev/null)
+    IFS='|' read -r _cur_dl _cur_ul <<EOF
+$_traffic_totals
+EOF
     case "$_cur_dl" in ''|*[!0-9]*) return 1 ;; esac
     case "$_cur_ul" in ''|*[!0-9]*) return 1 ;; esac
 
     local _banked_dl=0 _banked_ul=0 _last_dl=0 _last_ul=0 _last_pid=""
     if [ -s "$TRAFFIC_ACCUM_FILE" ]; then
-        _banked_dl=$(awk -F'|' '{print $1+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _banked_ul=$(awk -F'|' '{print $2+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _last_dl=$(awk -F'|' '{print $3+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _last_ul=$(awk -F'|' '{print $4+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        # 5th field added later; absent in accumulators written by older versions.
-        _last_pid=$(awk -F'|' '{print $5}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null | tr -d ' \n\r')
+        IFS='|' read -r _banked_dl _banked_ul _last_dl _last_ul _last_pid < "$TRAFFIC_ACCUM_FILE"
+        case "$_banked_dl" in ''|*[!0-9]*) _banked_dl=0 ;; esac
+        case "$_banked_ul" in ''|*[!0-9]*) _banked_ul=0 ;; esac
+        case "$_last_dl" in ''|*[!0-9]*) _last_dl=0 ;; esac
+        case "$_last_ul" in ''|*[!0-9]*) _last_ul=0 ;; esac
     fi
-    local _cur_pid; _cur_pid=$(pgrep -f "sing-box run" 2>/dev/null | head -1)
+    local _cur_pid; _cur_pid=$(pidof sing-box 2>/dev/null)
+    _cur_pid=${_cur_pid%% *}
     case "$_cur_pid" in ''|*[!0-9]*) _cur_pid="" ;; esac
 
     if [ "$_cur_dl" -ge "$_last_dl" ] 2>/dev/null && [ "$_cur_ul" -ge "$_last_ul" ] 2>/dev/null; then
@@ -4745,6 +4790,7 @@ _traffic_accum_tick() {
 # Return value: 0 if either path succeeded, 1 if both failed.
 # Does NOT touch LAST_ROUTE_* — uses its own independent curl sessions.
 check_health() {
+    local _ctx_loaded="${1:-0}"
     local tmp_resp _direct=fail _transport=fail _tier2=fail
     local _sec _port _ip
 
@@ -4797,12 +4843,8 @@ check_health() {
     #  (1) ip:port from _load_transport_ctx (reads actual listen addr from
     #      sing-box config.json, unlike raw network.lan.ipaddr);
     #  (2) same curl syntax as the poll (-x socks5h://), not --socks5-hostname.
-    _load_transport_ctx
+    [ "$_ctx_loaded" = "1" ] || _load_transport_ctx
     local _primary_sec="$_t_sec"
-    local _all_secs_h
-    _all_secs_h=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
-        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     _port="$_t_port"
     _ip="$_t_ip"
     tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
@@ -4815,9 +4857,7 @@ check_health() {
     # A3: probe all fallback paths — explicit fallback_socks + other sections mixed_proxy
     # Run all probes in parallel (background subshells) to avoid timeout accumulation.
     # Pattern: same as refresh_public_ip_cache() and cmd_all_delay_test.
-    local _fb_raw _fb_list="" _tier2_results="" _tier2=none
-    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    [ -n "$_fb_raw" ] && { { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }; _fb_list="$*"; }
+    local _fb_list="${_t_explicit_fb_socks:-}" _tier2_results="" _tier2=none
 
     # Build probe list: [label, endpoint] pairs written to tmpfiles in parallel
     local _probe_dir; _probe_dir=$(mktemp -d /tmp/podkop_health_probes.XXXXXX) || { _tier2=none; }
@@ -4835,24 +4875,13 @@ check_health() {
         _probe_any=1
     done
 
-    # other sections mixed_proxy — parallel, skip duplicates vs explicit fallback_socks
-    for _s in $_all_secs_h; do
-        [ "$_s" = "$_primary_sec" ] && continue
-        local _me _mp
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
-        [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_port" ] || continue
-        # Skip if already in explicit fallback_socks list (duplicate check by endpoint)
-        local _auto_ip; _auto_ip=$(_resolve_mixed_listen_ip_by_port "$_mp")
-        local _auto_ep="socks5h://${_auto_ip}:${_mp}"
-        local _dup=0 _fbx
-        for _fbx in $_fb_list; do
-            [ "$(_proxy_endpoint "$_fbx")" = "$_auto_ep" ] && { _dup=1; break; }
-        done
-        [ "$_dup" = "1" ] && continue
+    # Auto-discovered mixed proxies were already resolved by _load_transport_ctx.
+    local _auto_rec _auto_ep
+    for _auto_rec in ${_t_auto_socks:-}; do
+        _s=${_auto_rec%%|*}
+        _auto_ep=${_auto_rec#*|}
         ( curl -s -k --connect-timeout 4 --max-time 8 \
-            --socks5-hostname "${_auto_ip}:${_mp}" \
-            -X GET "${API_URL}/getMe" 2>/dev/null \
+            -x "$_auto_ep" -X GET "${API_URL}/getMe" 2>/dev/null \
             | jq -e '.ok == true' >/dev/null 2>&1 \
             && echo "ok" || echo "fail" ) > "${_probe_dir}/sec_${_s}" &
         _pids="$_pids $!"
@@ -4870,8 +4899,8 @@ check_health() {
         [ -f "$_rf" ] && [ "$(cat "$_rf")" = "ok" ] && _tier2=ok || \
             { [ "$_tier2" = "none" ] && _tier2=fail; }
     done
-    for _s in $_all_secs_h; do
-        [ "$_s" = "$_primary_sec" ] && continue
+    for _auto_rec in ${_t_auto_socks:-}; do
+        _s=${_auto_rec%%|*}
         local _rf="${_probe_dir}/sec_${_s}"
         [ -f "$_rf" ] || continue
         local _sec_result; _sec_result=$(cat "$_rf")
@@ -5908,9 +5937,10 @@ start_health_daemon() {
                 fi
             fi
 
-            sec=$(get_active_section)
-            m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
-            m_ip=$(get_proxy_ip)
+            _load_transport_ctx
+            sec="$_t_sec"
+            m_port="$_t_port"
+            m_ip="$_t_ip"
 
             # ------------------------------------------------------------------
             # Check A: Telegram API connectivity.
@@ -5919,7 +5949,7 @@ start_health_daemon() {
             # Does NOT touch LAST_ROUTE_FAST/POLL — uses its own curl session.
             # Under RKN: direct fails, SOCKS succeeds → status "via SOCKS".
             # ------------------------------------------------------------------
-            check_health
+            check_health 1
             # check_health writes tg_direct= and tg_transport= to HEALTH_STATE_FILE.
 
             # Bank traffic + detect Перезапуски sing-box every tick (survives
@@ -17436,17 +17466,11 @@ while true; do
         i=$((i + 1))
         [ -z "$update" ] && continue
 
-        id=$(printf '%s' "$update" | jq -r '.update_id' 2>/dev/null)
-        [ -z "$id" ] && continue
-        offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
-
         # Single jq call — fields joined with U+001F (Unit Separator, not shell whitespace).
-        # @tsv used \t which is whitespace for read, causing field shift when callback_id empty.
-        # Fields: chat_id, chat_type, raw_text, callback_id, u_name, user_id,
-        #         is_bot_sender, sender_chat_id, sender_chat_type, sender_chat_title,
-        #         CALLBACK_MSG_ID, message_thread_id
+        # Update/document metadata rides in the same parse instead of extra jq calls.
         _upd_flat=$(printf '%s' "$update" | jq -r '
             [
+                (.update_id // ""),
                 (.message.chat.id // .callback_query.message.chat.id // ""),
                 (.message.chat.type // .callback_query.message.chat.type // ""),
                 (.message.text // .callback_query.data // ""),
@@ -17458,14 +17482,19 @@ while true; do
                 (.message.sender_chat.type // .callback_query.message.sender_chat.type // ""),
                 (.message.sender_chat.title // .callback_query.message.sender_chat.title // ""),
                 (.message.message_id // .callback_query.message.message_id // ""),
-                (.message.message_thread_id // .callback_query.message.message_thread_id // "")
-            ] | join("\u001f")
+                (.message.message_thread_id // .callback_query.message.message_thread_id // ""),
+                (.message.document.file_id // ""),
+                (.message.document.file_name // ""),
+                (.message.document.file_size // 0)
+            ] | map(tostring) | join("\u001f")
         ' 2>/dev/null)
-        IFS=$(printf '\037') read -r chat_id chat_type _raw_text callback_id u_name user_id \
+        IFS=$(printf '\037') read -r id chat_id chat_type _raw_text callback_id u_name user_id \
             is_bot_sender sender_chat_id sender_chat_type sender_chat_title \
-            CALLBACK_MSG_ID message_thread_id <<EOF
+            CALLBACK_MSG_ID message_thread_id _doc_file_id _doc_name _doc_size <<EOF
 $_upd_flat
 EOF
+        [ -z "$id" ] && continue
+        offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
         text=$(printf '%s' "$_raw_text")
         [ "$message_thread_id" = "null" ] && message_thread_id=""
 
@@ -17534,7 +17563,6 @@ EOF
         fi
 
         # ── Document handler: bot script upload ─────────────────────────────
-        _doc_file_id=$(printf '%s' "$update" | jq -r '.message.document.file_id // empty' 2>/dev/null)
         if [ -n "$_doc_file_id" ] && is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
             _cur_doc_state=$(head -n1 "$STATE_FILE" 2>/dev/null)
             _upload_uid=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
@@ -17550,8 +17578,6 @@ EOF
                 [ "$_cur_doc_state" = "wait_bot_script_file" ] && rm -f "$STATE_FILE"
                 continue
             fi
-            _doc_name=$(printf '%s' "$update" | jq -r '.message.document.file_name // empty' 2>/dev/null)
-            _doc_size=$(printf '%s' "$update" | jq -r '.message.document.file_size // 0' 2>/dev/null)
             case "$_doc_size" in ''|*[!0-9]*) _doc_size=0 ;; esac
             # The explicit upload session is already bound to admin + private chat
             # + chat/user IDs + TTL. Filename is cosmetic and must not be another
