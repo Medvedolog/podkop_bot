@@ -10993,19 +10993,26 @@ _ts_backend_status() { _ts_backend_call status '{}'; }
 _ts_backend_provider() { _ts_backend_status | jq -r '.provider // "none"' 2>/dev/null; }
 _ts_provider_kind() {
     local _p
-    _p=$(_ts_backend_provider 2>/dev/null)
-    case "$_p" in forkop-native|forkop-x|podkop) printf '%s' "$_p"; return 0 ;; esac
     if [ "$PODKOP_VARIANT" = "forkop" ]; then
-        # See tsnet-provider.sh:tsnet_provider() for why this checks
-        # usr/lib/forkop/singbox/servers.uc (the real installed path) and a
-        # live protocol='tailscale' UCI section, not usr/lib/singbox/servers.uc.
+        # Live Forkop evidence is authoritative over the optional LuCI backend.
+        # A standalone bot may be newer than the installed luci-app; older
+        # backends can report forkop-x even when full Forkop already owns a
+        # native protocol='tailscale' server. Never mark that live native section
+        # as legacy just because the helper is stale.
         if [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\.protocol='tailscale'\$"; then
             printf '%s' forkop-native
-        else
-            printf '%s' forkop-x
+            return 0
         fi
+        _p=$(_ts_backend_provider 2>/dev/null)
+        case "$_p" in
+            forkop-x) printf '%s' forkop-x ;;
+            *)        printf '%s' forkop-x ;;
+        esac
         return 0
     fi
+
+    _p=$(_ts_backend_provider 2>/dev/null)
+    case "$_p" in podkop) printf '%s' podkop; return 0 ;; esac
     [ "$PODKOP_VARIANT" = "original" ] && { printf '%s' podkop; return 0; }
     printf '%s' none
 }
