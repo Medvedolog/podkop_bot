@@ -1171,11 +1171,17 @@ get_singbox_version_display() {
     fi
     local ver=""
 
-    # 1. Backend writes version to a state file after each install — no process spawn.
-    #    Path is variant-specific: forkop → /etc/forkop, plus → /etc/podkop-plus.
-    local _sb_state="/etc/podkop-plus/sing-box-version"
-    [ "$PODKOP_VARIANT" = "forkop" ] && _sb_state="/etc/forkop/sing-box-version"
+    # 1. Prefer metadata/state written by the owning project. Forkop's installer
+    #    may manage sing-box as a standalone binary with no opkg/apk ownership;
+    #    its UI cache is therefore a first-class source, not merely a fallback.
+    local _sb_state="/etc/podkop-plus/sing-box-version" _sb_ui_state=""
+    if [ "$PODKOP_VARIANT" = "forkop" ]; then
+        _sb_state="/etc/forkop/sing-box-version"
+        _sb_ui_state="/var/run/forkop/ui-state/sing-box-version"
+    fi
     [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
+    [ -z "$ver" ] && [ -n "$_sb_ui_state" ] && [ -r "$_sb_ui_state" ] && \
+        ver=$(sed -n '1p' "$_sb_ui_state" 2>/dev/null)
 
     # 2. opkg (OpenWrt 24.10 and earlier)
     if [ -z "$ver" ] && command -v opkg >/dev/null 2>&1; then
