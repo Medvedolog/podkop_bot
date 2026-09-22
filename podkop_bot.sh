@@ -85,7 +85,11 @@ _detect_podkop_variant() {
 }
 
 _forkop_display_name() {
-    if [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\\.protocol='tailscale'\\$"; then
+    # Forkop X carries a dedicated migration helper; prefer this positive marker
+    # over absence-based guessing so updater/release links never cross forks.
+    if [ -r /usr/share/forkop/mirror-migration.sh ]; then
+        printf 'Forkop X'
+    elif [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\\.protocol='tailscale'$"; then
         printf 'Forkop'
     else
         printf 'Forkop X'
@@ -17507,14 +17511,15 @@ while true; do
         i=$((i + 1))
         [ -z "$update" ] && continue
 
-        # Single jq call — fields joined with U+001F (Unit Separator, not shell whitespace).
-        # Update/document metadata rides in the same parse instead of extra jq calls.
+        # Single extraction jq — fields joined with U+001F (Unit Separator, not shell whitespace).
+        # Text is base64-wrapped before shell read: embedded newlines must not shift
+        # callback/user/document fields (especially user_id) into the next line.
         _upd_flat=$(printf '%s' "$update" | jq -r '
             [
                 (.update_id // ""),
                 (.message.chat.id // .callback_query.message.chat.id // ""),
                 (.message.chat.type // .callback_query.message.chat.type // ""),
-                (.message.text // .callback_query.data // ""),
+                ((.message.text // .callback_query.data // "") | @base64),
                 (.callback_query.id // ""),
                 (.message.from.username // .callback_query.from.username // ""),
                 (.message.from.id // .callback_query.from.id // ""),
@@ -17529,14 +17534,14 @@ while true; do
                 (.message.document.file_size // 0)
             ] | map(tostring) | join("\u001f")
         ' 2>/dev/null)
-        IFS=$(printf '\037') read -r id chat_id chat_type _raw_text callback_id u_name user_id \
+        IFS=$(printf '\037') read -r id chat_id chat_type _raw_text_b64 callback_id u_name user_id \
             is_bot_sender sender_chat_id sender_chat_type sender_chat_title \
             CALLBACK_MSG_ID message_thread_id _doc_file_id _doc_name _doc_size <<EOF
 $_upd_flat
 EOF
         [ -z "$id" ] && continue
         offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
-        text="$_raw_text"
+        text=$(printf '%s' "$_raw_text_b64" | jq -rR '@base64d' 2>/dev/null)
         [ "$message_thread_id" = "null" ] && message_thread_id=""
 
         [ -z "$BOT_USERNAME" ] && load_bot_identity >/dev/null 2>&1
