@@ -43,7 +43,7 @@ BOT_VERSION="0.19.19"
 #   evolution (subscription_update CLI)     — .outbounds[] subscription cache
 #   netshift  (yandexru45/netshift fork)    — like evolution, netshift paths
 #   plus      (ushan0v/podkop-plus binary)  — action= field, see PLUS MODEL below
-#   forkop    (ushan0v/forkop)              — native child sections linked by option section
+#   forkop    (ushan0v/forkop or slayer326/forkop for Forkop X) — native child sections linked by option section
 # NOTE: paths here are intentionally hardcoded — PODKOP_* vars not yet set.
 #
 # PLUS MODEL (important — differs from original's single proxy_config_type):
@@ -102,7 +102,11 @@ _apply_variant_env() {
             PODKOP_BIN="/usr/bin/forkop"
             PODKOP_PKG="forkop"
             PODKOP_DISPLAY_NAME="$(_forkop_display_name)"
-            PODKOP_GITHUB_REPO="ushan0v/forkop"
+            if [ "$PODKOP_DISPLAY_NAME" = "Forkop X" ]; then
+                PODKOP_GITHUB_REPO="slayer326/forkop"
+            else
+                PODKOP_GITHUB_REPO="ushan0v/forkop"
+            fi
             PODKOP_INIT="/etc/init.d/forkop"
             PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
             ;;
