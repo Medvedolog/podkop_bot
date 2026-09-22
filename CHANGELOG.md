@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.19.19
+
+- **PERFORMANCE:** Forkop child-section discovery now collapses repeated UCI reads into a single `uci show | awk` pass on hot UI paths, reducing process churn when opening section/proxy/service screens.
+- **PERFORMANCE:** Telegram update parsing now extracts the commonly used update, callback and document fields in one `jq` pass instead of spawning several parsers per update.
+- **PERFORMANCE:** transport context is reused through FAST recovery, long polling and watchdog health checks where it was already loaded, avoiding duplicate UCI/config resolution during degraded-network paths.
+- **PERFORMANCE:** sing-box mixed/SOCKS inbound lookup now uses one `jq` pass.
+- **TRANSPORT:** explicit fallback SOCKS and automatically discovered section SOCKS are tracked separately before being assembled into the effective tier2 chain, preserving source/order semantics.
+- **FIXED (callback UI):** an ambiguous `editMessageText` timeout no longer falls back to `sendMessage`. Telegram may already have applied the edit before the response is lost; creating a new message in that case produced duplicate cards such as Proxy, Services and Podkop Management.
+- **FIXED (menu keyboard):** opening the section list no longer clears the persistent reply-keyboard installation marker, which previously caused repeated “Menu buttons updated” messages on later returns to the main menu.
+- **CI/INTEGRITY:** source guards cover the optimized hot paths and the vendored bot checksum contract remains enforced. The LuCI package and standalone `podkop_bot.sh` are synchronized byte-for-byte for this dev baseline.
+
+---
+## v0.19.18
+
+- **Tailscale / multi-provider baseline:** retained the stabilized multiprovider/Tailscale work that preceded 0.19.19, including Forkop-oriented service handling and transport integration used by the current dev branch.
+
+---
 ## v0.19.17
 
 - **FIXED (state machine):** persistent reply-keyboard Status now escapes pending text input. Previously, while a flow such as `wait_admin_id` was active, pressing Status could be consumed as `STATE_INPUT` and validated as a Telegram ID, producing “Invalid ID”. `cmd_status` now clears the pending state and dispatches the normal Status handler.
