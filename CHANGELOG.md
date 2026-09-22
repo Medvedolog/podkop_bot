@@ -10,6 +10,7 @@
 - **FIXED (callback UI):** an ambiguous `editMessageText` timeout no longer falls back to `sendMessage`. Telegram may already have applied the edit before the response is lost; creating a new message in that case produced duplicate cards such as Proxy, Services and Podkop Management.
 - **FIXED (menu keyboard):** opening the section list no longer clears the persistent reply-keyboard installation marker, which previously caused repeated “Menu buttons updated” messages on later returns to the main menu.
 - **FIXED (Forkop X updates):** when the detected flavour is Forkop X, version checks, release links and updater source now use `slayer326/forkop`; full Forkop continues to use `ushan0v/forkop`.
+- **FIXED (Forkop native Tailscale):** live native evidence (`/usr/lib/forkop/singbox/servers.uc` or an existing `protocol='tailscale'` section) now overrides a stale LuCI backend provider hint. Updating only the standalone bot can no longer mislabel a working full-Forkop Tailscale section as legacy Forkop X.
 - **CI/INTEGRITY:** source guards cover the optimized hot paths and the vendored bot checksum contract remains enforced. The LuCI package and standalone `podkop_bot.sh` are synchronized byte-for-byte for this dev baseline.
 
 ---
