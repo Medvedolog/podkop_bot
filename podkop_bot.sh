@@ -3038,13 +3038,30 @@ edit_message() {
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" \
             '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML"}')
     fi
-    local resp _tg_desc
+    local resp _tg_desc _tg_code
     resp=$(api_request "editMessageText" "$payload")
     if printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
         return 0
     fi
-    _tg_desc=$(printf '%s' "$resp" | jq -r '.description // "no Telegram response"' 2>/dev/null)
-    logger -t podkop-bot "[Telegram] editMessageText failed: ${_tg_desc}"
+    _tg_desc=$(printf '%s' "$resp" | jq -r '.description // empty' 2>/dev/null)
+    _tg_code=$(printf '%s' "$resp" | jq -r '.error_code // empty' 2>/dev/null)
+
+    # Telegram returns 400 when the requested text/markup is already current.
+    # Treat that as success: replacing the card would be a duplicate.
+    case "$_tg_desc" in
+        *"message is not modified"*)
+            return 0
+            ;;
+    esac
+
+    # Only explicit Telegram application errors justify replacing the card.
+    # Empty/invalid response means the transport result is unknown: the edit may
+    # already have been applied server-side, so the caller must not send a copy.
+    if [ -n "$_tg_code" ]; then
+        logger -t podkop-bot "[Telegram] editMessageText rejected: code=${_tg_code} description=${_tg_desc:-unknown}"
+        return 2
+    fi
+    logger -t podkop-bot "[Telegram] editMessageText outcome unknown: no Telegram response"
     return 1
 }
 
@@ -3124,10 +3141,16 @@ send_or_edit() {
             rm -f "$LAST_ALERT_MSG_FILE"
             send_message "$txt" "$kb"
         else
-            # If Telegram rejects editing (for example because of malformed HTML
-            # or an expired/inaccessible message), send a fresh card instead of
-            # leaving the user forever on “Формируем…”.
-            edit_message "$mid" "$txt" "$kb" || send_message "$txt" "$kb"
+            # Only fall back to a fresh card when Telegram explicitly confirms
+            # that this message cannot be edited. A transport timeout is ambiguous:
+            # Telegram may already have applied the edit, and sendMessage here would
+            # create a duplicate card.
+            edit_message "$mid" "$txt" "$kb"
+            case $? in
+                0) ;;
+                2) send_message "$txt" "$kb" ;;
+                *) logger -t podkop-bot "[UI] editMessageText outcome unknown; keeping current card to avoid duplicate" ;;
+            esac
         fi
     else
         send_message "$txt" "$kb"
@@ -6486,7 +6509,6 @@ _handle_sections() {
     case "$cmd" in
         "sections_menu")
             rm -f "$STATE_FILE"
-    rm -f "$REPLY_KB_INSTALLED_FILE"  # Force re-install reply keyboard after restart
             local sections rows s text kb _sdisp
             # uci show gives "podkop.NAME=section" for section objects.
             # Correct pattern matches lines ending in =section exactly.
