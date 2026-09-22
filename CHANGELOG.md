@@ -14,7 +14,11 @@
 ---
 ## v0.19.18
 
-- **Tailscale / multi-provider baseline:** retained the stabilized multiprovider/Tailscale work that preceded 0.19.19, including Forkop-oriented service handling and transport integration used by the current dev branch.
+- **TRANSPORT:** added WARP Rescue as a real tier between the configured bot proxy and Direct, exposed it in the connection-chain UI, kept POLL on healthy proxy paths, and made WARP recovery non-blocking with bounded long-poll hold time.
+- **TRANSPORT:** local Clash API access is kept outside the Bearhole/proxy path so router-local status/proxy operations do not depend on the external route they are inspecting.
+- **UPLOADS:** manual bot-script upload accepts valid scripts even when the user renamed the file; validation is based on size/content/session security rather than filename cosmetics.
+- **WATCHDOG:** fast sing-box PID restarts are detected and alerted, while restart accounting remains single-owned so one real restart is not counted twice.
+- **TAILSCALE/TSNET:** added the preflight that prevents tsnet management from colliding with a standalone `tailscaled`, then synchronized the multiprovider tsnet integration and legacy Forkop X cleanup paths.
 
 ---
 ## v0.19.17
