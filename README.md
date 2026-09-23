@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.17
+# 🤖 podkop_bot 0.19.19
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.17-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.19.19-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -19,7 +19,7 @@
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
-Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`.
+Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`, а также его форк **[Forkop X](https://github.com/slayer326/forkop)** (slayer326). Forkop и Forkop X бот различает сам: проверка версии, ссылки на releases и обновление идут в репозиторий именно того форка, который установлен.
 
 > 🇷🇺 **Интерфейс бота — русский.** Начиная с v0.18.x все кнопки, карточки и уведомления переведены; переключателя языка нет, английской версии интерфейса тоже. Английскими остаются только технические термины, которые переводить и не стоит: названия протоколов, поля UCI, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`. Старые английские команды (`Menu`, `Status`) бот по-прежнему понимает — если у вас в чате осталась клавиатура от прежней версии, она не сломается.
 
@@ -74,7 +74,7 @@
 ```text
 🖥️ Управление Podkop
 Устройство: AX6000
-Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.17
+Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.19
 Секция: main
 Активный прокси: 🇳🇱 NL-vless-reality (main-1-out)
 Подключение бота: Podkop (SOCKS5:192.168.2.1:2080)
@@ -446,20 +446,22 @@ ash install.sh --unattended --action update-luci
   * замер скорости в два этапа: 32 KB (ловит обрыв на старте) и 1 MB (собственно скорость)
 * **📋 Отчёт для поддержки** — конфиг UCI, маршруты, nft и системный журнал одной кнопкой
 
-### 🖧 Службы (только Plus и Forkop)
+### 🖧 Службы (Podkop, Plus и Forkop)
 
 * Live статус всех серверных инстансов из UCI (`type=server` секции podkop-plus)
 * Поддерживаемые протоколы: **VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale**
 * Для каждого инстанса: протокол, порт, публичный хост, режим безопасности (Reality/TLS/none) + SNI, режим маршрутизации
 * Статус порта: 🟢 слушает (TCP+UDP) · 🟡 включено в UCI, порт не обнаружен · ⚫ выключено
 * Tailscale: статус через процесс sing-box и state directory; IP смотрите в панели Tailscale
-* **Добавление узла Tailscale прямо из бота (только Forkop)** — спрашивает адрес контрол-сервера, pre-auth ключ и нужен ли выходной узел; на карточке появляются тумблеры «выходной узел» и «принимать маршруты». Требуется сборка sing-box `extended` либо собранная с тегом `with_tailscale`: бот проверяет это до записи и просто не показывает кнопку там, где она не сработает. Адрес контрол-сервера спрашивается всегда — по умолчанию он ведёт в облако Tailscale, а так же работает и свой сервер (Headscale, ionscale). Узел создаётся **выключенным**: включение — отдельное осознанное действие, потому что поднятие Tailscale-endpoint заставляет sing-box логиниться на контрол-сервер при старте и может временно оставить вас без связи
+* **Добавление узла Tailscale прямо из бота (Forkop, Forkop X, Podkop)** — спрашивает адрес контрол-сервера, pre-auth ключ и нужен ли выходной узел; на карточке появляются тумблеры «выходной узел» и «принимать маршруты». Требуется сборка sing-box `extended` либо собранная с тегом `with_tailscale`: бот проверяет это до записи и просто не показывает кнопку там, где она не сработает. Адрес контрол-сервера спрашивается всегда — по умолчанию он ведёт в облако Tailscale, а так же работает и свой сервер (Headscale, ionscale). Узел создаётся **выключенным**: включение — отдельное осознанное действие, потому что поднятие Tailscale-endpoint заставляет sing-box логиниться на контрол-сервер при старте и может временно оставить вас без связи
+* На полном Forkop узел — это нативная секция Forkop `protocol='tailscale'`. На Forkop X и классическом Podkop нативной модели нет: узел создаётся и управляется через backend веб-интерфейса [Podkop BearGuard](https://github.com/Medvedolog/luci-app-podkop-bearguard), который применяет Tailscale-endpoint к текущему конфигу sing-box. Кнопка «➕ Tailscale через sing-box» появляется только при установленном BearGuard (нужен его backend `podkop_bot_tailscale`) — на всех вариантах, включая полный Forkop. Podkop Plus в этом разделе только наблюдает: создать узел из бота на нём нельзя
 * Статистика соединений из Clash API (кол-во, ↓↑ трафик) при наличии
-* Кнопка в главном меню видна только на Podkop Plus
+* Кнопка в главном меню видна на Podkop, Podkop Plus и Forkop
 
 ### 🔔 Watchdog и алерты
 
-* Мониторинг `sing-box` (алерт при остановке и восстановлении)
+* Мониторинг `sing-box` (алерт при остановке и восстановлении, а также при быстром перезапуске со сменой PID)
+* **Защита от флаппинга sing-box** — первые два перезапуска за 10 минут приходят отдельными алертами; с третьего бот присылает одну сводку «sing-box флапает» и молчит, пока 10 минут не пройдут без перезапуска, после чего сообщает «sing-box стабилизировался» с общим числом. Частая причина такого цикла — нехватка ОЗУ (OOM-killer и повторный запуск через procd)
 * Мониторинг SOCKS upstream с гистерезисом
 * **Алерт смены прокси**: `🔀` с дебаунсом 120 сек — серия переключений группируется в одно сообщение, без спама при URLTest-флаппинге
 * TG connectivity мониторинг (`direct` + `tunnel SOCKS5` + `tier2` раздельно)
@@ -479,6 +481,7 @@ ash install.sh --unattended --action update-luci
 tier1   → Podkop SOCKS5 (основной туннель, primary proxy-секция)
 tier2_N → Fallback-прокси list (socks5:// / socks5h://, опц. user:pass@ и #Имя) + авто-секции с mixed_proxy
 tier3   → Custom Proxy
+WARP    → WARP Rescue (локальный SOCKS «револьвера» WARPSCOUT, если настроен в BearGuard)
 tier4   → Direct
 tier5   → Emergency Telegram IPs (обновляются через DoH)
 ```
@@ -607,16 +610,16 @@ MIT
 
 > ⚠️ **The bot's interface is Russian only.** Every button, card and alert has been in Russian since v0.18.x — there is no language switch and no English UI. Only technical terms stay in English (protocol names, UCI fields, `URLTest`, `SOCKS`, `DNS`, `YACD`, `sing-box`, `Zapret`, `ByeDPI`). This documentation and the changelog are bilingual; the bot itself is not.
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus) and [forkop](https://github.com/ushan0v/forkop) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour, subscription-source settings, existing URLTest child exclusions by country and proxy, ordered global DNS, `action=dns` sections, `label`, `sort_by_latency` and priority groups; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), [plus](https://github.com/ushan0v/podkop-plus), [forkop](https://github.com/ushan0v/forkop) (ushan0v) and [Forkop X](https://github.com/slayer326/forkop) (slayer326; version checks and updates follow the installed fork) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability. On Forkop, monitoring and diagnostics are at parity with Plus, and the bot writes natively to subscription URLs, section action, section conditions, detour, subscription-source settings, existing URLTest child exclusions by country and proxy, ordered global DNS, `action=dns` sections, `label`, `sort_by_latency` and priority groups; edits that would require creating or removing Forkop child sections stay read-only and direct you to LuCI rather than writing to fields the backend ignores.
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
 The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for [Podkop BearGuard](https://github.com/Medvedolog/luci-app-podkop-bearguard) (`luci-app-podkop-bot`) rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure). The same installer can also fetch and install Podkop BearGuard (`luci-app-podkop-bot`) itself (`--with-luci` flag, or standalone via `--action update-luci`) — a LuCI web UI for bot configuration and a browser-friendly Runtime Info view, for anyone who'd rather not do everything through Telegram.
 
-The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Меню | 📊 Статус`) is available at all times including during watchdog alerts.
+The bot maintains reachability through a tiered fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → WARP Rescue, when configured via Podkop BearGuard → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Меню | 📊 Статус`) is available at all times including during watchdog alerts.
 
 v0.19.0 introduced the **Forkop management MVP** — native writes for section conditions, cascade **detour** and **subscription source** settings, all guarded by transactional UCI writes (snapshot → commit → validate → automatic rollback on rejection). v0.19.7 added native **URLTest exclusions** for Forkop by country and by individual proxy, and v0.19.8 brought the same draft-and-apply picker to Podkop Plus, a dedicated menu for `action=dns` sections, ordered multi-DNS, `label`, `sort_by_latency`, a compact **Priority Groups** MVP, and traffic statistics that survive a reboot via a low-frequency UCI checkpoint (at most four flash writes a day). v0.19.9 protects that picker against concurrent edits: before applying, the draft's saved base is compared with current UCI, so a stale selection can no longer overwrite changes made meanwhile in LuCI.
 
-Adding a **Tailscale node from Telegram** is supported on Forkop, on sing-box builds that carry Tailscale support. The node is created disabled on purpose — bringing a Tailscale endpoint up makes sing-box log in to its control server during start, and the bot's own path to Telegram runs through that same backend.
+Adding a **Tailscale node from Telegram** is supported on Forkop (as a native Forkop server section) and on Forkop X and classic Podkop (the endpoint is applied to the live sing-box config), on sing-box builds that carry Tailscale support. In all cases the button requires the Podkop BearGuard backend (`podkop_bot_tailscale`) to be installed; Podkop Plus is observer-only. The node is created disabled on purpose — bringing a Tailscale endpoint up makes sing-box log in to its control server during start, and the bot's own path to Telegram runs through that same backend.
 
 Full [changelog](CHANGELOG.md) available.
