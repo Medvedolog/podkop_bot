@@ -6784,8 +6784,19 @@ SUBURLS
                 proxies=$(clash_request "/proxies")
             fi
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
-                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>Возможно, sing-box перезапускается. Повторите обновление через несколько секунд.</i>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+                # sing-box may be down precisely because of this section's config
+                # (dead subscription, bad manual link). Source edits are UCI-only,
+                # so keep them reachable here instead of dead-ending on Retry/Menu.
+                local _dn_kb="" _dn_hint=""
+                if section_is_subscription "$sec"; then
+                    _dn_kb="[{\"text\":\"✏ URL подписки\",\"callback_data\":\"cmd_edit_sub_url\"}],"
+                    _dn_hint="\n\nЕсли sing-box не стартует из-за подписки, URL можно заменить и без Clash API."
+                fi
+                if [ "$PODKOP_VARIANT" = "plus" ] || [ "$PODKOP_VARIANT" = "forkop" ] || ! section_is_subscription "$sec"; then
+                    _dn_kb="${_dn_kb}[{\"text\":\"${E_ADD} Прокси\",\"callback_data\":\"cmd_proxy_add\"}],"
+                fi
+                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>sing-box перезапускается или не смог запуститься с текущей конфигурацией.</i>%b' "$E_ERR" "$_dn_hint")" \
+                    "{\"inline_keyboard\":[${_dn_kb}[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
