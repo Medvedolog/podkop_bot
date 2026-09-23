@@ -1,7 +1,37 @@
 # Changelog
 
+## v0.19.19
+
+- **PERFORMANCE:** Forkop child-section discovery now collapses repeated UCI reads into a single `uci show | awk` pass on hot UI paths, reducing process churn when opening section/proxy/service screens.
+- **PERFORMANCE:** Telegram update parsing now extracts the commonly used update, callback and document fields in one `jq` pass instead of spawning several parsers per update.
+- **PERFORMANCE:** transport context is reused through FAST recovery, long polling and watchdog health checks where it was already loaded, avoiding duplicate UCI/config resolution during degraded-network paths.
+- **PERFORMANCE:** sing-box mixed/SOCKS inbound lookup now uses one `jq` pass.
+- **TRANSPORT:** explicit fallback SOCKS and automatically discovered section SOCKS are tracked separately before being assembled into the effective tier2 chain, preserving source/order semantics.
+- **FIXED (callback UI):** an ambiguous `editMessageText` timeout no longer falls back to `sendMessage`. Telegram may already have applied the edit before the response is lost; creating a new message in that case produced duplicate cards such as Proxy, Services and Podkop Management.
+- **FIXED (menu keyboard):** opening the section list no longer clears the persistent reply-keyboard installation marker, which previously caused repeated “Menu buttons updated” messages on later returns to the main menu.
+- **FIXED (Forkop X updates):** when the detected flavour is Forkop X, version checks, release links and updater source now use `slayer326/forkop`; full Forkop continues to use `ushan0v/forkop`.
+- **FIXED (Forkop native Tailscale):** live native evidence (`/usr/lib/forkop/singbox/servers.uc` or an existing `protocol='tailscale'` section) now overrides a stale LuCI backend provider hint. Updating only the standalone bot can no longer mislabel a working full-Forkop Tailscale section as legacy Forkop X.
+- **FIXED (Forkop sing-box version metadata):** version detection now reads Forkop's `/var/run/forkop/ui-state/sing-box-version` cache before package-manager fallbacks, so sing-box builds installed as standalone binaries by Forkop scripts are still identified.
+- **FIXED (Forkop flavour detection):** corrected the UCI regex end anchor and added `/usr/share/forkop/mirror-migration.sh` as a positive Forkop X marker, preventing updater/release links from drifting to the wrong fork when file layouts change.
+- **FIXED (multiline Telegram input):** update text is base64-wrapped inside the consolidated jq record before shell parsing, so embedded newlines no longer discard `user_id` and the remaining metadata.
+- **FIXED (Clash API down = no way out):** when sing-box could not start because of the section's own source (dead subscription, bad link), the Proxy screen stopped at "Clash API недоступен" with only Retry/Menu. The "✏ URL подписки" / "➕ Прокси" buttons lived only on the card that needs Clash. The Clash-unavailable card now carries those UCI-only actions (subscription URL for subscription sections; manual proxy where manual links are allowed), so the cause can be fixed from Telegram. Hardware-observed on Forkop and Podkop Plus.
+- **ALERTS (sing-box restart flap guard):** the first two sing-box PID changes within 10 minutes still alert individually. The third switches to one "sing-box флапает" summary and suppresses per-restart alerts until 10 minutes pass without a restart; then one "sing-box стабилизировался" message reports the total. Previously a restart loop (typically OOM-killer + procd respawn on a low-RAM router) produced one alert per restart.
+- **FIXED (stale sing-box version):** the sing-box version cache is keyed by the binary's inode:mtime:size, so a package swap (e.g. Forkop switching from `-extended` to the standard build) no longer leaves the weekly report showing the old version.
+- **CI/INTEGRITY:** source guards cover the optimized hot paths and the vendored bot checksum contract remains enforced. The LuCI package and standalone `podkop_bot.sh` are synchronized byte-for-byte for this dev baseline.
+
+---
+## v0.19.18
+
+- **TRANSPORT:** added WARP Rescue as a real tier between the configured bot proxy and Direct, exposed it in the connection-chain UI, kept POLL on healthy proxy paths, and made WARP recovery non-blocking with bounded long-poll hold time.
+- **TRANSPORT:** local Clash API access is kept outside the Bearhole/proxy path so router-local status/proxy operations do not depend on the external route they are inspecting.
+- **UPLOADS:** manual bot-script upload accepts valid scripts even when the user renamed the file; validation is based on size/content/session security rather than filename cosmetics.
+- **WATCHDOG:** fast sing-box PID restarts are detected and alerted, while restart accounting remains single-owned so one real restart is not counted twice.
+- **TAILSCALE/TSNET:** added the preflight that prevents tsnet management from colliding with a standalone `tailscaled`, then synchronized the multiprovider tsnet integration and legacy Forkop X cleanup paths.
+
+---
 ## v0.19.17
 
+- **FIXED (state machine):** persistent reply-keyboard Status now escapes pending text input. Previously, while a flow such as `wait_admin_id` was active, pressing Status could be consumed as `STATE_INPUT` and validated as a Telegram ID, producing “Invalid ID”. `cmd_status` now clears the pending state and dispatches the normal Status handler.
 - **ANTI-FLAP:** fixed false POLL demotion to emergency Direct routes when the independent Telegram follower sample was incorrectly considered stale. Follower freshness now follows its real cadence, preserving one-event hysteresis without changing authoritative POLL/FAST separation. Field rollout on multiple routers showed a sharp drop in route flapping.
 - **DIAGNOSTICS/UI:** the full Outbound check covers 12 external services, runs in background without blocking Telegram polling, and the dedicated Telegram Bot API check remains available as a separate Runtime action.
 - **SECURITY:** bot-script update/upload is restricted to the primary administrator in a private chat with a fresh 5-minute upload session; anonymous sender_chat access is opt-in and repeated unauthorized actors are rate-limited/temporarily blocked.

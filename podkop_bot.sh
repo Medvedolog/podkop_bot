@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.17
+# Podkop Telegram Bot v0.19.19
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -10,8 +10,8 @@
 # 'podkop' package (sing-box wrapper). Written in strict POSIX ash.
 #
 # KEY SUBSYSTEMS:
-# 1. 5-Tier Fallback Транспорт: Podkop SOCKS5 -> Резервные SOCKS -> Custom Proxy
-#    -> Direct -> Emergency IPs. Atomic IPC via mv for watchdog <-> main loop.
+# 1. Fallback Транспорт: Podkop SOCKS5 -> Резервные SOCKS -> Custom Proxy
+#    -> WARP Rescue -> Direct -> Emergency IPs. Atomic IPC via mv for watchdog <-> main loop.
 # 2. UCI Native Core: direct uci read/write, protected by flock.
 #    uci_list_clean + set -f replaces eval for safe list splitting.
 # 3. Dynamic State Machine: STATE_FILE for multi-step text inputs
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.17"
+BOT_VERSION="0.19.19"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -43,7 +43,7 @@ BOT_VERSION="0.19.17"
 #   evolution (subscription_update CLI)     — .outbounds[] subscription cache
 #   netshift  (yandexru45/netshift fork)    — like evolution, netshift paths
 #   plus      (ushan0v/podkop-plus binary)  — action= field, see PLUS MODEL below
-#   forkop    (ushan0v/forkop)              — native child sections linked by option section
+#   forkop    (ushan0v/forkop or slayer326/forkop for Forkop X) — native child sections linked by option section
 # NOTE: paths here are intentionally hardcoded — PODKOP_* vars not yet set.
 #
 # PLUS MODEL (important — differs from original's single proxy_config_type):
@@ -84,6 +84,18 @@ _detect_podkop_variant() {
     echo "original"
 }
 
+_forkop_display_name() {
+    # Forkop X carries a dedicated migration helper; prefer this positive marker
+    # over absence-based guessing so updater/release links never cross forks.
+    if [ -r /usr/share/forkop/mirror-migration.sh ]; then
+        printf 'Forkop X'
+    elif [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\\.protocol='tailscale'$"; then
+        printf 'Forkop'
+    else
+        printf 'Forkop X'
+    fi
+}
+
 # _apply_variant_env: re-applies all variant-dependent variables after
 # _detect_podkop_variant() runs. Called after do_update_podkop to handle
 # podkop-evolution → NetShift migration in the same session.
@@ -93,8 +105,12 @@ _apply_variant_env() {
             PODKOP_UCI="forkop"
             PODKOP_BIN="/usr/bin/forkop"
             PODKOP_PKG="forkop"
-            PODKOP_DISPLAY_NAME="Forkop"
-            PODKOP_GITHUB_REPO="ushan0v/forkop"
+            PODKOP_DISPLAY_NAME="$(_forkop_display_name)"
+            if [ "$PODKOP_DISPLAY_NAME" = "Forkop X" ]; then
+                PODKOP_GITHUB_REPO="slayer326/forkop"
+            else
+                PODKOP_GITHUB_REPO="ushan0v/forkop"
+            fi
             PODKOP_INIT="/etc/init.d/forkop"
             PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
             ;;
@@ -533,7 +549,7 @@ _write_route_state() {
             LAST_ROUTE_POLL="$_key"
             LAST_ROUTE_POLL_NAME="$_name"
             case "$_key" in
-                tier1|tier2_*|tier3) POLL_PROXY_FAIL_STREAK=0 ;;
+                tier1|tier2_*|tier3|warp_rescue) POLL_PROXY_FAIL_STREAK=0 ;;
             esac
             LAST_ROUTE="$_key"
             LAST_ROUTE_NAME="$_name"
@@ -701,23 +717,66 @@ CB_ANSWER_TEXT=""
 # option section='<parent>'. These helpers are read-only and never create legacy
 # parent options.
 forkop_children_by_type_and_owner() {
-    local _type="$1" _parent="$2" _child _owner
+    local _type="$1" _parent="$2"
     [ "$PODKOP_VARIANT" = "forkop" ] || return 1
-    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$_type" '
+    # One UCI dump is enough: collect section type + owner in the same awk pass.
+    # Preserve declaration order because child ordering is user-visible elsewhere.
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$_type" -v want="$_parent" '
         {
+            k=$1
+            sub("^" p, "", k)
             v=$2
             gsub(/\047/, "", v)
-            if (v == t) {
-                k=$1
-                sub("^" p, "", k)
-                print k
+            dot=index(k, ".")
+            if (!dot) {
+                order[++n]=k
+                type[k]=v
+            } else {
+                sec=substr(k, 1, dot-1)
+                opt=substr(k, dot+1)
+                if (opt == "section") owner[sec]=v
             }
         }
-    ' | while IFS= read -r _child; do
-        [ -n "$_child" ] || continue
-        _owner=$(uci -q get "${PODKOP_UCI}.${_child}.section" 2>/dev/null)
-        [ "$_owner" = "$_parent" ] && printf '%s\n' "$_child"
-    done
+        END {
+            for (i=1; i<=n; i++) {
+                sec=order[i]
+                if (type[sec] == t && owner[sec] == want) print sec
+            }
+        }
+    '
+}
+
+forkop_child_counts() {
+    local _parent="$1"
+    [ "$PODKOP_VARIANT" = "forkop" ] || { printf '0 0 0'; return 1; }
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v want="$_parent" '
+        {
+            k=$1
+            sub("^" p, "", k)
+            v=$2
+            gsub(/\047/, "", v)
+            dot=index(k, ".")
+            if (!dot) {
+                order[++n]=k
+                type[k]=v
+            } else {
+                sec=substr(k, 1, dot-1)
+                opt=substr(k, dot+1)
+                if (opt == "section") owner[sec]=v
+            }
+        }
+        END {
+            subn=utn=ifn=0
+            for (i=1; i<=n; i++) {
+                sec=order[i]
+                if (owner[sec] != want) continue
+                if (type[sec] == "subscription_url") subn++
+                else if (type[sec] == "urltest") utn++
+                else if (type[sec] == "section_interface") ifn++
+            }
+            printf "%d %d %d\n", subn, utn, ifn
+        }
+    '
 }
 
 forkop_child_count() {
@@ -904,10 +963,10 @@ get_section_type() {
         [ -z "$ct" ] && ct="connection"
         case "$ct" in
             connection|proxy|outbound|vpn)
-                local _sub_n _ut_n _if_n
-                _sub_n=$(forkop_child_count subscription_url "$sec")
-                _ut_n=$(forkop_child_count urltest "$sec")
-                _if_n=$(forkop_child_count section_interface "$sec")
+                local _sub_n _ut_n _if_n _child_counts
+                _child_counts=$(forkop_child_counts "$sec")
+                set -- ${_child_counts:-0 0 0}
+                _sub_n=${1:-0}; _ut_n=${2:-0}; _if_n=${3:-0}
                 # Preserve the existing single-value API for old views.
                 # URLTest takes display precedence, then subscription, then
                 # bound interface. Supported writes use native Forkop fields.
@@ -1095,20 +1154,38 @@ SB_RESTART_LOG="${BOT_DIR}/sb_restart_log"
 # an upstream DNS-failover storm no longer reads as sing-box dying repeatedly.
 SB_RELOAD_LOG="${BOT_DIR}/sb_reload_log"
 get_singbox_version_display() {
+    # Cache key is the sing-box binary's inode:mtime:size (same signature style
+    # as tsnet_capable() in tsnet-provider.sh) so a package replace/downgrade —
+    # e.g. Forkop switching the installed build from -extended to standard —
+    # invalidates the cache instead of serving a stale version string forever.
+    local _sb_bin _sb_key
+    _sb_bin=$(command -v sing-box 2>/dev/null)
+    if [ -n "$_sb_bin" ]; then
+        _sb_key=$(stat -c '%i:%Y:%s' "$_sb_bin" 2>/dev/null)
+        [ -n "$_sb_key" ] || _sb_key=$(ls -ln "$_sb_bin" 2>/dev/null | awk '{print $5":"$6":"$7":"$8}')
+    fi
+
     # Skip cache if it contains a negative result — unknown must not be persisted.
     if [ -s "$SB_VER_CACHE" ]; then
-        _cached_sbv=$(cat "$SB_VER_CACHE" 2>/dev/null)
-        if [ -n "$_cached_sbv" ] && [ "$_cached_sbv" != "unknown" ]; then
+        local _cached_key _cached_sbv
+        IFS='|' read -r _cached_key _cached_sbv < "$SB_VER_CACHE" 2>/dev/null
+        if [ -n "$_cached_sbv" ] && [ "$_cached_sbv" != "unknown" ] && [ "$_cached_key" = "$_sb_key" ]; then
             printf '%s' "$_cached_sbv"; return
         fi
     fi
     local ver=""
 
-    # 1. Backend writes version to a state file after each install — no process spawn.
-    #    Path is variant-specific: forkop → /etc/forkop, plus → /etc/podkop-plus.
-    local _sb_state="/etc/podkop-plus/sing-box-version"
-    [ "$PODKOP_VARIANT" = "forkop" ] && _sb_state="/etc/forkop/sing-box-version"
+    # 1. Prefer metadata/state written by the owning project. Forkop's installer
+    #    may manage sing-box as a standalone binary with no opkg/apk ownership;
+    #    its UI cache is therefore a first-class source, not merely a fallback.
+    local _sb_state="/etc/podkop-plus/sing-box-version" _sb_ui_state=""
+    if [ "$PODKOP_VARIANT" = "forkop" ]; then
+        _sb_state="/etc/forkop/sing-box-version"
+        _sb_ui_state="/var/run/forkop/ui-state/sing-box-version"
+    fi
     [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
+    [ -z "$ver" ] && [ -n "$_sb_ui_state" ] && [ -r "$_sb_ui_state" ] && \
+        ver=$(sed -n '1p' "$_sb_ui_state" 2>/dev/null)
 
     # 2. opkg (OpenWrt 24.10 and earlier)
     if [ -z "$ver" ] && command -v opkg >/dev/null 2>&1; then
@@ -1134,7 +1211,7 @@ get_singbox_version_display() {
     # would hide a valid version on the next call after state-file appears).
     if [ "$ver" != "unknown" ]; then
         mkdir -p "$BOT_DIR" 2>/dev/null
-        printf '%s' "$ver" > "$SB_VER_CACHE" 2>/dev/null
+        printf '%s|%s' "$_sb_key" "$ver" > "$SB_VER_CACHE" 2>/dev/null
     else
         rm -f "$SB_VER_CACHE" 2>/dev/null
     fi
@@ -1156,14 +1233,46 @@ is_singbox_extended() {
 # section exists on a build without the tag, so a blind write does not just
 # fail to start the node, it takes routing down with it.
 #
-# The tag probe runs `sing-box version` only as a last resort: that spawns a
-# second Go binary (+20-30 MB RSS), which is exactly what get_singbox_version_display
-# exists to avoid. On extended builds — the common case, and the only one most
-# routers have — we never reach it.
+# Capability probing MUST NOT execute sing-box. A second Go process just for
+# `sing-box version` can exhaust the last tens of MiB on 256 MB routers and stall
+# the already-running dataplane. Prefer the shared provider helper; standalone
+# installs fall back to package/variant markers and a streaming binary tag scan.
 singbox_supports_tailscale() {
-    is_singbox_extended && return 0
+    if [ -r /usr/lib/podkop_bot/tsnet-provider.sh ]; then
+        . /usr/lib/podkop_bot/tsnet-provider.sh
+        tsnet_capable
+        return
+    fi
+
     command -v sing-box >/dev/null 2>&1 || return 1
-    sing-box version 2>/dev/null | grep -q 'with_tailscale'
+    if command -v opkg >/dev/null 2>&1; then
+        opkg status sing-box-tiny 2>/dev/null | grep -q '^Status: .* installed$' && return 1
+        opkg status sing-box-extended 2>/dev/null | grep -q '^Status: .* installed$' && return 0
+    fi
+    if command -v apk >/dev/null 2>&1; then
+        apk info -e sing-box-tiny >/dev/null 2>&1 && return 1
+        apk info -e sing-box-extended >/dev/null 2>&1 && return 0
+    fi
+    if [ -r /etc/forkop/sing-box-variant ]; then
+        grep -qiE 'extended|with_tailscale|tailscale' /etc/forkop/sing-box-variant 2>/dev/null && return 0
+        grep -qi 'tiny' /etc/forkop/sing-box-variant 2>/dev/null && return 1
+    fi
+
+    local _bin _key _cache _ck _cv
+    _bin=$(command -v sing-box)
+    _key=$(stat -c '%i:%Y:%s' "$_bin" 2>/dev/null)
+    [ -n "$_key" ] || _key=$(ls -ln "$_bin" 2>/dev/null | awk '{print $5":"$6":"$7":"$8}')
+    _cache="${BOT_DIR}/singbox_ts_cap"
+    if [ -r "$_cache" ]; then
+        IFS=' ' read -r _ck _cv < "$_cache"
+        if [ "$_ck" = "$_key" ]; then [ "$_cv" = 1 ]; return; fi
+    fi
+    if LC_ALL=C grep -aFq 'with_tailscale' "$_bin" 2>/dev/null; then
+        printf '%s 1\n' "$_key" > "$_cache" 2>/dev/null || true
+        return 0
+    fi
+    printf '%s 0\n' "$_key" > "$_cache" 2>/dev/null || true
+    return 1
 }
 
 # reply_keyboard_main: persistent bottom navigation keyboard JSON
@@ -1363,6 +1472,7 @@ url_decode() {
 #       tier1               Podkop SOCKS5 (primary)
 #       tier2_N             fallback_socks list (UCI list, N entries)
 #       tier3               custom_proxy (single legacy entry)
+#       warp_rescue         WARP Rescue localhost SOCKS (optional)
 #       tier4               Direct
 #       tier5               Emergency hardcoded Telegram IPs
 #   — Sticky-route fast path: each profile remembers its last working tier
@@ -1380,14 +1490,11 @@ url_decode() {
 _resolve_mixed_listen_ip_by_port() {
     local _port="$1" _ip=""
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
-        _ip=$(jq -r --arg p "$_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
-        [ -z "$_ip" ] && _ip=$(jq -r --arg p "$_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
+        _ip=$(jq -r --arg p "$_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
     fi
     case "$_ip" in
         ""|0.0.0.0|::|"[::]") uci -q get network.lan.ipaddr 2>/dev/null || echo "127.0.0.1" ;;
@@ -1400,15 +1507,11 @@ get_proxy_ip() {
     sec=$(get_active_section)
     m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
-        sb_ip=$(jq -r --arg p "$m_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
-        # Fallback: match any inbound on that port regardless of type
-        [ -z "$sb_ip" ] && sb_ip=$(jq -r --arg p "$m_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -n 1)
+        sb_ip=$(jq -r --arg p "$m_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
         if [ -n "$sb_ip" ]; then
             if [ "$sb_ip" = "0.0.0.0" ] || [ "$sb_ip" = "::" ]; then
                 lan_ip=$(uci -q get network.lan.ipaddr)
@@ -1516,28 +1619,25 @@ _try_curl() {
 # Returns section name via stdout; falls back to active section then "main".
 _resolve_primary_section() {
     local _s _me _en _sec=""
-    local _all
-    _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep -E '^[^.]+\.[^.=]+=section$' \
-        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
+    local _all="${1:-}"
+    [ -n "$_all" ] || _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null | grep -E '^[^.]+\.[^.=]+=section$' | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     for _s in $_all; do
         section_is_proxy "$_s" || continue
         # Skip disabled sections: enabled=0 with mixed_proxy_enabled=1 does not
-        # carry live transport and must not be picked as primary (also improves
-        # tier1 transport selection).
+        # carry live transport and must not be picked as primary.
         _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
         [ -z "$_en" ] && _en=1
         [ "$_en" = "1" ] || continue
         _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
         if [ "$_me" = "1" ]; then
-            _sec="$_s"; break
+            _sec="$_s"
+            break
         fi
     done
     [ -z "$_sec" ] && _sec=$(get_active_section)
     [ -z "$_sec" ] && _sec="main"
     echo "$_sec"
 }
-
 
 # Call at the top of each transport function.
 # IMPORTANT: tier1 is always the PRIMARY proxy section (connection_type=proxy,
@@ -1583,12 +1683,11 @@ _proxy_display() {
 _load_transport_ctx() {
     _t_policy=$(uci -q get podkop_bot.settings.transport || echo "auto")
 
-    # Find primary section via shared helper
-    local _primary_sec; _primary_sec=$(_resolve_primary_section)
-    local _all_secs
-    _all_secs=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+    # Enumerate sections once. The primary resolver consumes this same snapshot.
+    _t_all_secs=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
         | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
         | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
+    local _primary_sec; _primary_sec=$(_resolve_primary_section "$_t_all_secs")
 
     _t_sec="$_primary_sec"
     _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
@@ -1597,14 +1696,11 @@ _load_transport_ctx() {
     # Resolve actual listen IP from config.json for tier1
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
         local _sb_ip
-        _sb_ip=$(jq -r --arg p "$_t_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
-             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
-             .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -1)
-        [ -z "$_sb_ip" ] && _sb_ip=$(jq -r --arg p "$_t_port" \
-            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
-            ${SINGBOX_CONFIG_PATH} 2>/dev/null | head -1)
+        _sb_ip=$(jq -r --arg p "$_t_port" '
+            [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
+            | (($m | map(select(.type=="mixed" or .type=="socks" or .type=="socks5")) | .[0].listen)
+               // $m[0].listen // empty)
+        ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
         if [ -n "$_sb_ip" ]; then
             [ "$_sb_ip" = "0.0.0.0" ] || [ "$_sb_ip" = "::" ] || _t_ip="$_sb_ip"
         fi
@@ -1618,15 +1714,18 @@ _load_transport_ctx() {
     local _fb_raw
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
+    _t_explicit_fb_socks=""
+    _t_auto_socks=""
     if [ -n "$_fb_raw" ]; then
         { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
-        _t_fb_socks="$*"
+        _t_explicit_fb_socks="$*"
+        _t_fb_socks="$_t_explicit_fb_socks"
     fi
 
     # Auto-add mixed_proxy from OTHER sections as additional fallback tiers.
     # Each section with mixed_proxy_enabled=1 and a different port = independent
     # transport path (e.g. awg_main/WARP on 2081 can reach Telegram even if main/2080 fails).
-    for _s in $_all_secs; do
+    for _s in $_t_all_secs; do
         [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
         local _me _mp _ct
         _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
@@ -1641,7 +1740,10 @@ _load_transport_ctx() {
         for _ex in $_t_fb_socks; do
             [ "$(_proxy_endpoint "$_ex")" = "$_auto_fb" ] && { _already=1; break; }
         done
-        [ "$_already" = "0" ] && _t_fb_socks="${_t_fb_socks:+$_t_fb_socks }${_auto_fb}"
+        if [ "$_already" = "0" ]; then
+            _t_fb_socks="${_t_fb_socks:+$_t_fb_socks }${_auto_fb}"
+            _t_auto_socks="${_t_auto_socks:+$_t_auto_socks }${_s}|${_auto_fb}"
+        fi
     done
 }
 
@@ -1995,7 +2097,65 @@ resolve_tg_emergency_ips() {
     printf '%s' "${_out# }"
 }
 
-# _try_all_tiers: full cascade including custom/direct/emergency.
+
+# PODKOP_TRANSPORT_PATCH_V2
+# WARP Rescue transport provider.  The revolver owns the WARP process; the bot
+# only consumes its localhost SOCKS endpoint and may ask the controller to arm
+# it when Rescue was explicitly enabled by the operator.
+_WARP_RESCUE_CONFIG="/etc/podkop_bot/warpscout.conf"
+_WARP_RESCUE_PID_FILE="${BOT_DIR}/warpscout_rescue_socks.pid"
+_WARP_RESCUE_TRIGGER_TS_FILE="${BOT_DIR}/warp_rescue_trigger_ts"
+
+_warp_rescue_cfg_get() {
+    [ -r "$_WARP_RESCUE_CONFIG" ] || return 1
+    sed -n "s/^$1=//p" "$_WARP_RESCUE_CONFIG" 2>/dev/null | head -1
+}
+
+_warp_rescue_pid_alive() {
+    [ -s "$_WARP_RESCUE_PID_FILE" ] || return 1
+    local _p
+    _p=$(cat "$_WARP_RESCUE_PID_FILE" 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_p" 2>/dev/null
+}
+
+_warp_rescue_proxy() {
+    local _allow_start="${1:-0}" _enabled _port _now _last=0 _resp _i
+    _enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+    [ "$_enabled" = "1" ] || return 1
+    _port=$(_warp_rescue_cfg_get socks_port 2>/dev/null || true)
+    case "$_port" in ''|*[!0-9]*) _port=18191 ;; esac
+
+    if ! _warp_rescue_pid_alive; then
+        [ "$_allow_start" = "1" ] || return 1
+        _now=$(date +%s 2>/dev/null || echo 0)
+        [ -r "$_WARP_RESCUE_TRIGGER_TS_FILE" ] && _last=$(cat "$_WARP_RESCUE_TRIGGER_TS_FILE" 2>/dev/null || echo 0)
+        case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+        if [ $((_now - _last)) -ge 20 ] 2>/dev/null; then
+            printf '%s\n' "$_now" > "$_WARP_RESCUE_TRIGGER_TS_FILE"
+            _resp=$(ubus call podkop_bot_warpscout_rescue trigger '{}' 2>/dev/null || true)
+            printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1 || return 1
+        fi
+    fi
+    _warp_rescue_pid_alive || return 1
+    printf 'socks5h://127.0.0.1:%s' "$_port"
+}
+
+_try_warp_rescue() {
+    local _args="$1" _max_time="$2" _ct="$3" _proxy
+    [ "$_t_policy" != "direct" ] || return 1
+    _proxy=$(_warp_rescue_proxy 1) || return 1
+    logger -t podkop-bot "[Transport] Trying WARP Rescue for ${_ROUTE_PROFILE:-unknown}"
+    if _try_curl "-x $_proxy" "$_max_time" "$_args" "$_ct"; then
+        ROUTE_KEY="warp_rescue"
+        ROUTE_NAME="WARP Rescue"
+        return 0
+    fi
+    logger -t podkop-bot "[Transport] WARP Rescue failed for ${_ROUTE_PROFILE:-unknown}"
+    return 1
+}
+
+# _try_all_tiers: full cascade including custom/WARP/direct/emergency.
 # Sets ROUTE_KEY and ROUTE_NAME on success.
 _try_all_tiers() {
     local args="$1" max_time="$2" ct_fast="$3"
@@ -2031,22 +2191,31 @@ _try_all_tiers() {
         # Same reasoning as above: a refusal is not a fault of this proxy.
         [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
     fi
-    # POLL-only demotion hysteresis.  If the independent follower has a
-    # fresh positive proxy sample, one failed long-poll cascade is treated as transient.
-    # The next POLL retries the proxy stack; two consecutive failures still allow Direct.
+    # WARP Rescue is a genuine runtime tier, not diagnostics decoration.  It is
+    # attempted after configured proxies and before Direct.
+    if _try_warp_rescue "$args" "$max_time" "$ct_fast"; then
+        return 0
+    fi
+    [ "${_TG_NO_DEMOTE:-0}" = "1" ] && return 1
+
+    # POLL-only demotion guard.  If the independent follower still proves at
+    # least one proxy route can reach Telegram with a fresh getMe, a failed 50s
+    # getUpdates is an idle-tunnel/POLL failure, not proof that the proxy path is
+    # dead.  Never fall through to Direct on that evidence alone.  Full discovery
+    # is repeated on the next POLL, so another healthy proxy can take over.
     if [ "${_ROUTE_PROFILE:-fast}" = "poll" ] && [ "$_t_policy" != "direct" ]; then
         if _poll_follower_has_fresh_proxy; then
             POLL_PROXY_FAIL_STREAK=$(( ${POLL_PROXY_FAIL_STREAK:-0} + 1 ))
             if [ "$POLL_PROXY_FAIL_STREAK" -lt 2 ]; then
                 _TG_NO_DEMOTE=1
-                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold"
+                logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=hold_direct"
                 return 1
             fi
-            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote"
+            logger -t podkop-bot "[Transport] POLL proxy cascade failed. streak=${POLL_PROXY_FAIL_STREAK} follower=alive action=demote_after_streak"
         else
-            POLL_PROXY_FAIL_STREAK=0
             logger -t podkop-bot "[Transport] POLL proxy cascade failed. follower=none_or_stale action=demote"
         fi
+        POLL_PROXY_FAIL_STREAK=0
     fi
 
     # tier4: direct
@@ -2082,11 +2251,10 @@ _try_all_tiers() {
 # $1=curl_args  $2=max_time  $3=ct_sticky  $4=ct_full  $5=route_var (LAST_ROUTE_FAST|LAST_ROUTE_POLL)
 # Updates the named route variable and LAST_ROUTE/LAST_ROUTE_NAME (for UI display).
 _route_request() {
-    local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5"
+    local _args="$1" _max="$2" _ct_sticky="$3" _ct_full="$4" _rvar="$5" _ctx_loaded="${6:-0}"
     local _last ROUTE_KEY ROUTE_NAME
 
-
-    _load_transport_ctx
+    [ "$_ctx_loaded" = "1" ] || _load_transport_ctx
     case "$_rvar" in
         LAST_ROUTE_POLL) _reprobe_file="$POLL_REPROBE_TS_FILE" ;;
         *)               _reprobe_file="$FAST_REPROBE_TS_FILE" ;;
@@ -2136,8 +2304,18 @@ _route_request() {
                     eval "$_rvar=tier3"; return 0
                 }
                 ;;
+            warp_rescue)
+                local _warp_proxy=""
+                _warp_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
+                [ -n "$_warp_proxy" ] && \
+                _try_curl "-x $_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                    LAST_ROUTE="warp_rescue"; LAST_ROUTE_NAME="WARP Rescue"
+                    _write_route_state "$_ROUTE_PROFILE" "warp_rescue" "$LAST_ROUTE_NAME"
+                    eval "$_rvar=warp_rescue"; return 0
+                }
+                ;;
             tier4)
-                # On degraded path (tier4): periodically try SOCKS tiers before using direct.
+                # On degraded path (tier4): periodically try proxy tiers before using direct.
                 # Mirrors tier5 reprobe logic — prevents sticking on Direct when tier2
                 # recovers but tier1 is still down (Telegram accessible directly).
                 local _now _last_reprobe
@@ -2156,6 +2334,8 @@ _route_request() {
                     elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
                         ROUTE_KEY="tier3"; ROUTE_NAME="Прокси бота (${_t_custom})"
+                    elif _try_warp_rescue "$_args" "$_max" "2"; then
+                        :
                     else
                         ROUTE_KEY=""
                     fi
@@ -2189,6 +2369,8 @@ _route_request() {
                     elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
                         ROUTE_KEY="tier3"; ROUTE_NAME="Прокси бота (${_t_custom})"
+                    elif _try_warp_rescue "$_args" "$_max" "2"; then
+                        :
                     else
                         ROUTE_KEY=""
                     fi
@@ -2268,7 +2450,7 @@ _route_request() {
 # api_request_fast: sendMessage, editMessageText, answerCallbackQuery, deleteMessage
 # connect-timeout: 2s sticky / 3s full   max-time: 8s
 api_request_fast() {
-    local method="$1" payload="$2" max_time="${3:-8}" tmp final_args
+    local method="$1" payload="$2" max_time="${3:-8}" tmp final_args _ctx_loaded=0
     _ROUTE_PROFILE="fast"
     API_RESPONSE=""
     tmp=$(mktemp /tmp/podkop_req.XXXXXX 2>/dev/null) || return 1
@@ -2277,6 +2459,7 @@ api_request_fast() {
     # Recovery mode: try SOCKS tiers first before sticky (mirrors api_poll_long behaviour)
     if [ "${FAST_RECOVERY_MODE:-0}" -gt 0 ]; then
         _load_transport_ctx
+        _ctx_loaded=1
         local ROUTE_KEY ROUTE_NAME
         # Use reduced max_time so all SOCKS tiers fit within one fast request budget.
         # Default max_time=8s with ct=3s means tier1 alone can consume all 8s before
@@ -2296,7 +2479,7 @@ api_request_fast() {
             logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
         fi
     fi
-    if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST"; then
+    if _route_request "$final_args" "$max_time" "5" "6" "LAST_ROUTE_FAST" "$_ctx_loaded"; then
         _restore_poll_compat; rm -f "$tmp"; echo "$API_RESPONSE"; return 0
     fi
     _restore_poll_compat; rm -f "$tmp"; return 1
@@ -2308,14 +2491,15 @@ api_request() { api_request_fast "$@"; }
 # connect-timeout: 3s sticky / 4s full   max-time: 65s (50s poll + buffer)
 # Recovery mode: if POLL_RECOVERY_MODE>0, skip sticky path and probe SOCKS tiers first
 api_poll_long() {
-    local offset="$1" poll_timeout="${2:-50}"
+    local offset="$1" poll_timeout="${2:-50}" _ctx_loaded=0
     _ROUTE_PROFILE="poll"
     local args="-X GET ${API_URL}/getUpdates?offset=${offset}&timeout=${poll_timeout}"
     API_RESPONSE=""
-    _load_transport_ctx
 
     # Recovery mode: aggressively try SOCKS tiers, skip sticky
     if [ "$POLL_RECOVERY_MODE" -gt 0 ]; then
+        _load_transport_ctx
+        _ctx_loaded=1
         POLL_RECOVERY_MODE=$((POLL_RECOVERY_MODE - 1))
         logger -t podkop-bot "[Transport] Probing SOCKS tiers (recovery mode)..."
         local ROUTE_KEY ROUTE_NAME
@@ -2331,7 +2515,7 @@ api_poll_long() {
         # SOCKS still down in recovery — fall through to full cascade
     fi
 
-    _route_request "$args" "65" "5" "6" "LAST_ROUTE_POLL"
+    _route_request "$args" "65" "5" "6" "LAST_ROUTE_POLL" "$_ctx_loaded"
 }
 
 # api_poll: backward-compat wrapper
@@ -2468,6 +2652,16 @@ probe_all_socks_write() {
         ) & _pids="$_pids $!"
     fi
 
+    local _warp_follow=""
+    _warp_follow=$(_warp_rescue_proxy 0 2>/dev/null || true)
+    if [ -n "$_warp_follow" ]; then
+        _slots="$_slots warp_rescue"
+        (
+            _lat=$(probe_telegram_proxy_latency "$_warp_follow")
+            printf 'warp_rescue=%s\n' "$_lat" > "$_probe_dir/warp_rescue"
+        ) & _pids="$_pids $!"
+    fi
+
     # Reap exactly our workers; never use a bare wait in the bot shell.
     for _pid in $_pids; do wait "$_pid" 2>/dev/null || true; done
 
@@ -2506,7 +2700,7 @@ _poll_follower_has_fresh_proxy() {
     [ "$_max_age" -lt 150 ] && _max_age=150
     [ "$_max_age" -gt 1200 ] && _max_age=1200
     [ $((_now - _ts)) -le "$_max_age" ] 2>/dev/null || return 1
-    grep -Eq '^tier(1|2_[0-9]+|3)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
+    grep -Eq '^(tier(1|2_[0-9]+|3)|warp_rescue)=[0-9]+ms([[:space:]]|$)' "$SOCKS_PROBE_FILE" 2>/dev/null
 }
 
 # Journal values must stay ASCII/machine-readable even when UI fallback text is localized.
@@ -2565,6 +2759,15 @@ api_document() {
                 LAST_ROUTE_DOC="tier3"; return 0
             }
         fi
+        local _warp_doc=""
+        _warp_doc=$(_warp_rescue_proxy 1 2>/dev/null || true)
+        if [ -n "$_warp_doc" ]; then
+            res=$(_do_curl_doc "-x $_warp_doc")
+            _is_telegram_response "$res" && {
+                unset -f _do_curl_doc
+                LAST_ROUTE_DOC="warp_rescue"; return 0
+            }
+        fi
     fi
     if [ "$_t_policy" != "socks" ]; then
         res=$(_do_curl_doc "$_t_ifflag")
@@ -2612,6 +2815,12 @@ get_tg_latency() {
             ;;
         tier3)
             p_args="$if_flag -x ${custom_url}"
+            ;;
+        warp_rescue)
+            local _warp_lat=""
+            _warp_lat=$(_warp_rescue_proxy 0 2>/dev/null || true)
+            [ -n "$_warp_lat" ] || { echo "Нет данных"; return; }
+            p_args="-x $_warp_lat"
             ;;
         tier4)
             p_args="$if_flag"
@@ -2789,31 +2998,22 @@ is_reply_to_bot() {
 # SECTION 4: Messaging Functions
 # ==============================================================================
 
-# _validate_kb: check reply_markup JSON is valid before passing to jq --argjson.
-# Invalid kb silently kills the whole jq payload, leaving the card un-sent.
-# On failure: logs the bad JSON with calling context, clears kb so card sends without buttons.
-_validate_kb() {
-    local _kb="$1" _ctx="${2:-unknown}"
-    [ -z "$_kb" ] || [ "$_kb" = "null" ] && return 0
-    if ! printf '%s' "$_kb" | jq -e . >/dev/null 2>&1; then
-        logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${_ctx}): $(printf '%s' "$_kb" | head -c 120)"
-        return 1
-    fi
-    return 0
-}
-
 send_message() {
-    local txt="$1" kb="$2" payload resp new_mid
-    _validate_kb "$kb" "${cmd:-send}" || kb=""
+    local txt="$1" kb="$2" payload="" resp new_mid
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" --argjson kb "$kb" \
-                '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber),reply_markup:$kb}')
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber),reply_markup:$kb}' 2>/dev/null) || payload=""
         else
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --argjson kb "$kb" \
-                '{chat_id:$cid,text:$txt,parse_mode:"HTML",reply_markup:$kb}')
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML",reply_markup:$kb}' 2>/dev/null) || payload=""
         fi
-    else
+        if [ -z "$payload" ]; then
+            logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${cmd:-send}): $(printf '%s' "$kb" | head -c 120)"
+            kb=""
+        fi
+    fi
+    if [ -z "$kb" ] || [ "$kb" = "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" \
                 '{chat_id:$cid,text:$txt,parse_mode:"HTML",message_thread_id:($tid|tonumber)}')
@@ -2838,23 +3038,44 @@ send_message() {
 }
 
 edit_message() {
-    local mid="$1" txt="$2" kb="$3" payload
+    local mid="$1" txt="$2" kb="$3" payload=""
     [ -z "$mid" ] && { send_message "$txt" "$kb"; return; }
-    _validate_kb "$kb" "${cmd:-edit}" || kb=""
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" --argjson kb "$kb" \
-            '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}')
-    else
+            '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}' 2>/dev/null) || payload=""
+        if [ -z "$payload" ]; then
+            logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${cmd:-edit}): $(printf '%s' "$kb" | head -c 120)"
+            kb=""
+        fi
+    fi
+    if [ -z "$kb" ] || [ "$kb" = "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" \
             '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML"}')
     fi
-    local resp _tg_desc
+    local resp _tg_desc _tg_code
     resp=$(api_request "editMessageText" "$payload")
     if printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then
         return 0
     fi
-    _tg_desc=$(printf '%s' "$resp" | jq -r '.description // "no Telegram response"' 2>/dev/null)
-    logger -t podkop-bot "[Telegram] editMessageText failed: ${_tg_desc}"
+    _tg_desc=$(printf '%s' "$resp" | jq -r '.description // empty' 2>/dev/null)
+    _tg_code=$(printf '%s' "$resp" | jq -r '.error_code // empty' 2>/dev/null)
+
+    # Telegram returns 400 when the requested text/markup is already current.
+    # Treat that as success: replacing the card would be a duplicate.
+    case "$_tg_desc" in
+        *"message is not modified"*)
+            return 0
+            ;;
+    esac
+
+    # Only explicit Telegram application errors justify replacing the card.
+    # Empty/invalid response means the transport result is unknown: the edit may
+    # already have been applied server-side, so the caller must not send a copy.
+    if [ -n "$_tg_code" ]; then
+        logger -t podkop-bot "[Telegram] editMessageText rejected: code=${_tg_code} description=${_tg_desc:-unknown}"
+        return 2
+    fi
+    logger -t podkop-bot "[Telegram] editMessageText outcome unknown: no Telegram response"
     return 1
 }
 
@@ -2920,9 +3141,9 @@ send_or_edit() {
     local mid="$1" txt="$2" kb="$3"
     if [ -n "$mid" ] && [ "$mid" != "null" ] && [ "$mid" != "0" ]; then
         # Check if a health alert was sent after this menu card
-        local alert_mid menu_mid
-        alert_mid=$(cat "$LAST_ALERT_MSG_FILE" 2>/dev/null)
-        menu_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        local alert_mid="" menu_mid=""
+        [ -f "$LAST_ALERT_MSG_FILE" ] && IFS= read -r alert_mid < "$LAST_ALERT_MSG_FILE"
+        [ -f "$LAST_MENU_MSG_FILE" ] && IFS= read -r menu_mid < "$LAST_MENU_MSG_FILE"
         # Validate as integers — empty or non-numeric values crash ash with -gt
         case "$alert_mid" in ''|*[!0-9]*) alert_mid=0 ;; esac
         case "$menu_mid"  in ''|*[!0-9]*) menu_mid=0  ;; esac
@@ -2934,10 +3155,16 @@ send_or_edit() {
             rm -f "$LAST_ALERT_MSG_FILE"
             send_message "$txt" "$kb"
         else
-            # If Telegram rejects editing (for example because of malformed HTML
-            # or an expired/inaccessible message), send a fresh card instead of
-            # leaving the user forever on “Формируем…”.
-            edit_message "$mid" "$txt" "$kb" || send_message "$txt" "$kb"
+            # Only fall back to a fresh card when Telegram explicitly confirms
+            # that this message cannot be edited. A transport timeout is ambiguous:
+            # Telegram may already have applied the edit, and sendMessage here would
+            # create a duplicate card.
+            edit_message "$mid" "$txt" "$kb"
+            case $? in
+                0) ;;
+                2) send_message "$txt" "$kb" ;;
+                *) logger -t podkop-bot "[UI] editMessageText outcome unknown; keeping current card to avoid duplicate" ;;
+            esac
         fi
     else
         send_message "$txt" "$kb"
@@ -2966,14 +3193,15 @@ delete_message() {
 # connection but then hangs on the response (e.g. sing-box under high load, OOM).
 # connect-timeout 3 alone only covers the TCP handshake, not the full transfer.
 clash_request() {
+    # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.
     local endpoint="$1" method="${2:-GET}" data="$3"
     local secret tmp_body
     secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
-            curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
         else
-            curl -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
         fi
     else
         local rc
@@ -4525,21 +4753,24 @@ _traffic_stats_init() {
 _traffic_accum_tick() {
     local _conn _cur_dl _cur_ul
     _conn=$(clash_request "/connections" 2>/dev/null)
-    _cur_dl=$(printf '%s' "$_conn" | jq -r '.downloadTotal // empty' 2>/dev/null)
-    _cur_ul=$(printf '%s' "$_conn" | jq -r '.uploadTotal // empty' 2>/dev/null)
+    local _traffic_totals
+    _traffic_totals=$(printf '%s' "$_conn" | jq -r '[.downloadTotal // "", .uploadTotal // ""] | map(tostring) | join("|")' 2>/dev/null)
+    IFS='|' read -r _cur_dl _cur_ul <<EOF
+$_traffic_totals
+EOF
     case "$_cur_dl" in ''|*[!0-9]*) return 1 ;; esac
     case "$_cur_ul" in ''|*[!0-9]*) return 1 ;; esac
 
     local _banked_dl=0 _banked_ul=0 _last_dl=0 _last_ul=0 _last_pid=""
     if [ -s "$TRAFFIC_ACCUM_FILE" ]; then
-        _banked_dl=$(awk -F'|' '{print $1+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _banked_ul=$(awk -F'|' '{print $2+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _last_dl=$(awk -F'|' '{print $3+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        _last_ul=$(awk -F'|' '{print $4+0}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null)
-        # 5th field added later; absent in accumulators written by older versions.
-        _last_pid=$(awk -F'|' '{print $5}' "$TRAFFIC_ACCUM_FILE" 2>/dev/null | tr -d ' \n\r')
+        IFS='|' read -r _banked_dl _banked_ul _last_dl _last_ul _last_pid < "$TRAFFIC_ACCUM_FILE"
+        case "$_banked_dl" in ''|*[!0-9]*) _banked_dl=0 ;; esac
+        case "$_banked_ul" in ''|*[!0-9]*) _banked_ul=0 ;; esac
+        case "$_last_dl" in ''|*[!0-9]*) _last_dl=0 ;; esac
+        case "$_last_ul" in ''|*[!0-9]*) _last_ul=0 ;; esac
     fi
-    local _cur_pid; _cur_pid=$(pgrep -f "sing-box run" 2>/dev/null | head -1)
+    local _cur_pid; _cur_pid=$(pidof sing-box 2>/dev/null)
+    _cur_pid=${_cur_pid%% *}
     case "$_cur_pid" in ''|*[!0-9]*) _cur_pid="" ;; esac
 
     if [ "$_cur_dl" -ge "$_last_dl" ] 2>/dev/null && [ "$_cur_ul" -ge "$_last_ul" ] 2>/dev/null; then
@@ -4585,6 +4816,7 @@ _traffic_accum_tick() {
 # Return value: 0 if either path succeeded, 1 if both failed.
 # Does NOT touch LAST_ROUTE_* — uses its own independent curl sessions.
 check_health() {
+    local _ctx_loaded="${1:-0}"
     local tmp_resp _direct=fail _transport=fail _tier2=fail
     local _sec _port _ip
 
@@ -4620,9 +4852,11 @@ check_health() {
         local _dc_ok=0; _dc_i=0
         for _dc_ip in $_dc_ips; do
             _dc_i=$((_dc_i+1))
-            [ -f "${_dc_dir}/dc_${_dc_i}" ] && \
-                [ "$(cat "${_dc_dir}/dc_${_dc_i}")" = "ok" ] && \
-                _dc_ok=$((_dc_ok + 1))
+            if [ -f "${_dc_dir}/dc_${_dc_i}" ]; then
+            local _dc_result=""
+            IFS= read -r _dc_result < "${_dc_dir}/dc_${_dc_i}"
+            [ "$_dc_result" = "ok" ] && _dc_ok=$((_dc_ok + 1))
+        fi
         done
         rm -rf "$_dc_dir" 2>/dev/null || true
         if [ "$_dc_total" -gt 0 ] && [ "$_dc_ok" -gt 0 ] && [ $((_dc_ok*2)) -ge "$_dc_total" ]; then
@@ -4637,12 +4871,8 @@ check_health() {
     #  (1) ip:port from _load_transport_ctx (reads actual listen addr from
     #      sing-box config.json, unlike raw network.lan.ipaddr);
     #  (2) same curl syntax as the poll (-x socks5h://), not --socks5-hostname.
-    _load_transport_ctx
+    [ "$_ctx_loaded" = "1" ] || _load_transport_ctx
     local _primary_sec="$_t_sec"
-    local _all_secs_h
-    _all_secs_h=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
-        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     _port="$_t_port"
     _ip="$_t_ip"
     tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
@@ -4655,9 +4885,7 @@ check_health() {
     # A3: probe all fallback paths — explicit fallback_socks + other sections mixed_proxy
     # Run all probes in parallel (background subshells) to avoid timeout accumulation.
     # Pattern: same as refresh_public_ip_cache() and cmd_all_delay_test.
-    local _fb_raw _fb_list="" _tier2_results="" _tier2=none
-    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    [ -n "$_fb_raw" ] && { { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }; _fb_list="$*"; }
+    local _fb_list="${_t_explicit_fb_socks:-}" _tier2_results="" _tier2=none
 
     # Build probe list: [label, endpoint] pairs written to tmpfiles in parallel
     local _probe_dir; _probe_dir=$(mktemp -d /tmp/podkop_health_probes.XXXXXX) || { _tier2=none; }
@@ -4675,24 +4903,13 @@ check_health() {
         _probe_any=1
     done
 
-    # other sections mixed_proxy — parallel, skip duplicates vs explicit fallback_socks
-    for _s in $_all_secs_h; do
-        [ "$_s" = "$_primary_sec" ] && continue
-        local _me _mp
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
-        [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_port" ] || continue
-        # Skip if already in explicit fallback_socks list (duplicate check by endpoint)
-        local _auto_ip; _auto_ip=$(_resolve_mixed_listen_ip_by_port "$_mp")
-        local _auto_ep="socks5h://${_auto_ip}:${_mp}"
-        local _dup=0 _fbx
-        for _fbx in $_fb_list; do
-            [ "$(_proxy_endpoint "$_fbx")" = "$_auto_ep" ] && { _dup=1; break; }
-        done
-        [ "$_dup" = "1" ] && continue
+    # Auto-discovered mixed proxies were already resolved by _load_transport_ctx.
+    local _auto_rec _auto_ep
+    for _auto_rec in ${_t_auto_socks:-}; do
+        _s=${_auto_rec%%|*}
+        _auto_ep=${_auto_rec#*|}
         ( curl -s -k --connect-timeout 4 --max-time 8 \
-            --socks5-hostname "${_auto_ip}:${_mp}" \
-            -X GET "${API_URL}/getMe" 2>/dev/null \
+            -x "$_auto_ep" -X GET "${API_URL}/getMe" 2>/dev/null \
             | jq -e '.ok == true' >/dev/null 2>&1 \
             && echo "ok" || echo "fail" ) > "${_probe_dir}/sec_${_s}" &
         _pids="$_pids $!"
@@ -4706,22 +4923,32 @@ check_health() {
     local _rn=0
     for _fbe in $_fb_list; do
         _rn=$((_rn + 1))
-        local _rf="${_probe_dir}/fb_${_rn}"
-        [ -f "$_rf" ] && [ "$(cat "$_rf")" = "ok" ] && _tier2=ok || \
-            { [ "$_tier2" = "none" ] && _tier2=fail; }
+        local _rf="${_probe_dir}/fb_${_rn}" _rf_result=""
+        if [ -f "$_rf" ]; then
+            IFS= read -r _rf_result < "$_rf"
+            [ "$_rf_result" = "ok" ] && _tier2=ok || { [ "$_tier2" = "none" ] && _tier2=fail; }
+        fi
     done
-    for _s in $_all_secs_h; do
-        [ "$_s" = "$_primary_sec" ] && continue
+    for _auto_rec in ${_t_auto_socks:-}; do
+        _s=${_auto_rec%%|*}
         local _rf="${_probe_dir}/sec_${_s}"
         [ -f "$_rf" ] || continue
-        local _sec_result; _sec_result=$(cat "$_rf")
+        local _sec_result=""
+        IFS= read -r _sec_result < "$_rf"
         _tier2_results="${_tier2_results}tg_sec_${_s}=${_sec_result}\n"
         [ "$_sec_result" = "ok" ] && _tier2=ok
     done
     [ "$_probe_any" = "0" ] && _tier2=none
     rm -rf "$_probe_dir" 2>/dev/null || true
 
-    # Write atomically via tmp+mv — prevents watchdog reading truncated file
+    # Export the values for this watchdog process too. Consumers in the same
+    # tick must not re-parse the file we are about to write.
+    HEALTH_TG_DIRECT="$_direct"
+    HEALTH_TG_TRANSPORT="$_transport"
+    HEALTH_TG_TIER2="$_tier2"
+    HEALTH_TG_SEC_LINES="$_tier2_results"
+
+    # Write atomically for external/read-only consumers.
     printf 'tg_direct=%s\ntg_transport=%s\ntg_tier2=%s\n%b' \
         "$_direct" "$_transport" "$_tier2" "$_tier2_results" \
         > "${HEALTH_STATE_FILE}.tmp" && mv "${HEALTH_STATE_FILE}.tmp" "$HEALTH_STATE_FILE" 2>/dev/null
@@ -4734,16 +4961,21 @@ _write_socks_state() {
     # Args: $1=tg_aggregate(ok|fail)  $2=socks(up|down)  $3=last_ok_route
     # Reads tg_direct/tg_transport from HEALTH_STATE_FILE (written by check_health).
     # Keeps tg= for backward compat with any external tooling.
-    local _tg_direct _tg_transport _tg_tier2 _tg_sec_lines _tier3_state
-    _tg_direct=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-    _tg_transport=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-    _tg_tier2=$(grep "^tg_tier2=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    local _tg_direct="${HEALTH_TG_DIRECT:-?}" _tg_transport="${HEALTH_TG_TRANSPORT:-?}"
+    local _tg_tier2="${HEALTH_TG_TIER2:-none}" _tg_sec_lines="${HEALTH_TG_SEC_LINES:-}" _tier3_state
     # tier3 (bot proxy) had no health signal anywhere: not here, not in the alert
     # state machine, not in the support bundle. When the bot kept dropping to
     # Direct there was no way to tell whether the custom proxy had even answered.
     # Derive it from the latency probe: a measured value means it responded.
     if [ -n "$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)" ]; then
-        _tier3_state=$(grep "^tier3=" "$SOCKS_PROBE_FILE" 2>/dev/null | cut -d= -f2 | cut -d' ' -f1)
+        _tier3_state=""
+        if [ -f "$SOCKS_PROBE_FILE" ]; then
+            while IFS='=' read -r _sk _sv; do
+                [ "$_sk" = "tier3" ] || continue
+                _tier3_state=${_sv%% *}
+                break
+            done < "$SOCKS_PROBE_FILE"
+        fi
         case "${_tier3_state:-}" in
             '')        _tier3_state="unknown" ;;
             timeout)   _tier3_state="fail" ;;
@@ -4752,18 +4984,16 @@ _write_socks_state() {
     else
         _tier3_state="none"
     fi
-    # Forward per-section TG results so Tunnel Health can read them from SOCKS_STATE_FILE
-    _tg_sec_lines=$(grep "^tg_sec_" "$HEALTH_STATE_FILE" 2>/dev/null)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
-    # Authoritative long-poll route is in POLL_ROUTE_KEY_FILE, written by POLL only.
-    printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%s\n' \
-        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$_tier3_state" "$2" "$3" \
-        "${_tg_sec_lines}" > "$SOCKS_STATE_FILE"
-    local _sr_poll _sr_poll_name _sr_fast _sr_fast_name
-    _sr_poll=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
-    _sr_poll_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo unknown)
-    _sr_fast=$(cat "$FAST_ROUTE_KEY_FILE" 2>/dev/null || echo unknown)
-    _sr_fast_name=$(cat "$FAST_ROUTE_FILE" 2>/dev/null || echo unknown)
+    # Authoritative route files are tiny; read them with ash builtins.
+    printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\ntier3=%s\nsocks=%s\nlast_ok=%s\n%b\n' \
+        "$1" "$_tg_direct" "$_tg_transport" "$_tg_tier2" "$_tier3_state" "$2" "$3" \
+        "$_tg_sec_lines" > "$SOCKS_STATE_FILE"
+    local _sr_poll=unknown _sr_poll_name=unknown _sr_fast=unknown _sr_fast_name=unknown
+    [ -f "$POLL_ROUTE_KEY_FILE" ] && IFS= read -r _sr_poll < "$POLL_ROUTE_KEY_FILE"
+    [ -f "$POLL_ROUTE_FILE" ] && IFS= read -r _sr_poll_name < "$POLL_ROUTE_FILE"
+    [ -f "$FAST_ROUTE_KEY_FILE" ] && IFS= read -r _sr_fast < "$FAST_ROUTE_KEY_FILE"
+    [ -f "$FAST_ROUTE_FILE" ] && IFS= read -r _sr_fast_name < "$FAST_ROUTE_FILE"
     printf 'poll_route=%s\npoll_route_name=%s\nfast_route=%s\nfast_route_name=%s\n' \
         "$_sr_poll" "$_sr_poll_name" "$_sr_fast" "$_sr_fast_name" >> "$SOCKS_STATE_FILE"
 }
@@ -5604,6 +5834,13 @@ start_health_daemon() {
         # Auto-switch debounce: batch rapid URLTest flapping into one summary
         local _sw_count=0 _sw_first_ts=0 _sw_pending_to="" _sw_old_disp=""
         local _SW_WINDOW=120   # seconds: batch switches within this window
+        # sing-box restart-flap guard: reported on hardware (AX3000T, low free
+        # RAM) as 13 PID-change alerts in well under an hour. The first couple
+        # of restarts still alert individually — that is real, useful signal
+        # (e.g. a config apply) — only a genuine flap loop goes quiet.
+        local _sbf_count=0 _sbf_first_ts=0 _sbf_last_ts=0 _sbf_flapping=0
+        local _SBF_WINDOW=600     # seconds: window the threshold is counted over
+        local _SBF_THRESHOLD=3    # restarts within the window that count as flapping
         # Track tier1 SOCKS state separately from effective transport state.
         # Allows alerting when tier1 goes down even if tier2 keeps bot reachable.
         local last_tier1_state="up"
@@ -5741,9 +5978,10 @@ start_health_daemon() {
                 fi
             fi
 
-            sec=$(get_active_section)
-            m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
-            m_ip=$(get_proxy_ip)
+            _load_transport_ctx
+            sec="$_t_sec"
+            m_port="$_t_port"
+            m_ip="$_t_ip"
 
             # ------------------------------------------------------------------
             # Check A: Telegram API connectivity.
@@ -5752,7 +5990,7 @@ start_health_daemon() {
             # Does NOT touch LAST_ROUTE_FAST/POLL — uses its own curl session.
             # Under RKN: direct fails, SOCKS succeeds → status "via SOCKS".
             # ------------------------------------------------------------------
-            check_health
+            check_health 1
             # check_health writes tg_direct= and tg_transport= to HEALTH_STATE_FILE.
 
             # Bank traffic + detect Перезапуски sing-box every tick (survives
@@ -5772,9 +6010,7 @@ start_health_daemon() {
                 fi
             fi
             # TG is "reachable" if either path works (direct OK or transport OK).
-            local _tgd _tgt
-            _tgd=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
-            _tgt=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            local _tgd="${HEALTH_TG_DIRECT:-?}" _tgt="${HEALTH_TG_TRANSPORT:-?}"
             curr_tg_state="${_tgd}/${_tgt}"
             if [ "$_tgd" = "ok" ] || [ "$_tgt" = "ok" ]; then
                 tg_fail_streak=0
@@ -5821,10 +6057,82 @@ start_health_daemon() {
             fi
 
             # ------------------------------------------------------------------
-            # Check B: sing-box process liveness
+            # Check B: sing-box process liveness + PID transition detection.
+            # A fast backend update may restart sing-box entirely between two
+            # watchdog ticks, so state can look running -> running while PID
+            # changes. Treat that as a real restart and alert separately.
             # ------------------------------------------------------------------
-            if pidof sing-box >/dev/null 2>&1; then curr_sb_state="running"
+            local curr_sb_pid=""
+            curr_sb_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+            if [ -n "$curr_sb_pid" ]; then curr_sb_state="running"
             else curr_sb_state="stopped"; fi
+
+            if [ "$curr_sb_state" = "running" ] && [ "$last_sb_state" = "running" ] && \
+               [ -n "${last_sb_pid:-}" ] && [ -n "$curr_sb_pid" ] && \
+               [ "$curr_sb_pid" != "$last_sb_pid" ]; then
+                logger -t podkop-bot "[Watchdog] sing-box restarted between checks (PID ${last_sb_pid} -> ${curr_sb_pid})."
+                # Restart statistics remain owned by _traffic_accum_tick(); do not
+                # append SB_RESTART_LOG here or one restart may be counted twice.
+                printf 'up' > "$ROUTE_CMD_FILE"
+
+                # Flap accounting: reset the counter once the window has elapsed
+                # since the first restart in the current burst.
+                local _sbf_now; _sbf_now=$(date +%s)
+                if [ "$_sbf_count" -eq 0 ] || [ $(( _sbf_now - _sbf_first_ts )) -ge "$_SBF_WINDOW" ]; then
+                    _sbf_count=1; _sbf_first_ts=$_sbf_now
+                else
+                    _sbf_count=$(( _sbf_count + 1 ))
+                fi
+                _sbf_last_ts=$_sbf_now
+
+                if [ "$_sbf_count" -ge "$_SBF_THRESHOLD" ]; then
+                    if [ "$_sbf_flapping" -eq 0 ]; then
+                        _sbf_flapping=1
+                        logger -t podkop-bot "[Watchdog] sing-box flapping: ${_sbf_count} restarts in $(( (_sbf_now - _sbf_first_ts) / 60 + 1 )) min. Suppressing further per-restart alerts."
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _sbf_pl
+                            _sbf_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
+                                "$(printf '<b>[%s]</b> %s <b>sing-box флапает</b>\n\n<b>Перезапусков:</b> %s за %d мин\n\n<i>Дальнейшие уведомления о перезапусках приостановлены, пока процесс не стабилизируется. Частые причины: нехватка ОЗУ (OOM-killer) или нестабильный сервер в URLTest.</i>' \
+                                    "$_hn" "$E_WARN" "$_sbf_count" "$(( (_sbf_now - _sbf_first_ts) / 60 + 1 ))")" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_sbf_pl"
+                        fi
+                    fi
+                    # Flapping: skip the per-restart alert below, already covered
+                    # by the flap notice above.
+                elif [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    local _restart_route_key _restart_route_name _restart_txt _restart_pl
+                    _restart_route_key=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\
+\r\t ')
+                    _restart_route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null)
+                    [ -n "$_restart_route_name" ] || _restart_route_name="${_restart_route_key:-unknown}"
+                    case "${_restart_route_key:-unknown}" in
+                        tier2_*|tier3|warp_rescue)
+                            _restart_txt=$(printf '<b>[%s]</b> %s <b>sing-box перезапущен</b>\n\nВо время перезапуска бот сохранил связь через резервный канал.\n<b>Резерв:</b> <code>%s</code>\n<b>PID:</b> <code>%s → %s</code>\n\n<i>Проверяю основной SOCKS и возвращаю бота на него.</i>' \
+                                "$_hn" "$E_WARN" "$(html_escape "$_restart_route_name")" "$last_sb_pid" "$curr_sb_pid")
+                            ;;
+                        *)
+                            _restart_txt=$(printf '<b>[%s]</b> %s <b>sing-box перезапущен</b>\n\n<b>PID:</b> <code>%s → %s</code>\n<b>Текущий канал бота:</b> <code>%s</code>\n\n<i>Проверяю маршруты после перезапуска.</i>' \
+                                "$_hn" "$E_WARN" "$last_sb_pid" "$curr_sb_pid" "$(html_escape "$_restart_route_name")")
+                            ;;
+                    esac
+                    _restart_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_restart_txt" \
+                        '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                    send_health_alert "$_restart_pl"
+                fi
+            elif [ "$_sbf_flapping" -eq 1 ] && [ $(( $(date +%s) - _sbf_last_ts )) -ge "$_SBF_WINDOW" ]; then
+                # No new restart for a full window: the flap has settled.
+                local _sbf_total=$_sbf_count _sbf_recover_pl
+                _sbf_flapping=0; _sbf_count=0
+                logger -t podkop-bot "[Watchdog] sing-box restart flap settled: ${_sbf_total} restarts total."
+                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    _sbf_recover_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
+                        "$(printf '<b>[%s]</b> %s <b>sing-box стабилизировался</b>\n\nВсего перезапусков за флап: <b>%s</b>. Новых перезапусков больше нет — уведомления возобновлены.' \
+                            "$_hn" "$E_OK" "$_sbf_total")" \
+                        '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                    send_health_alert "$_sbf_recover_pl"
+                fi
+            fi
 
             if [ "$curr_sb_state" != "$last_sb_state" ]; then
                 if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
@@ -5854,6 +6162,7 @@ start_health_daemon() {
                 fi
                 last_sb_state="$curr_sb_state"
             fi
+            last_sb_pid="$curr_sb_pid"
 
             # ------------------------------------------------------------------
             # Check C: SOCKS upstream via probe_socks_upstream (3 endpoints)
@@ -6011,7 +6320,7 @@ start_health_daemon() {
                     # Nudge only an explicitly degraded POLL route. tier3 is healthy;
                     # unknown/stale values are intentionally ignored until POLL resolves.
                     case "${_wd_cur_route:-unknown}" in
-                        tier1|tier2_*|tier3)
+                        tier1|tier2_*|tier3|warp_rescue)
                             logger -t podkop-bot "[Watchdog] Route OK (${_wd_cur_route}), no action needed."
                             ;;
                         tier4|tier5|fail)
@@ -6109,7 +6418,7 @@ start_health_daemon() {
             # is worse than no alerting, so tier3 now clears the flag like any
             # other working route; the message names the actual route in use.
             case "${_wd_bot_route:-unknown}" in
-                tier1|tier2_*|tier3)
+                tier1|tier2_*|tier3|warp_rescue)
                     # Good route — if previously degraded, send recovery alert
                     if [ "${last_bot_route_degraded:-0}" = "1" ]; then
                         last_bot_route_degraded=0
@@ -6171,7 +6480,7 @@ start_health_daemon() {
                 # Only explicit degradation is actionable. Unknown/stale values do
                 # not prove a broken long-poll and therefore must not trigger rediscovery.
                 case "${_wd_cur_route:-unknown}" in
-                    tier1|tier2_*|tier3)
+                    tier1|tier2_*|tier3|warp_rescue)
                         : # good route, no nudge needed
                         ;;
                     tier4|tier5|fail)
@@ -6214,7 +6523,6 @@ _handle_sections() {
     case "$cmd" in
         "sections_menu")
             rm -f "$STATE_FILE"
-    rm -f "$REPLY_KB_INSTALLED_FILE"  # Force re-install reply keyboard after restart
             local sections rows s text kb _sdisp
             # uci show gives "podkop.NAME=section" for section objects.
             # Correct pattern matches lines ending in =section exactly.
@@ -6476,8 +6784,19 @@ SUBURLS
                 proxies=$(clash_request "/proxies")
             fi
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
-                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>Возможно, sing-box перезапускается. Повторите обновление через несколько секунд.</i>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+                # sing-box may be down precisely because of this section's config
+                # (dead subscription, bad manual link). Source edits are UCI-only,
+                # so keep them reachable here instead of dead-ending on Retry/Menu.
+                local _dn_kb="" _dn_hint=""
+                if section_is_subscription "$sec"; then
+                    _dn_kb="[{\"text\":\"✏ URL подписки\",\"callback_data\":\"cmd_edit_sub_url\"}],"
+                    _dn_hint="\n\nЕсли sing-box не стартует из-за подписки, URL можно заменить и без Clash API."
+                fi
+                if [ "$PODKOP_VARIANT" = "plus" ] || [ "$PODKOP_VARIANT" = "forkop" ] || ! section_is_subscription "$sec"; then
+                    _dn_kb="${_dn_kb}[{\"text\":\"${E_ADD} Прокси\",\"callback_data\":\"cmd_proxy_add\"}],"
+                fi
+                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>sing-box перезапускается или не смог запуститься с текущей конфигурацией.</i>%b' "$E_ERR" "$_dn_hint")" \
+                    "{\"inline_keyboard\":[${_dn_kb}[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -10646,6 +10965,80 @@ _fk_cond_human() {
     esac
 }
 
+# Detect a classic standalone Tailscale installation separately from sing-box
+# tsnet. A running tailscaled is not an automatic error, but creating/enabling a
+# second Tailscale node must require an explicit operator confirmation.
+_ts_standalone_present() {
+    [ -x /etc/init.d/tailscale ] || [ -x /etc/init.d/tailscaled ] || \
+        command -v tailscaled >/dev/null 2>&1 || command -v tailscale >/dev/null 2>&1
+}
+
+_ts_standalone_running() {
+    local _svc _c _cl
+    for _svc in /etc/init.d/tailscale /etc/init.d/tailscaled; do
+        [ -x "$_svc" ] || continue
+        "$_svc" running >/dev/null 2>&1 && return 0
+        "$_svc" status >/dev/null 2>&1 && return 0
+    done
+    for _c in /proc/[0-9]*/cmdline; do
+        [ -r "$_c" ] || continue
+        _cl=$(tr '\0' ' ' < "$_c" 2>/dev/null) || continue
+        case "$_cl" in *tailscaled*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Shared tsnet backend for Telegram. The standalone bot is deliberately
+# read-only for Tailscale unless a compatible controller backend is installed.
+TS_BACKEND_API_REQUIRED=1
+TS_BACKEND_PATH=/usr/libexec/rpcd/podkop_bot_tailscale
+
+_ts_backend_api_version() {
+    [ -x "$TS_BACKEND_PATH" ] || return 1
+    "$TS_BACKEND_PATH" list 2>/dev/null | jq -r '.api_version // 0' 2>/dev/null
+}
+_ts_backend_control_state() {
+    [ -x "$TS_BACKEND_PATH" ] || { printf '%s' missing; return 1; }
+    local _v
+    _v=$(_ts_backend_api_version 2>/dev/null)
+    [ "$_v" = "$TS_BACKEND_API_REQUIRED" ] || { printf '%s' incompatible; return 1; }
+    printf '%s' ready
+}
+_ts_backend_control_available() { [ "$(_ts_backend_control_state 2>/dev/null)" = ready ]; }
+_ts_backend_call() {
+    local _method="$1" _payload="${2:-{}}"
+    _ts_backend_control_available || return 2
+    printf '%s' "$_payload" | "$TS_BACKEND_PATH" call "$_method" 2>/dev/null
+}
+_ts_backend_status() { _ts_backend_call status '{}'; }
+_ts_backend_provider() { _ts_backend_status | jq -r '.provider // "none"' 2>/dev/null; }
+_ts_provider_kind() {
+    local _p
+    if [ "$PODKOP_VARIANT" = "forkop" ]; then
+        # Live Forkop evidence is authoritative over the optional LuCI backend.
+        # A standalone bot may be newer than the installed luci-app; older
+        # backends can report forkop-x even when full Forkop already owns a
+        # native protocol='tailscale' server. Never mark that live native section
+        # as legacy just because the helper is stale.
+        if [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\.protocol='tailscale'\$"; then
+            printf '%s' forkop-native
+            return 0
+        fi
+        _p=$(_ts_backend_provider 2>/dev/null)
+        case "$_p" in
+            forkop-x) printf '%s' forkop-x ;;
+            *)        printf '%s' forkop-x ;;
+        esac
+        return 0
+    fi
+
+    _p=$(_ts_backend_provider 2>/dev/null)
+    case "$_p" in podkop) printf '%s' podkop; return 0 ;; esac
+    [ "$PODKOP_VARIANT" = "original" ] && { printf '%s' podkop; return 0; }
+    printf '%s' none
+}
+_ts_backend_native() { [ "$(_ts_provider_kind)" = "forkop-native" ]; }
+
 # ── Tailscale server management (Forkop) ──────────────────────────────────────
 # Read-only rendering of tailscale servers already lives in cmd_server_instances.
 # This block adds the write path: create a server, and toggle the two flags that
@@ -10776,12 +11169,35 @@ _ts_pending_clear() {
 # The bot intentionally supports one managed Tailscale endpoint per router; LuCI
 # remains available for advanced users who deliberately need more than one.
 _ts_find_existing() {
-    uci -q show "$PODKOP_UCI" 2>/dev/null | \
-        sed -n "s/^${PODKOP_UCI}\.\(.*\)\.protocol='tailscale'$/\1/p" | head -n 1
+    local _st _configured _legacy _sec
+    _st=$(_ts_backend_status 2>/dev/null) || _st=''
+    if [ -n "$_st" ]; then
+        _configured=$(printf '%s' "$_st" | jq -r '.configured // false' 2>/dev/null)
+        if [ "$_configured" = "true" ]; then
+            printf '%s' "$_st" | jq -r '.section // "podkop-bot-tailscale"' 2>/dev/null
+            return 0
+        fi
+        _legacy=$(printf '%s' "$_st" | jq -r '.legacy_native_present // false' 2>/dev/null)
+        if [ "$_legacy" = "true" ]; then
+            printf '%s' "$_st" | jq -r '.legacy_native_section // empty' 2>/dev/null
+            return 0
+        fi
+    fi
+    # Backend may be missing or API-incompatible during a staged upgrade.
+    # Keep the old direct-UCI fallback for every Forkop flavour so a native
+    # Tailscale section cannot become invisible and be accidentally duplicated.
+    if [ "$PODKOP_VARIANT" = "forkop" ]; then
+        _sec=$(uci -q show "$PODKOP_UCI" 2>/dev/null | sed -n "s/^${PODKOP_UCI}\.\([^.=]*\)\.protocol='tailscale'$/\1/p" | head -n 1)
+        [ -n "$_sec" ] || return 1
+        printf '%s' "$_sec"
+        return 0
+    fi
+    return 1
 }
 
 # _ts_gen_name: unused UCI section name for a new tailscale server.
 _ts_gen_name() {
+    if ! _ts_backend_native; then printf '%s' "podkop-bot-tailscale"; return 0; fi
     local _i=1 _n _state_dir
     while [ "$_i" -lt 100 ]; do
         _n="server_ts_${_i}"
@@ -10801,6 +11217,7 @@ _ts_gen_name() {
 # Stages the whole server in one transaction. Any staging failure reverts.
 _ts_create() {
     local _n="$1" _url="$2" _key="$3" _exit="$4" _host="$5"
+    _ts_backend_native || return 0
     uci -q set "${PODKOP_UCI}.${_n}=server" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_n}.protocol" "tailscale"            || return 1
     # Created DISABLED on purpose. Enabling a tailscale endpoint makes sing-box
@@ -10828,6 +11245,13 @@ _ts_create() {
 #          5=read-back mismatch+rollback OK, 6=read-back mismatch+rollback failed.
 _ts_commit_created_disabled() {
     local _n="$1" _url="$2" _key="$3" _exit="$4" _host="$5"
+    if ! _ts_backend_native; then
+        local _payload _r
+        _payload=$(jq -cn --arg u "$_url" --arg k "$_key" --arg h "$_host" '{control_url:$u,auth_key:$k,hostname:$h,advertise_exit_node:false,confirm_standalone:true}') || return 1
+        _r=$(_ts_backend_call create "$_payload") || return 1
+        [ "$(printf '%s' "$_r" | jq -r '.ok // false' 2>/dev/null)" = "true" ]
+        return
+    fi
     local _bak="${BOT_DIR}/ts_cfg_bak.$$" _ok=1
 
     mkdir -p "$BOT_DIR" 2>/dev/null || true
@@ -10879,7 +11303,7 @@ _si_ts_registered_global() {
 
 _ts_create_fail_msg() {
     case "$1" in
-        1) printf '%s Не удалось сохранить Tailscale в UCI — изменение отменено.' "$E_ERR" ;;
+        1) printf '%s Не удалось сохранить Tailscale через backend — изменение отменено.' "$E_ERR" ;;
         3) printf '%s Не удалось создать резервную копию Forkop — Tailscale не добавлен.' "$E_ERR" ;;
         5) printf '%s Проверка сохранённой Tailscale-секции не прошла — конфигурация восстановлена.' "$E_WARN" ;;
         6) printf '%s Проверка Tailscale-секции не прошла и откат файла Forkop не удался. Не включайте узел до проверки конфигурации.' "$E_ERR" ;;
@@ -11337,8 +11761,7 @@ _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
     local sec=$(get_active_section)
     if [ "$PODKOP_VARIANT" != "forkop" ]; then
-        _handle_settings "section_settings" "$mid" "" ""
-        return
+        case "$cmd" in ts_*|STATE_INPUT) ;; *) _handle_settings "section_settings" "$mid" "" ""; return ;; esac
     fi
 
     if [ "$cmd" = "STATE_INPUT" ]; then
@@ -11961,7 +12384,13 @@ ${_ip}"; fi
             send_or_edit "$mid" "$(printf '%s <b>Интервал автообновления</b>\n\nОтправьте интервал: <code>12h</code>, <code>1d</code>, <code>30m</code>.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
             ;;
-        "ts_add")
+        "ts_add"|"ts_add_confirm")
+            if [ "$cmd" = "ts_add" ] && _ts_standalone_running; then
+                send_or_edit "$mid" \
+                    "$(printf '%s <b>Уже работает отдельный Tailscale (tailscaled).</b>\n\nForkop запустит второй узел через встроенный tsnet sing-box. Это допустимо, но может дать два узла, пересекающиеся маршруты или неожиданный выбор exit node.\n\nПродолжить всё равно?' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"⚠️ Продолжить всё равно\",\"callback_data\":\"ts_add_confirm\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                return
+            fi
             # The bot deliberately manages at most one Tailscale endpoint. Forkop
             # itself can represent more, but accidental duplicates create multiple
             # tsnet identities/state directories and are almost never intended.
@@ -11970,8 +12399,14 @@ ${_ip}"; fi
             if [ -n "$_existing_ts" ]; then
                 _ts_pending_clear; rm -f "$STATE_FILE"
                 local _existing_h _existing_en
-                _existing_h=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.tailscale_hostname" 2>/dev/null)
-                _existing_en=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.enabled" 2>/dev/null)
+                if _ts_backend_native; then
+                    _existing_h=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.tailscale_hostname" 2>/dev/null)
+                    _existing_en=$(uci -q get "${PODKOP_UCI}.${_existing_ts}.enabled" 2>/dev/null)
+                else
+                    local _bst; _bst=$(_ts_backend_status)
+                    _existing_h=$(printf '%s' "$_bst" | jq -r '.hostname // empty')
+                    [ "$(printf '%s' "$_bst" | jq -r '.enabled // false')" = true ] && _existing_en=1 || _existing_en=0
+                fi
                 [ -n "$_existing_h" ] || _existing_h="$_existing_ts"
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Tailscale уже настроен</b>\n\nУзел: <code>%s</code>\nСостояние: <b>%s</b>\n\n<i>Второй Tailscale-узел через бота не создаётся, чтобы случайно не зарегистрировать дубликат.</i>' "$E_WARN" "$(html_escape "$_existing_h")" "$([ "$_existing_en" = "1" ] && printf 'включён' || printf 'выключен')")" \
@@ -11996,7 +12431,71 @@ ${_ip}"; fi
                 "$(printf '%s <b>Адрес контрол-сервера</b>\n\nОтправьте адрес, например <code>https://headscale.example.com</code>.\n\n<i>Для облачного Tailscale отправьте <code>https://controlplane.tailscale.com</code>.</i>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
             ;;
-        "ts_e_"*|"ts_x_"*|"ts_r_"*)
+        "ts_ld_"*)
+            local _sn="${cmd#ts_ld_}" _kb
+            if _ts_backend_native || [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" != "tailscale" ]; then
+                CB_ANSWER_TEXT="Старая Tailscale-секция уже исчезла"
+                _handle_bot "cmd_server_instances" "$mid" "" ""
+                return
+            fi
+            _kb=$(jq -cn \
+                --arg d "ts_ldc_${_sn}_0" --arg p "ts_ldc_${_sn}_1" --arg b "cmd_server_instances" \
+                --arg back "${E_BACK} Отмена" \
+                '{inline_keyboard:[[ {text:"🗑 Удалить секцию",callback_data:$d} ],[ {text:"🧹 Удалить вместе с state",callback_data:$p} ],[ {text:$back,callback_data:$b} ]]}' )
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Устаревшая Tailscale-секция</b> · <code>%s</code>\n\nОна осталась от полного Forkop, но текущий Forkop X её не обслуживает. Удаление ниже меняет только UCI и <b>не перезапускает Forkop/sing-box</b>.\n\nОбычное удаление сохранит старую identity/state на случай возврата. Полное удаление также сотрёт <code>/etc/forkop/tailscale/%s</code>.' "$E_WARN" "$(html_escape "$_sn")" "$(html_escape "$_sn")")" \
+                "$_kb"
+            ;;
+        "ts_ldc_"*)
+            local _lr="${cmd#ts_ldc_}" _sn _purge _st _expected _payload _br
+            _purge="${_lr##*_}"; _sn="${_lr%_[01]}"
+            case "$_purge" in 0|1) ;; *) CB_ANSWER_TEXT="Некорректная команда"; return ;; esac
+            if _ts_backend_native || [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" != "tailscale" ]; then
+                CB_ANSWER_TEXT="Секция уже исчезла или снова обслуживается native Forkop"
+                _handle_bot "cmd_server_instances" "$mid" "" ""
+                return
+            fi
+            _st=$(_ts_backend_status 2>/dev/null || true)
+            _expected=$(printf '%s' "$_st" | jq -r '.legacy_native_section // empty' 2>/dev/null)
+            if [ -n "$_st" ] && [ -n "$_expected" ] && [ "$_expected" != "$_sn" ]; then
+                CB_ANSWER_TEXT="Список устарел — откройте службы заново"; return
+            fi
+            _payload=$(jq -cn --argjson p "$([ "$_purge" = 1 ] && echo true || echo false)" '{legacy_native:true,purge_state:$p}')
+            _br=$(_ts_backend_call delete "$_payload" 2>/dev/null || true)
+            if [ "$(printf '%s' "$_br" | jq -r '.ok // false' 2>/dev/null)" != true ]; then
+                if uci -q delete "${PODKOP_UCI}.${_sn}" && uci -q commit "$PODKOP_UCI"; then
+                    [ "$_purge" = 1 ] && rm -rf "/etc/forkop/tailscale/${_sn}" 2>/dev/null || true
+                else
+                    send_message "$(printf '%s Не удалось удалить устаревшую Tailscale-секцию.' "$E_ERR")" ""; return
+                fi
+            fi
+            local _cleanup_tail
+            _cleanup_tail="$([ "$_purge" = 1 ] && printf ' Старый state также удалён.' || true)"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Старая Tailscale-секция удалена.</b>\n\nForkop X и sing-box не перезапускались.%s\n\nМожно сразу создать новый tsnet через установленный sing-box.' "$E_OK" "$_cleanup_tail")" \
+                "{\"inline_keyboard\":[[{\"text\":\"➕ Создать новое tsnet\",\"callback_data\":\"ts_add\"}],[{\"text\":\"${E_SRV} К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+            ;;
+        "ts_e_"*|"ts_ec_"*|"ts_x_"*|"ts_r_"*)
+            local _ts_confirmed=0 _ts_target _ts_payload
+            # Standalone tailscaled conflict confirmation applies only when the
+            # managed tsnet node itself is being enabled. Changing flags on an
+            # already existing node (exit-node / accept-routes) does not create
+            # another identity and must never be remapped through ts_ec_.
+            case "$cmd" in
+                ts_ec_*) _ts_confirmed=1; cmd="ts_e_${cmd#ts_ec_}" ;;
+            esac
+            case "$cmd" in
+                ts_e_*)
+                    _ts_target="${cmd##*_}"
+                    if [ "$_ts_target" = "1" ] && [ "$_ts_confirmed" != "1" ] && _ts_standalone_running; then
+                        _ts_payload="${cmd#ts_e_}"
+                        send_or_edit "$mid" \
+                            "$(printf '%s <b>Standalone Tailscale уже запущен.</b>\n\nВключить одновременно встроенный tsnet sing-box? Оба узла останутся самостоятельными.' "$E_WARN")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"⚠️ Включить всё равно\",\"callback_data\":\"ts_ec_${_ts_payload}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_server_instances\"}]]}"
+                        return
+                    fi
+                    ;;
+            esac
             # Toggles on an existing node: advertise_exit_node / accept_routes.
             # callback = ts_<x|r>_<section>_<0|1>
             local _rest _sn _nv _key
@@ -12006,6 +12505,23 @@ ${_ip}"; fi
                 *)      _rest="${cmd#ts_r_}"; _key="tailscale_accept_routes" ;;
             esac
             _sn="${_rest%_[01]}"; _nv="${_rest##*_}"
+            if ! _ts_backend_native; then
+                if [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" = "tailscale" ]; then
+                    CB_ANSWER_TEXT="Это устаревшая native-секция — удалите её из карточки служб"
+                    _handle_bot "cmd_server_instances" "$mid" "" ""
+                    return
+                fi
+                if [ "$_key" != "enabled" ]; then CB_ANSWER_TEXT="В MVP для Podkop/Forkop X доступно только подключение tsnet"; return; fi
+                local _confirm=false _payload _br
+                [ "$_ts_confirmed" = "1" ] && _confirm=true
+                _payload=$(jq -cn --argjson e "$([ "$_nv" = 1 ] && echo true || echo false)" --argjson c "$_confirm" '{enabled:$e,confirm_standalone:$c}')
+                _br=$(_ts_backend_call set_enabled "$_payload")
+                if [ "$(printf '%s' "$_br" | jq -r '.ok // false')" != true ]; then
+                    send_message "$(printf '%s Не удалось изменить Tailscale: <code>%s</code>' "$E_WARN" "$(html_escape "$(printf '%s' "$_br" | jq -r '.reason // "backend_error"')")")" ""; return
+                fi
+                [ "$_nv" = 1 ] && send_message "$(printf '%s <b>Tailscale включён</b>. tsnet применяется fail-open overlay, не блокируя основной сервис.' "$E_OK")" "" || send_message "$(printf '%s Tailscale выключен.' "$E_OK")" ""
+                return
+            fi
             if [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" != "tailscale" ]; then
                 send_message "$(printf '%s Секция не найдена — откройте список заново.' "$E_WARN")" ""
                 return
@@ -13608,7 +14124,38 @@ _handle_fallback_socks() {
                 rows="${rows}[{\"text\":\"tier3 · $(json_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3")")")\",\"callback_data\":\"np_view_bot\"}],"
             fi
 
-            # tier4/tier5 always exist — say so, so the chain has no invisible parts.
+            # WARP Rescue is owned by Revolver, but belongs in this ordered runtime chain.
+            local _wr_enabled _wr_port _wr_state _wr_lat
+            _wr_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+            if [ "$_wr_enabled" = "1" ]; then
+                _wr_port=$(_warp_rescue_cfg_get socks_port 2>/dev/null || true)
+                case "$_wr_port" in ''|*[!0-9]*) _wr_port=18191 ;; esac
+                _wr_lat=$(grep '^warp_rescue=' "$SOCKS_PROBE_FILE" 2>/dev/null | cut -d= -f2 | cut -d' ' -f1)
+                local _wr_ep _wr_node _wr_loc _wr_meta
+                _wr_ep=$(sed -n 's/^endpoint=//p' /tmp/podkop_bot/warpscout_rescue.state 2>/dev/null | head -n1)
+                [ -z "$_wr_ep" ] && _wr_ep=$(_warp_rescue_cfg_get active_endpoint 2>/dev/null || true)
+                _wr_meta=$(awk -F'|' -v e="$_wr_ep" '$1==e {print $6 "|" $7; exit}' /etc/podkop_bot/warpscout-shortlist.tsv 2>/dev/null)
+                _wr_node=${_wr_meta%%|*}; _wr_loc=${_wr_meta#*|}
+                [ "$_wr_loc" = "$_wr_meta" ] && _wr_loc=""
+                if _warp_rescue_pid_alive; then
+                    _wr_state="ON-AIR${_wr_lat:+ · $_wr_lat}"
+                else
+                    _wr_state="ожидает Revolver"
+                fi
+                _row_lbl=""; [ "${LAST_ROUTE:-}" = "warp_rescue" ] && _row_lbl=" ${E_PLAY}"
+                list_text=$(printf '%s\
+\
+<code>warp_rescue</code>%s WARP Rescue <code>socks5h://127.0.0.1:%s</code> — <i>%s</i>' \
+                    "$list_text" "$_row_lbl" "$_wr_port" "$_wr_state")
+                if [ -n "$_wr_ep" ]; then
+                    local _wr_desc="Сервер выхода: $_wr_ep"
+                    [ -n "$_wr_loc" ] && _wr_desc="${_wr_desc} · $_wr_loc"
+                    [ -n "$_wr_node" ] && _wr_desc="${_wr_desc} · $_wr_node"
+                    list_text=$(printf '%s\n<i>%s</i>' "$list_text" "$_wr_desc")
+                fi
+            fi
+
+            # Direct and emergency IPs are the final two tiers.
             _row_lbl=""; [ "${LAST_ROUTE:-}" = "tier4" ] && _row_lbl=" ${E_PLAY}"
             list_text=$(printf '%s\n\n<code>tier4</code>%s Напрямую' "$list_text" "$_row_lbl")
             _row_lbl=""; [ "${LAST_ROUTE:-}" = "tier5" ] && _row_lbl=" ${E_PLAY}"
@@ -13619,6 +14166,7 @@ _handle_fallback_socks() {
             [ -z "$_t3" ] && _add_t3_btn=",{\"text\":\"${E_ADD} Прокси бота\",\"callback_data\":\"cmd_custom_proxy\"}"
             text=$(printf '%s <b>Прокси подключения</b>\n\nБот пробует каналы сверху вниз, пока один не ответит. %s — активный сейчас.\nАдрес может быть <code>socks5h://</code>, <code>socks5://</code> или <code>http://</code>.\n\n%s' \
                 "$E_NET" "$E_PLAY" "$list_text")
+            text=$(printf '%s' "$text" | sed 's/\\$//') # r44-proxy-ui-sync
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} SOCKS\",\"callback_data\":\"cmd_fb_socks_add\"}${_add_t3_btn}],[{\"text\":\"${E_TEST} Проверить все\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"net_proxies_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -13918,6 +14466,20 @@ _handle_fallback_socks() {
                 local _t3_show; _t3_show=$(html_escape "$(_mask_proxy "$(_proxy_endpoint "$_t3_test")")")
                 _append_channel "Прокси бота" "$_t3_show"
             fi
+            # Manual "Проверить все" includes the real WARP runtime tier.
+            local _wr_test_enabled _wr_test_proxy
+            _wr_test_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+            if [ "$_wr_test_enabled" = "1" ]; then
+                _wr_test_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
+                if [ -n "$_wr_test_proxy" ]; then
+                    _probe_channel "$_wr_test_proxy"
+                    _append_channel "WARP Rescue" "$(html_escape "$_wr_test_proxy")"
+                else
+                    CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
+                    CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="не удалось запустить"
+                    _append_channel "WARP Rescue" "Revolver не поднял SOCKS"
+                fi
+            fi
             unset -f _probe_channel _append_channel
             [ -z "$result_text" ] && result_text="<i>Узлы не настроены.</i>"
             send_or_edit "$mid" \
@@ -14028,6 +14590,7 @@ _handle_bot() {
                     tier1) printf 'основной SOCKS' ;;
                     tier2_*) printf 'резервный SOCKS №%s' "${1#tier2_}" ;;
                     tier3) printf 'прокси бота' ;;
+                    warp_rescue) printf 'WARP Rescue' ;;
                     tier4) printf 'напрямую' ;;
                     tier5) printf 'аварийный IP' ;;
                     fail) printf 'нет соединения' ;;
@@ -14061,7 +14624,7 @@ EOF
             kb="${kb}[{\"text\":\"${E_SET} Настройки\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"${E_RST} Перезапустить\",\"callback_data\":\"ask_reload_podkop\"}],"
             kb="${kb}[{\"text\":\"${E_BOT} Настройки бота\",\"callback_data\":\"bot_settings\"},${_stop_start}],"
             case "$PODKOP_VARIANT" in
-                plus|forkop)
+                original|plus|forkop)
                     kb="${kb}[{\"text\":\"${E_SRV} Службы\",\"callback_data\":\"cmd_server_instances\"}],"
                     ;;
             esac
@@ -14474,7 +15037,7 @@ EOF
             # Plus and Forkop expose this model; no write operations are performed.
             # Clash /connections is used only optionally for live traffic stats.
             case "$PODKOP_VARIANT" in
-                plus|forkop) : ;;
+                original|plus|forkop) : ;;
                 *)
                     send_or_edit "$mid" \
                         "$(printf '%s Раздел «Службы» доступен в Podkop Plus и Forkop.' "$E_WARN")" \
@@ -14494,10 +15057,58 @@ EOF
             local _s
             for _s in $_si_sections; do _si_count=$((_si_count+1)); done
 
-            if [ "$_si_count" -eq 0 ]; then
+            # Forkop X / classic Podkop keep the managed tsnet outside UCI server
+            # sections. Use the same backend status as LuCI. Without a compatible
+            # backend inspect only non-secret managed-state fields and stay read-only.
+            local _ts_managed_status='' _ts_managed_present=0 _ts_managed_backend=0
+            local _ts_managed_provider='' _ts_managed_host='' _ts_managed_url=''
+            local _ts_managed_enabled=false _ts_managed_registered=false
+            local _ts_managed_applied=false _ts_managed_sb=false _ts_managed_active=0
+            local _ts_managed_runtime=unknown _ts_managed_accept=false _ts_managed_exit=false
+            if _ts_backend_control_available; then
+                _ts_managed_status=$(_ts_backend_status 2>/dev/null || true)
+                if [ -n "$_ts_managed_status" ] &&                    [ "$(printf '%s' "$_ts_managed_status" | jq -r '.configured // false' 2>/dev/null)" = true ] &&                    [ "$(printf '%s' "$_ts_managed_status" | jq -r '.provider // "none"' 2>/dev/null)" != forkop-native ]; then
+                    _ts_managed_present=1; _ts_managed_backend=1
+                    _ts_managed_provider=$(printf '%s' "$_ts_managed_status" | jq -r '.provider // "none"' 2>/dev/null)
+                    _ts_managed_host=$(printf '%s' "$_ts_managed_status" | jq -r '.hostname // empty' 2>/dev/null)
+                    _ts_managed_url=$(printf '%s' "$_ts_managed_status" | jq -r '.control_url // empty' 2>/dev/null)
+                    _ts_managed_enabled=$(printf '%s' "$_ts_managed_status" | jq -r '.enabled // false' 2>/dev/null)
+                    _ts_managed_registered=$(printf '%s' "$_ts_managed_status" | jq -r '.registered // false' 2>/dev/null)
+                    _ts_managed_applied=$(printf '%s' "$_ts_managed_status" | jq -r '.runtime_applied // false' 2>/dev/null)
+                    _ts_managed_sb=$(printf '%s' "$_ts_managed_status" | jq -r '.singbox_running // false' 2>/dev/null)
+                    _ts_managed_active=$(printf '%s' "$_ts_managed_status" | jq -r '.active_connections // 0' 2>/dev/null)
+                    _ts_managed_runtime=$(printf '%s' "$_ts_managed_status" | jq -r '.runtime_state // "unknown"' 2>/dev/null)
+                    _ts_managed_accept=$(printf '%s' "$_ts_managed_status" | jq -r '.accept_routes // false' 2>/dev/null)
+                    _ts_managed_exit=$(printf '%s' "$_ts_managed_status" | jq -r '.advertise_exit_node // false' 2>/dev/null)
+                fi
+            elif [ -r /etc/podkop-bot/tsnet.json ] && [ "$(_ts_provider_kind)" != forkop-native ]; then
+                _ts_managed_present=1; _ts_managed_provider=$(_ts_provider_kind)
+                _ts_managed_host=$(jq -r '.hostname // empty' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_url=$(jq -r '.control_url // empty' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_enabled=$(jq -r '.enabled // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_accept=$(jq -r '.accept_routes // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+                _ts_managed_exit=$(jq -r '.advertise_exit_node // false' /etc/podkop-bot/tsnet.json 2>/dev/null)
+            fi
+
+            # Standalone tailscaled is a service in its own right. It must be
+            # visible even when Podkop/Forkop has no `config server` sections and
+            # even on legacy/orphaned Podkop Plus. Detection and permission to
+            # create a second sing-box tsnet node are deliberately separate.
+            local _ts_standalone_present_flag=0 _ts_standalone_running_flag=0
+            _ts_standalone_present && _ts_standalone_present_flag=1
+            [ "$_ts_standalone_present_flag" = 1 ] && _ts_standalone_running && _ts_standalone_running_flag=1
+
+            local _si_total=$((_si_count + _ts_managed_present + _ts_standalone_present_flag))
+            if [ "$_si_total" -eq 0 ]; then
+                local _ts_empty_add=''
+                # Podkop Plus is intentionally observer-only: it is orphaned and
+                # we do not create a new tsnet integration for it.
+                if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
+                    _ts_empty_add='[{"text":"➕ Tailscale через sing-box","callback_data":"ts_add"}],'
+                fi
                 send_or_edit "$mid" \
-                    "$(printf '%s <b>Службы</b>\n\n<i>Серверы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
-                    "{\"inline_keyboard\":[$(if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then printf '[{"text":"\xe2\x9e\x95 Tailscale","callback_data":"ts_add"}],'; fi)[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
+                    "$(printf '%s <b>Службы</b>\n\n<i>Серверы и Tailscale-службы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
+                    "{\"inline_keyboard\":[${_ts_empty_add}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -14516,7 +15127,8 @@ EOF
                 ' > "$_conn_map_file" 2>/dev/null
             fi
 
-            local _ts_toggle_rows=""
+            local _ts_toggle_rows="" _ts_provider_current
+            _ts_provider_current=$(_ts_provider_kind)
             _si_conn_stats() {
                 awk -v t="$1" '$1==t{print;found=1;exit} END{if(!found)print t,0,0,0}' \
                     "$_conn_map_file" 2>/dev/null
@@ -14555,7 +15167,7 @@ EOF
             }
 
             local _text
-            _text="${E_SRV} <b>Службы</b> (${_si_count})\n"
+            _text="${E_SRV} <b>Службы</b> (${_si_total})\n"
             _text="${_text}<code>────────────────────</code>"
 
             # Compute sing-box liveness once (used by tailscale status); avoids one
@@ -14563,8 +15175,79 @@ EOF
             local _sb_alive=0
             pgrep -f sing-box >/dev/null 2>&1 && _sb_alive=1
 
+            # Classic standalone tailscaled card. Read-only by design: this bot
+            # does not take ownership of a separately installed Tailscale daemon.
+            if [ "$_ts_standalone_present_flag" = 1 ]; then
+                local _tss_icon _tss_state _tss_ip _tss_iface
+                if [ "$_ts_standalone_running_flag" = 1 ]; then
+                    _tss_icon="${E_ON}"; _tss_state="<b>работает</b>"
+                else
+                    _tss_icon="${E_OFF}"; _tss_state="установлен, но не запущен"
+                fi
+                _tss_iface=$(ip -4 -o addr 2>/dev/null | awk '$2 ~ /^tailscale/ {print $2; exit}')
+                _tss_ip=$(ip -4 -o addr 2>/dev/null | awk '$2 ~ /^tailscale/ {split($4,a,"/"); print a[1]; exit}')
+                _text="${_text}\n\n${_tss_icon} <b>Tailscale</b> · <code>standalone</code>"
+                _text="${_text}\n    🔗 ${_tss_state}"
+                _text="${_text}\n    🧩 Отдельная служба <code>tailscaled</code>"
+                [ -n "$_tss_iface" ] && _text="${_text}\n    🔌 Интерфейс: <code>$(html_escape "$_tss_iface")</code>"
+                [ -n "$_tss_ip" ] && _text="${_text}\n    📍 <code>$(html_escape "$_tss_ip")</code>"
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text="${_text}\n    ℹ️ Podkop Plus: только наблюдение; новый tsnet через sing-box здесь не создаётся"
+                elif [ "$_ts_managed_present" = 0 ] && [ "$(_ts_provider_kind)" != none ]; then
+                    _text="${_text}\n    ℹ️ Можно добавить отдельный tsnet через sing-box; это будет второй Tailscale-узел"
+                fi
+            fi
+
+            # Non-native managed tsnet card. Identity existence is not treated as
+            # proof of continuous control-plane connectivity; live activity comes
+            # only from backend runtime evidence.
+            if [ "$_ts_managed_present" = 1 ]; then
+                local _tm_icon _tm_state _tm_integration _tm_en_lbl
+                case "$_ts_managed_runtime" in
+                    active)   _tm_icon="${E_ON}";  _tm_state="<b>есть активный Tailscale-трафик</b>" ;;
+                    ready)    _tm_icon="${E_ON}";  _tm_state="endpoint применён · sing-box работает" ;;
+                    starting)
+                        if [ "$_ts_managed_applied" = true ] && [ "$_ts_managed_sb" = true ]; then
+                            _tm_icon="${E_ON}"; _tm_state="endpoint работает · identity ещё не подтверждена диагностикой"
+                        else
+                            _tm_icon="${E_YLW}"; _tm_state="запускается"
+                        fi ;;
+                    degraded) _tm_icon="${E_YLW}"; _tm_state="настроен, но endpoint сейчас не применён" ;;
+                    failed)   _tm_icon="${E_ERR}"; _tm_state="настроен, но sing-box не работает" ;;
+                    disabled) _tm_icon="${E_OFF}"; _tm_state="настроен, но выключен" ;;
+                    *)
+                        if [ "$_ts_managed_enabled" = true ]; then _tm_icon="${E_YLW}"; _tm_state="настроен · runtime-статус недоступен"
+                        else _tm_icon="${E_OFF}"; _tm_state="настроен, но выключен"; fi ;;
+                esac
+                case "$_ts_managed_provider" in
+                    forkop-x) _tm_integration="Forkop X · safe overlay" ;;
+                    podkop) _tm_integration="Podkop · safe overlay" ;;
+                    *) _tm_integration="$(html_escape "$_ts_managed_provider") · overlay" ;;
+                esac
+                _text="${_text}\n\n${_tm_icon} <b>Tailscale</b> · <code>tsnet</code>"
+                _text="${_text}\n    🔗 ${_tm_state}"
+                _text="${_text}\n    🧩 Интеграция: ${_tm_integration}"
+                [ -n "$_ts_managed_host" ] && _text="${_text}\n    🏷 Узел: <code>$(html_escape "$_ts_managed_host")</code>"
+                case "$_ts_managed_url" in ""|"https://controlplane.tailscale.com") : ;; *) _text="${_text}\n    🛰 Сервер управления: <code>$(html_escape "$_ts_managed_url")</code>" ;; esac
+                if [ "$_ts_managed_backend" = 1 ]; then
+                    [ "$_ts_managed_applied" = true ] && _text="${_text}\n    ✅ Endpoint применён в sing-box" || _text="${_text}\n    ⚠️ Endpoint не найден в текущем конфиге sing-box"
+                    [ "$_ts_managed_sb" = true ] && _text="${_text}\n    ⚙️ sing-box: работает" || _text="${_text}\n    ⚙️ sing-box: не работает"
+                    [ "$_ts_managed_registered" = true ] && _text="${_text}\n    💾 Identity: создана" || _text="${_text}\n    💾 Identity: ещё не создана"
+                    case "$_ts_managed_active" in ''|*[!0-9]*) _ts_managed_active=0 ;; esac
+                    [ "$_ts_managed_active" -gt 0 ] && _text="${_text}\n    📊 Активных соединений Tailscale: ${_ts_managed_active}"
+                else
+                    _text="${_text}\n    ℹ️ Runtime-диагностика недоступна без совместимого backend"
+                fi
+                [ "$_ts_managed_accept" = true ] && _text="${_text}\n    📥 принимает маршруты"
+                [ "$_ts_managed_exit" = true ] && _text="${_text}\n    🚪 анонсирует выходной узел"
+                if [ "$_ts_managed_backend" = 1 ]; then
+                    [ "$_ts_managed_enabled" = true ] && _tm_en_lbl="${E_ON} Узел включён" || _tm_en_lbl="${E_OFF} Узел выключен"
+                    _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_tm_en_lbl")\",\"callback_data\":\"ts_e_podkop-bot-tailscale_$([ "$_ts_managed_enabled" = true ] && echo 0 || echo 1)\"}],"
+                fi
+            fi
+
             for _s in $_si_sections; do
-                local _proto _enabled _listen _port _pubhost _security _sni _routing_mode _routing_sec
+                local _proto _enabled _listen _port _pubhost _security _sni _routing_mode _routing_sec _ts_legacy=0
                 _proto=$(uci -q get ${PODKOP_UCI}.${_s}.protocol 2>/dev/null || echo "vless")
                 _enabled=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null || echo "1")
                 _listen=$(uci -q get ${PODKOP_UCI}.${_s}.listen 2>/dev/null || echo "0.0.0.0")
@@ -14574,6 +15257,7 @@ EOF
                 _sni=$(uci -q get ${PODKOP_UCI}.${_s}.tls_server_name 2>/dev/null || echo "")
                 _routing_mode=$(uci -q get ${PODKOP_UCI}.${_s}.routing_mode 2>/dev/null || echo "rules")
                 _routing_sec=$(uci -q get ${PODKOP_UCI}.${_s}.routing_section 2>/dev/null || echo "")
+                [ "$_proto" = "tailscale" ] && [ "$_ts_provider_current" != "forkop-native" ] && _ts_legacy=1
 
                 # Status icon: enabled in UCI + port listening
                 local _icon
@@ -14590,7 +15274,9 @@ EOF
                 # (per-section tailscaled.state exists). Yellow = configured but not yet
                 # logged in (empty state / sing-box not up).
                 [ "$_proto" = "tailscale" ] && {
-                    if [ "$_enabled" != "1" ] && [ -n "$_enabled" ]; then
+                    if [ "$_ts_legacy" = 1 ]; then
+                        _icon="${E_WARN}"
+                    elif [ "$_enabled" != "1" ] && [ -n "$_enabled" ]; then
                         _icon="${E_OFF}"
                     elif [ "$_sb_alive" = "1" ] && _si_ts_registered "$_s"; then
                         _icon="${E_ON}"
@@ -14629,7 +15315,10 @@ EOF
                     _ts_accept=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_accept_routes 2>/dev/null || echo "0")
 
                     # Connectivity status line
-                    if [ "$_enabled" != "1" ] && [ -n "$_enabled" ]; then
+                    if [ "$_ts_legacy" = 1 ]; then
+                        _text="${_text}\n    ⚠️ <b>устаревшая native-секция полного Forkop</b>"
+                        _text="${_text}\n    <i>Forkop X её не обслуживает; включать/перезапускать sing-box нельзя</i>"
+                    elif [ "$_enabled" != "1" ] && [ -n "$_enabled" ]; then
                         _text="${_text}\n    ⏸ <i>настроен, но выключен — в tailnet не подключается</i>"
                     elif _si_ts_registered "$_s"; then
                         _text="${_text}\n    🔗 <b>подключён к tailnet</b> · пользовательский режим (tsnet)"
@@ -14669,15 +15358,21 @@ EOF
                 # Per-node toggles for tailscale: exit node + accept routes.
                 # Built while rendering so the labels match what the card shows.
                 [ "$_proto" = "tailscale" ] && {
-                    local _ex_cur _rt_cur _ex_lbl _rt_lbl
-                    _ex_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_advertise_exit_node 2>/dev/null)
-                    _rt_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_accept_routes 2>/dev/null)
-                    [ "$_ex_cur" = "1" ] && _ex_lbl="${E_ON} Выходной узел" || _ex_lbl="${E_OFF} Выходной узел"
-                    [ "$_rt_cur" = "1" ] && _rt_lbl="${E_ON} Принимать маршруты" || _rt_lbl="${E_OFF} Принимать маршруты"
-                    local _en_cur _en_lbl
-                    _en_cur=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
-                    [ "$_en_cur" = "1" ] && _en_lbl="${E_ON} Узел включён" || _en_lbl="${E_OFF} Узел выключен"
-                    _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_en_lbl")\",\"callback_data\":\"ts_e_${_s}_$([ "$_en_cur" = "1" ] && echo 0 || echo 1)\"}],[{\"text\":\"$(json_escape "$_ex_lbl")\",\"callback_data\":\"ts_x_${_s}_$([ "$_ex_cur" = "1" ] && echo 0 || echo 1)\"},{\"text\":\"$(json_escape "$_rt_lbl")\",\"callback_data\":\"ts_r_${_s}_$([ "$_rt_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                    if ! _ts_backend_control_available; then
+                        : # observer mode: render status only, never mutation buttons
+                    elif [ "$_ts_legacy" = 1 ]; then
+                        _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"🗑 Удалить старую Tailscale-секцию\",\"callback_data\":\"ts_ld_${_s}\"}],"
+                    else
+                        local _ex_cur _rt_cur _ex_lbl _rt_lbl
+                        _ex_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_advertise_exit_node 2>/dev/null)
+                        _rt_cur=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_accept_routes 2>/dev/null)
+                        [ "$_ex_cur" = "1" ] && _ex_lbl="${E_ON} Выходной узел" || _ex_lbl="${E_OFF} Выходной узел"
+                        [ "$_rt_cur" = "1" ] && _rt_lbl="${E_ON} Принимать маршруты" || _rt_lbl="${E_OFF} Принимать маршруты"
+                        local _en_cur _en_lbl
+                        _en_cur=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
+                        [ "$_en_cur" = "1" ] && _en_lbl="${E_ON} Узел включён" || _en_lbl="${E_OFF} Узел выключен"
+                        _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_en_lbl")\",\"callback_data\":\"ts_e_${_s}_$([ "$_en_cur" = "1" ] && echo 0 || echo 1)\"}],[{\"text\":\"$(json_escape "$_ex_lbl")\",\"callback_data\":\"ts_x_${_s}_$([ "$_ex_cur" = "1" ] && echo 0 || echo 1)\"},{\"text\":\"$(json_escape "$_rt_lbl")\",\"callback_data\":\"ts_r_${_s}_$([ "$_rt_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                    fi
                 }
 
                 # Public host — skip for tailscale (public_host is router WAN/LAN, not TS IP)
@@ -14722,7 +15417,11 @@ EOF
             done
 
             rm -f "$_conn_map_file"
-            _text="${_text}\n\n<i>Статус: 🟢 принимает подключения · 🟡 включён, но порт не найден · ⚫ выключен</i>"
+            if [ "$_ts_managed_present" = 1 ]; then
+                _text="${_text}\n\n<i>Tailscale: runtime-статус берётся из общего LuCI/backend; identity сама по себе не считается доказательством постоянного подключения.</i>"
+            else
+                _text="${_text}\n\n<i>Статус: 🟢 принимает подключения · 🟡 включён, но порт не найден · ⚫ выключен</i>"
+            fi
 
             # Render: convert our literal "\n" markers to real newlines WITHOUT the
             # fragile `printf '%b'` (which also interprets \t \xNN \c etc. that may appear
@@ -14731,13 +15430,29 @@ EOF
             # two-byte sequence backslash-n; every other byte (UTF-8 emoji, stray '\') passes through.
             local _text_nl
             _text_nl=$(printf '%s' "$_text" | awk '{gsub(/\\n/,"\n")}1')
+            if ! _ts_backend_control_available; then
+                local _ts_ctl_state _ts_ctl_note
+                _ts_ctl_state=$(_ts_backend_control_state 2>/dev/null)
+                if [ "$_ts_ctl_state" = incompatible ]; then
+                    _ts_ctl_note="Установленный backend имеет несовместимую версию API."
+                else
+                    _ts_ctl_note="Backend управления не установлен."
+                fi
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> Podkop Plus оставляем read-only; создание встроенного tsnet для него не поддерживаем."
+                else
+                    _text_nl="${_text_nl}\n\nℹ️ <b>Tailscale: режим наблюдения.</b> ${_ts_ctl_note}\nСоздание, изменение и удаление появятся автоматически с совместимым backend API v${TS_BACKEND_API_REQUIRED}."
+                fi
+            fi
             # Tailscale row: offered only on Forkop (config server + protocol=tailscale
             # is a Forkop feature) and only when the sing-box build can actually serve
             # it — offering a button that always errors is worse than no button.
             local _ts_row="" _ts_existing=""
-            if [ "$PODKOP_VARIANT" = "forkop" ] && singbox_supports_tailscale; then
+            # Creation capability is stricter than discovery. Standalone
+            # tailscaled is always shown, but Podkop Plus remains observer-only.
+            if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
                 _ts_existing=$(_ts_find_existing)
-                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale\",\"callback_data\":\"ts_add\"}],"
+                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
             fi
             send_or_edit "$mid" "$_text_nl" \
                 "{\"inline_keyboard\":[${_ts_row}${_ts_toggle_rows}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
@@ -14946,6 +15661,7 @@ EOF
                     tier1) printf 'основной SOCKS' ;;
                     tier2_*) printf 'резервный SOCKS №%s' "${1#tier2_}" ;;
                     tier3) printf 'прокси бота' ;;
+                    warp_rescue) printf 'WARP Rescue' ;;
                     tier4) printf 'напрямую' ;;
                     tier5) printf 'аварийный IP' ;;
                     fail) printf 'нет соединения' ;;
@@ -15024,7 +15740,8 @@ EOF
             m_ip=$(get_proxy_ip)
 
             # Build fallback route chain with active tier highlighted in bold.
-            # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3, tier4, tier5.
+            # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3,
+            # warp_rescue, tier4 or tier5.
             local tr_chain="" _tier=1 _fb_raw _fb _tier_key _tier_line
             _active_tier="$LAST_ROUTE_FAST"
             # Unconditionally: the chain block below is skipped in "direct" mode,
@@ -15073,6 +15790,18 @@ $(_fmt_tier "tier2_${_fn}" "Секция podkop (${_fb_esc})")"
                 _cp_esc=$(html_escape "$cp")
                 tr_chain="${tr_chain}
 $(_fmt_tier "tier3" "Прокси бота (${_cp_esc})")"
+                _tier=$((_tier + 1))
+            fi
+            # WARP Rescue is a real transport tier between configured proxies and Direct.
+            # Dormant means Revolver is armed but its localhost SOCKS is not running yet.
+            local _wr_enabled _wr_port _wr_state
+            _wr_enabled=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+            if [ "$tr" != "direct" ] && [ "$_wr_enabled" = "1" ]; then
+                _wr_port=$(_warp_rescue_cfg_get socks_port 2>/dev/null || true)
+                case "$_wr_port" in ''|*[!0-9]*) _wr_port=18191 ;; esac
+                if _warp_rescue_pid_alive; then _wr_state="ON-AIR"; else _wr_state="ожидание Revolver"; fi
+                tr_chain="${tr_chain}
+$(_fmt_tier "warp_rescue" "WARP Rescue (127.0.0.1:${_wr_port}, ${_wr_state})")"
                 _tier=$((_tier + 1))
             fi
             if [ "$tr" != "socks" ]; then
@@ -15149,6 +15878,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             local cp_sfx="" _cp_n=1 _cp_fb
             for _cp_fb in $_t_fb_socks; do _cp_n=$((_cp_n + 1)); done
             [ "$cp" != "Not set" ] && _cp_n=$((_cp_n + 1))
+            [ "$(_warp_rescue_cfg_get enabled 2>/dev/null || true)" = "1" ] && _cp_n=$((_cp_n + 1)) # r44-proxy-ui-sync
             cp_sfx=" · ${_cp_n}"
             [ "$bi" = "Not set" ]                 && bi_btn="{\"text\":\"${E_ADD} Привязать интерфейс\",\"callback_data\":\"cmd_bind_iface\"}"                 || bi_btn="{\"text\":\"${E_DEL} Отвязать интерфейс\",\"callback_data\":\"cmd_clear_bind_iface\"}"
             [ "$st" = "1" ] && st_icon="$E_ON" || st_icon="$E_OFF"
@@ -15909,7 +16639,7 @@ EOF
                 printf 'wait_bot_script_file\n%s\n%s\n%s\n' "$user_id" "$chat_id" "$(date +%s)"
             } > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте файл <code>podkop_bot.sh</code> как документ.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
+                "$(printf '%s <b>Загрузить скрипт бота</b>\n\nОтправьте скрипт бота как документ. Имя файла может быть любым.\n\n<i>Перед установкой будут проверены shebang, BOT_VERSION и синтаксис.\nТекущая версия бота будет сохранена в <code>podkop_bot.sh.bak</code>.\nПосле установки бот автоматически перезапустится.</i>\n\n/cancel — отмена.' "$E_FILE")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_maintenance\"}]]}"
             ;;
 
@@ -16417,6 +17147,14 @@ handle_command() {
     # State machine: intercept plain text (not callbacks) for multi-step input
     if [ -f "$STATE_FILE" ] && [ -z "$cb_id" ]; then
         local state; state=$(head -n 1 "$STATE_FILE")
+        # Persistent keyboard navigation must win over pending text input.
+        # normalize_reply_button() maps Status to cmd_status before dispatch.
+        if [ "$1" = "cmd_status" ]; then
+            rm -f "$STATE_FILE"
+            _handle_bot "cmd_status" "$mid" "" ""
+            return
+        fi
+
         # Universal exit: /cancel or Menu always clears state
         case "$1" in
             /cancel|cancel|/menu|/start|main_menu|"🏠 Меню"|"🏠Menu")
@@ -16524,8 +17262,17 @@ handle_command() {
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|\
         fkutf_*|fkufm_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
-        ts_add|ts_e_*|ts_x_*|ts_r_*)
-            _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;
+        ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
+            if _ts_backend_control_available; then
+                _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id"
+            else
+                case "$(_ts_backend_control_state 2>/dev/null)" in
+                    incompatible) CB_ANSWER_TEXT="Tailscale: backend API несовместим — только наблюдение" ;;
+                    *)            CB_ANSWER_TEXT="Tailscale: backend не установлен — только наблюдение" ;;
+                esac
+                _handle_bot "cmd_server_instances" "$mid" "" ""
+            fi
+            ;;
 
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
@@ -16775,20 +17522,15 @@ while true; do
         i=$((i + 1))
         [ -z "$update" ] && continue
 
-        id=$(printf '%s' "$update" | jq -r '.update_id' 2>/dev/null)
-        [ -z "$id" ] && continue
-        offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
-
-        # Single jq call — fields joined with U+001F (Unit Separator, not shell whitespace).
-        # @tsv used \t which is whitespace for read, causing field shift when callback_id empty.
-        # Fields: chat_id, chat_type, raw_text, callback_id, u_name, user_id,
-        #         is_bot_sender, sender_chat_id, sender_chat_type, sender_chat_title,
-        #         CALLBACK_MSG_ID, message_thread_id
+        # Single extraction jq — fields joined with U+001F (Unit Separator, not shell whitespace).
+        # Text is base64-wrapped before shell read: embedded newlines must not shift
+        # callback/user/document fields (especially user_id) into the next line.
         _upd_flat=$(printf '%s' "$update" | jq -r '
             [
+                (.update_id // ""),
                 (.message.chat.id // .callback_query.message.chat.id // ""),
                 (.message.chat.type // .callback_query.message.chat.type // ""),
-                (.message.text // .callback_query.data // ""),
+                ((.message.text // .callback_query.data // "") | @base64),
                 (.callback_query.id // ""),
                 (.message.from.username // .callback_query.from.username // ""),
                 (.message.from.id // .callback_query.from.id // ""),
@@ -16797,15 +17539,20 @@ while true; do
                 (.message.sender_chat.type // .callback_query.message.sender_chat.type // ""),
                 (.message.sender_chat.title // .callback_query.message.sender_chat.title // ""),
                 (.message.message_id // .callback_query.message.message_id // ""),
-                (.message.message_thread_id // .callback_query.message.message_thread_id // "")
-            ] | join("\u001f")
+                (.message.message_thread_id // .callback_query.message.message_thread_id // ""),
+                (.message.document.file_id // ""),
+                (.message.document.file_name // ""),
+                (.message.document.file_size // 0)
+            ] | map(tostring) | join("\u001f")
         ' 2>/dev/null)
-        IFS=$(printf '\037') read -r chat_id chat_type _raw_text callback_id u_name user_id \
+        IFS=$(printf '\037') read -r id chat_id chat_type _raw_text_b64 callback_id u_name user_id \
             is_bot_sender sender_chat_id sender_chat_type sender_chat_title \
-            CALLBACK_MSG_ID message_thread_id <<EOF
+            CALLBACK_MSG_ID message_thread_id _doc_file_id _doc_name _doc_size <<EOF
 $_upd_flat
 EOF
-        text=$(printf '%s' "$_raw_text")
+        [ -z "$id" ] && continue
+        offset=$((id + 1)); echo "$offset" > "$OFFSET_FILE"
+        text=$(printf '%s' "$_raw_text_b64" | jq -rR '@base64d' 2>/dev/null)
         [ "$message_thread_id" = "null" ] && message_thread_id=""
 
         [ -z "$BOT_USERNAME" ] && load_bot_identity >/dev/null 2>&1
@@ -16873,7 +17620,6 @@ EOF
         fi
 
         # ── Document handler: bot script upload ─────────────────────────────
-        _doc_file_id=$(printf '%s' "$update" | jq -r '.message.document.file_id // empty' 2>/dev/null)
         if [ -n "$_doc_file_id" ] && is_allowed_actor "$user_id" "$sender_chat_id" "$is_bot_sender" "$ALLOW_ANON_ADMINS"; then
             _cur_doc_state=$(head -n1 "$STATE_FILE" 2>/dev/null)
             _upload_uid=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
@@ -16889,24 +17635,19 @@ EOF
                 [ "$_cur_doc_state" = "wait_bot_script_file" ] && rm -f "$STATE_FILE"
                 continue
             fi
-            _doc_name=$(printf '%s' "$update" | jq -r '.message.document.file_name // empty' 2>/dev/null)
-            _doc_size=$(printf '%s' "$update" | jq -r '.message.document.file_size // 0' 2>/dev/null)
-            _doc_ok=0
-            case "$_doc_name" in
-                podkop_bot*.sh|podkop_bot) _doc_ok=1 ;;
-            esac
             case "$_doc_size" in ''|*[!0-9]*) _doc_size=0 ;; esac
-            # Valid-looking bot script but too large: tell the user explicitly
-            # instead of silently ignoring it (which would leave the wait state
-            # set and no feedback about why nothing happened).
-            if [ "$_doc_ok" = "1" ] && [ "$_doc_size" -gt 2097152 ]; then
+            # The explicit upload session is already bound to admin + private chat
+            # + chat/user IDs + TTL. Filename is cosmetic and must not be another
+            # security gate: Telegram/users routinely rename the same valid script.
+            # Accept any document here and decide only from size + file contents.
+            if [ "$_doc_size" -gt 2097152 ]; then
                 rm -f "$STATE_FILE"
                 set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
                 send_message "$(printf '%s Файл слишком большой (максимум 2 МБ). Загрузка отменена.' "$E_ERR")" ""
                 reset_chat_context
                 continue
             fi
-            if [ "$_doc_ok" = "1" ] && [ "$_doc_size" -le 2097152 ]; then
+            if [ "$_doc_size" -le 2097152 ]; then
                 rm -f "$STATE_FILE"
                 set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
                 send_message "$(printf '%s Загружаем отправленный скрипт…' "$E_TIME")" ""
@@ -16928,7 +17669,7 @@ EOF
                     reset_chat_context; continue
                 fi
 
-                if ! head -1 "$_bot_tmp" | grep -q '^#!' || ! grep -q '^BOT_VERSION=' "$_bot_tmp"; then
+                if ! head -1 "$_bot_tmp" | grep -q '^#!' || ! grep -q '^[[:space:]]*BOT_VERSION=' "$_bot_tmp"; then
                     rm -f "$_bot_tmp"
                     send_message "$(printf '%s Файл не похож на скрипт бота.' "$E_ERR")" ""
                     reset_chat_context; continue
@@ -17004,7 +17745,7 @@ EOF
                     esac
                 fi
             fi
-            safe_text=$(echo "$_audit_text" | tr '\n' ' ' | tr '|' '_')
+            safe_text=$(printf '%s' "$_audit_text" | tr '\n|' ' _')
             echo "${now}|${u_name:-Unknown}|${safe_text}" > "$LAST_CMD_FILE"
 
             set_chat_context "$chat_id" "$CALLBACK_MSG_ID" "$chat_type" "$message_thread_id"
