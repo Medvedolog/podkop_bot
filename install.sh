@@ -18,6 +18,16 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.6.3"
+#
+# CHANGELOG v2.6.3:
+# - FIXED: update-luci picks the BearGuard package by name
+#        (luci-app-podkop-bot-*.apk / luci-app-podkop-bot_*_all.ipk). From
+#        0.19.19 the same release also carries architecture-specific
+#        hwelp-proxy .apk/.ipk assets, and "first *.apk" could pick HWELP.
+# - CHANGED: LUCI_REPO points at the renamed repository
+#        Medvedolog/luci-app-podkop-bearguard (the old name still redirects).
+#
 # INSTALLER_VERSION="2.6.2"
 #
 # CHANGELOG v2.6.2:
@@ -345,7 +355,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.6.2"
+INSTALLER_VERSION="2.6.3"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -1528,7 +1538,7 @@ _curl_socks_fallover() {
 #      update. So the actual package-manager call is DETACHED (setsid/nohup) and
 #      logs to a file the UI polls — if rpcd restarts mid-install, the install
 #      still completes and the log survives.
-LUCI_REPO="Medvedolog/luci-app-podkop-bot"
+LUCI_REPO="Medvedolog/luci-app-podkop-bearguard"
 LUCI_UPDATE_LOG="/tmp/podkop_bot_luci_update.log"
 
 # _update_luci_app: fetch latest LuCI release asset and install it detached.
@@ -1552,7 +1562,12 @@ _update_luci_app() {
     if command -v apk >/dev/null 2>&1; then _pm="apk"
     elif command -v opkg >/dev/null 2>&1; then _pm="opkg"
     else _lu_log "[!!] Neither apk nor opkg found"; return 1; fi
-    local _suffix; [ "$_pm" = "apk" ] && _suffix=".apk" || _suffix="_all.ipk"
+    local _suffix _asset_re
+    if [ "$_pm" = "apk" ]; then
+        _suffix=".apk"; _asset_re='/luci-app-podkop-bot[-_][^"/]*[.]apk'
+    else
+        _suffix="_all.ipk"; _asset_re='/luci-app-podkop-bot_[^"/]*_all[.]ipk'
+    fi
     _lu_log "[OK] Package manager: $_pm (asset *$_suffix)"
 
     # latest release metadata
@@ -1569,7 +1584,7 @@ _update_luci_app() {
     local _url
     _url=$(printf '%s' "$_json" \
         | tr ',' '\n' \
-        | grep -oE '"browser_download_url"[: ]*"[^"]*'"$_suffix"'"' \
+        | grep -oE '"browser_download_url"[: ]*"[^"]*'"$_asset_re"'"' \
         | sed -n 's/.*"\(https[^"]*\)".*/\1/p' | head -1)
     if [ -z "$_url" ]; then _lu_log "[!!] No $_suffix asset in latest release"; return 1; fi
     _lu_log "  Asset: $_url"
