@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.19
+# Podkop Telegram Bot v0.19.20
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -19,7 +19,7 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: 5 watchdog checks (TG connectivity, sing-box,
 #    SOCKS probe, proxy leaf change, route degradation). Alerts on tier4/tier5.
-# 6. Active Outbound Probe: geo (ipapi.co + Cloudflare + Google), service
+# 6. Active Outbound Probe: geo (ipapi.co → ipinfo.io → ip-api.com + Cloudflare + Google), service
 #    reachability (12 services including Telegram Bot API), 2-stage throughput
 #    (32KB block detection + 8MB speed measurement).
 #
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.19"
+BOT_VERSION="0.19.20"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -3328,9 +3328,9 @@ refresh_public_ip_cache() {
         "https://api.ipify.org" 2>/dev/null | tr -d '\n\r\t ' > "$f4" &
     local p4=$!
 
-    # 5. 2ip.me — Russian service, plain text IP
+    # 5. icanhazip.com — plain text IP (replaces api.2ip.me, which now returns 404)
     curl -4 -s --connect-timeout 5 --max-time 8 \
-        "https://api.2ip.me" 2>/dev/null | tr -d '\n\r\t ' > "$f5" &
+        "https://ipv4.icanhazip.com" 2>/dev/null | tr -d '\n\r\t ' > "$f5" &
     local p5=$!
 
     wait "$p1" "$p2" "$p3" "$p4" "$p5" 2>/dev/null
@@ -3370,7 +3370,7 @@ refresh_public_ip_cache() {
     [ -n "$t2" ] && { [ -n "$sources" ] && sources="${sources}, ifconfig.me" || sources="ifconfig.me"; }
     [ -n "$t3" ] && { [ -n "$sources" ] && sources="${sources}, yandex.ru"   || sources="yandex.ru"; }
     [ -n "$t4" ] && { [ -n "$sources" ] && sources="${sources}, ipify.org"   || sources="ipify.org"; }
-    [ -n "$t5" ] && { [ -n "$sources" ] && sources="${sources}, 2ip.me"      || sources="2ip.me"; }
+    [ -n "$t5" ] && { [ -n "$sources" ] && sources="${sources}, icanhazip.com" || sources="icanhazip.com"; }
     [ -z "$sources" ] && sources="all failed"
 
     ts=$(date +%s)
@@ -4159,6 +4159,35 @@ probe_geo() {
         PROBE_EXIT_IP=$(printf '%s' "$resp" | jq -r '.ip // empty' 2>/dev/null)
         PROBE_COUNTRY=$(printf '%s' "$resp" | jq -r '(.country_code // "") + " " + (.country_name // "")' 2>/dev/null | sed 's/^ *//;s/ *$//')
         PROBE_ORG=$(printf '%s' "$resp" | jq -r '.org // empty' 2>/dev/null)
+    fi
+
+    # Fallback 1: ipinfo.io. ipapi.co answers 429 {"error":true,...} quickly for
+    # hosting/VPS exit IPs, which left IP and country as "no data" even though
+    # the proxy itself worked (issue #5). ipinfo.io returns only the ISO code.
+    if [ -z "$PROBE_EXIT_IP" ]; then
+        resp=$(curl -s -k \
+            -x "socks5h://${m_ip}:${m_port}" \
+            --connect-timeout 6 --max-time 10 \
+            "https://ipinfo.io/json" 2>/dev/null)
+        if [ -n "$resp" ]; then
+            PROBE_EXIT_IP=$(printf '%s' "$resp" | jq -r '.ip // empty' 2>/dev/null)
+            PROBE_COUNTRY=$(printf '%s' "$resp" | jq -r '.country // empty' 2>/dev/null)
+            PROBE_ORG=$(printf '%s' "$resp" | jq -r '.org // empty' 2>/dev/null)
+        fi
+    fi
+
+    # Fallback 2: ip-api.com (plain HTTP only on the free tier; also gives the
+    # country name). status != "success" means a rate limit or a private IP.
+    if [ -z "$PROBE_EXIT_IP" ]; then
+        resp=$(curl -s \
+            -x "socks5h://${m_ip}:${m_port}" \
+            --connect-timeout 6 --max-time 10 \
+            "http://ip-api.com/json/?fields=status,query,countryCode,country,as" 2>/dev/null)
+        if [ -n "$resp" ] && [ "$(printf '%s' "$resp" | jq -r '.status // empty' 2>/dev/null)" = "success" ]; then
+            PROBE_EXIT_IP=$(printf '%s' "$resp" | jq -r '.query // empty' 2>/dev/null)
+            PROBE_COUNTRY=$(printf '%s' "$resp" | jq -r '(.countryCode // "") + " " + (.country // "")' 2>/dev/null | sed 's/^ *//;s/ *$//')
+            PROBE_ORG=$(printf '%s' "$resp" | jq -r '.as // empty' 2>/dev/null)
+        fi
     fi
     [ -z "$PROBE_EXIT_IP" ] && PROBE_EXIT_IP="Нет данных"
     [ -z "$PROBE_COUNTRY" ] && PROBE_COUNTRY="Нет данных"
@@ -5025,6 +5054,38 @@ send_health_alert() {
     fi
 }
 
+# _link_alert_mode: how bot-link / sing-box restart events reach the admin.
+#   all      - every transition is sent at once (behaviour before 0.19.20)
+#   smart    - short blips are accumulated into a periodic summary; an alert is
+#              sent only when a problem persists (default)
+#   critical - only when the bot found no failover path N checks in a row,
+#              or sing-box is flapping / stays down
+#   off      - none of these alerts
+# RAM alerts, quiet hours and the master alert_notify switch work as before.
+_link_alert_mode() {
+    local _m; _m=$(uci -q get podkop_bot.settings.link_alert_mode 2>/dev/null)
+    case "$_m" in all|smart|critical|off) printf '%s' "$_m" ;; *) printf 'smart' ;; esac
+}
+
+_link_alert_mode_label() {
+    case "$1" in
+        all)      printf 'Все' ;;
+        critical) printf 'Только критичные' ;;
+        off)      printf 'Выключены' ;;
+        *)        printf 'Умные' ;;
+    esac
+}
+
+# _fmt_secs_ru SECONDS - compact duration: "45 с", "7 мин", "2 ч 05 мин".
+_fmt_secs_ru() {
+    local _s="${1:-0}"
+    case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+    if [ "$_s" -lt 60 ]; then printf '%d с' "$_s"
+    elif [ "$_s" -lt 3600 ]; then printf '%d мин' $(( _s / 60 ))
+    else printf '%d ч %02d мин' $(( _s / 3600 )) $(( (_s % 3600) / 60 ))
+    fi
+}
+
 # _flush_autoswitch_summary: send pending URLTest switch summary when the
 # debounce window expires. This is called periodically from the watchdog loop,
 # not only on a new switch, so a single switch followed by silence is not lost.
@@ -5034,7 +5095,14 @@ _flush_autoswitch_summary() {
     # Flush when the debounce window elapsed, or if the buffer grows too much.
     [ $((_now - _sw_first_ts)) -lt "$_SW_WINDOW" ] && [ "$_sw_count" -lt 10 ] && return 0
 
-    if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" != "1" ]; then
+    if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" != "1" ] || \
+       [ "$(uci -q get podkop_bot.settings.urltest_switch_notify || echo 1)" != "1" ]; then
+        _sw_count=0; _sw_pending_to=""; _sw_old_disp=""
+        return 0
+    fi
+    # Two outbounds with the same display name ("se → se") tell the admin
+    # nothing they can act on — keep it in the switch log only.
+    if [ "$_sw_count" -eq 1 ] && [ "$_sw_old_disp" = "$_sw_pending_to" ]; then
         _sw_count=0; _sw_pending_to=""; _sw_old_disp=""
         return 0
     fi
@@ -5847,6 +5915,17 @@ start_health_daemon() {
         local _recovery_ts=0  # timestamp of last "Primary SOCKS recovered" alert
         # Track bot route degradation (tier4/tier5) for alert on degrade/recover.
         local last_bot_route_degraded=0
+        # Link-alert accumulator (modes smart/critical, see _link_alert_mode).
+        # An "episode" is a run of watchdog checks where the bot link is not
+        # healthy. Short episodes are only counted into a periodic summary;
+        # an alert goes out when an episode persists (smart) or the bot found
+        # no failover path _LK_CRIT_STREAK checks in a row (smart/critical).
+        local _lk_ep_start=0 _lk_ep_alerted=0 _lk_nofb_streak=0
+        local _lk_dg_first=0 _lk_dg_blips=0 _lk_dg_max=0 _lk_dg_sbr=0
+        local _LK_SMART_DELAY=300      # seconds a problem must last before an alert
+        local _LK_CRIT_STREAK=10       # checks in a row without a failover path
+        local _LK_DIGEST_WINDOW=10800  # summary of short blips at most every 3 h
+        local _sb_stop_alerted=0       # smart/critical: stop alert sent, pair it with recovery
 
         local _dr_last_date=""
         local _wr_last_date=""
@@ -5980,6 +6059,15 @@ start_health_daemon() {
 
             _load_transport_ctx
             sec="$_t_sec"
+
+            # Alert routing for this cycle. _lk_legacy=1 keeps the per-event
+            # messages (mode "all"); _lk_send=1 allows the accumulated ones.
+            local _lam _lk_send=0 _lk_legacy=0 _lk_t1_down=0
+            _lam=$(_link_alert_mode)
+            if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                [ "$_lam" != "off" ] && _lk_send=1
+                [ "$_lam" = "all" ] && _lk_legacy=1
+            fi
             m_port="$_t_port"
             m_ip="$_t_ip"
 
@@ -6018,7 +6106,7 @@ start_health_daemon() {
                 if [ "$last_tg_state" = "fail" ] && [ "$tg_ok_streak" -ge 2 ]; then
                     last_tg_state="ok"
                     logger -t podkop-bot "[Watchdog] Telegram reachable again."
-                    if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    if [ "$_lk_legacy" = "1" ]; then
                         local _now_tg; _now_tg=$(date +%s)
                         # Suppress if "Primary SOCKS recovered" was sent <30s ago
                         # (that alert already conveys the recovery — no duplicate needed)
@@ -6045,10 +6133,13 @@ start_health_daemon() {
                 if [ "$last_tg_state" = "ok" ] && [ "$tg_fail_streak" -ge 2 ]; then
                     last_tg_state="fail"
                     logger -t podkop-bot "[Watchdog] Telegram unreachable."
-                    if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    if [ "$_lk_legacy" = "1" ]; then
+                        # The old text had an unclosed <b> and an extra printf
+                        # argument: Telegram rejected it, so only the
+                        # "reachable again" half of the pair ever arrived.
                         admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram недоступен</b>\n\nБот потерял соединение.\n<b>Туннель Podkop продолжает работать.' \
-                                "$_hn" "$E_WARN" "${LAST_ROUTE_NAME:-unknown}")" \
+                            --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram недоступен</b>\n\nБот потерял соединение с Telegram API.\n<i>Туннель Podkop продолжает работать.</i>' \
+                                "$_hn" "$E_WARN")" \
                             '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                         send_health_alert "$admin_payload"
                     fi
@@ -6077,19 +6168,28 @@ start_health_daemon() {
 
                 # Flap accounting: reset the counter once the window has elapsed
                 # since the first restart in the current burst.
-                local _sbf_now; _sbf_now=$(date +%s)
-                if [ "$_sbf_count" -eq 0 ] || [ $(( _sbf_now - _sbf_first_ts )) -ge "$_SBF_WINDOW" ]; then
-                    _sbf_count=1; _sbf_first_ts=$_sbf_now
+                local _sbf_now _sbf_rl _sbf_planned=0; _sbf_now=$(date +%s)
+                # A restart the bot itself caused (settings apply, reload) is not
+                # news to the admin. Outside mode "all" it is neither alerted nor
+                # counted towards flapping.
+                _sbf_rl=$(cat "$RELOAD_TS_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                case "$_sbf_rl" in ''|*[!0-9]*) _sbf_rl=0 ;; esac
+                [ $(( _sbf_now - _sbf_rl )) -le 180 ] && _sbf_planned=1
+                if [ "$_sbf_planned" = "1" ] && [ "$_lam" != "all" ]; then
+                    logger -t podkop-bot "[Watchdog] sing-box restart follows a bot reload $(( _sbf_now - _sbf_rl ))s ago — not alerted."
+                elif [ "$_sbf_count" -eq 0 ] || [ $(( _sbf_now - _sbf_first_ts )) -ge "$_SBF_WINDOW" ]; then
+                    _sbf_count=1; _sbf_first_ts=$_sbf_now; _sbf_last_ts=$_sbf_now
                 else
-                    _sbf_count=$(( _sbf_count + 1 ))
+                    _sbf_count=$(( _sbf_count + 1 )); _sbf_last_ts=$_sbf_now
                 fi
-                _sbf_last_ts=$_sbf_now
 
-                if [ "$_sbf_count" -ge "$_SBF_THRESHOLD" ]; then
+                if [ "$_sbf_planned" = "1" ] && [ "$_lam" != "all" ]; then
+                    : # planned restart, logged above
+                elif [ "$_sbf_count" -ge "$_SBF_THRESHOLD" ]; then
                     if [ "$_sbf_flapping" -eq 0 ]; then
                         _sbf_flapping=1
                         logger -t podkop-bot "[Watchdog] sing-box flapping: ${_sbf_count} restarts in $(( (_sbf_now - _sbf_first_ts) / 60 + 1 )) min. Suppressing further per-restart alerts."
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        if [ "$_lk_send" = "1" ]; then
                             local _sbf_pl
                             _sbf_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
                                 "$(printf '<b>[%s]</b> %s <b>sing-box флапает</b>\n\n<b>Перезапусков:</b> %s за %d мин\n\n<i>Дальнейшие уведомления о перезапусках приостановлены, пока процесс не стабилизируется. Частые причины: нехватка ОЗУ (OOM-killer) или нестабильный сервер в URLTest.</i>' \
@@ -6100,7 +6200,7 @@ start_health_daemon() {
                     fi
                     # Flapping: skip the per-restart alert below, already covered
                     # by the flap notice above.
-                elif [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                elif [ "$_lk_legacy" = "1" ]; then
                     local _restart_route_key _restart_route_name _restart_txt _restart_pl
                     _restart_route_key=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\
 \r\t ')
@@ -6119,13 +6219,17 @@ start_health_daemon() {
                     _restart_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_restart_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$_restart_pl"
+                elif [ "$_lam" = "smart" ]; then
+                    # Single unplanned restart: into the summary, not a message.
+                    _lk_dg_sbr=$(( _lk_dg_sbr + 1 ))
+                    [ "$_lk_dg_first" -eq 0 ] && _lk_dg_first=$_sbf_now
                 fi
             elif [ "$_sbf_flapping" -eq 1 ] && [ $(( $(date +%s) - _sbf_last_ts )) -ge "$_SBF_WINDOW" ]; then
                 # No new restart for a full window: the flap has settled.
                 local _sbf_total=$_sbf_count _sbf_recover_pl
                 _sbf_flapping=0; _sbf_count=0
                 logger -t podkop-bot "[Watchdog] sing-box restart flap settled: ${_sbf_total} restarts total."
-                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                if [ "$_lk_send" = "1" ]; then
                     _sbf_recover_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
                         "$(printf '<b>[%s]</b> %s <b>sing-box стабилизировался</b>\n\nВсего перезапусков за флап: <b>%s</b>. Новых перезапусков больше нет — уведомления возобновлены.' \
                             "$_hn" "$E_OK" "$_sbf_total")" \
@@ -6135,32 +6239,49 @@ start_health_daemon() {
             fi
 
             if [ "$curr_sb_state" != "$last_sb_state" ]; then
-                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
-                    if [ "$curr_sb_state" = "stopped" ]; then
-                        local _sb_leaf _sb_leaf_disp
-                        _sb_leaf=$([ -n "$last_leaf" ] && echo "$last_leaf" || echo "unknown")
-                        _sb_leaf_disp=$(display_proxy_name "$_sb_leaf")
-                        sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box остановлен</b>\n\nТуннель не работает.\n<b>Последний прокси:</b> <code>%s</code>\n\n<i>Маршрутизация трафика нарушена. Бот переключается на резервный канал.</i>' \
-                            "$_hn" "$E_ERR" "$_sb_leaf_disp")
-                        # IPC: force transport reset — tier1/tier2 SOCKS are dead without sing-box
-                        printf 'down' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Transport] sing-box stopped. Signalling route reset."
-                    else
-                        new_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
-                        # Get current leaf after recovery (may take a moment to settle)
-                        local _rec_leaf_disp
-                        _rec_leaf_disp=$(display_proxy_name "${last_leaf:-unknown}")
-                        sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box восстановлен</b>\n\nТуннель снова работает.\n<b>Активный прокси:</b> <code>%s</code>\n\n<i>Маршрутизация трафика восстановлена.</i>' \
-                            "$_hn" "$E_OK" "$_rec_leaf_disp")
-                        # IPC: signal recovery — let transport rediscover tier1
-                        printf 'up' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Transport] sing-box recovered. Signalling route rediscovery."
-                    fi
+                # IPC below must run even with alerts off — only messages are gated.
+                if [ "$curr_sb_state" = "stopped" ]; then
+                    local _sb_leaf _sb_leaf_disp
+                    _sb_leaf=$([ -n "$last_leaf" ] && echo "$last_leaf" || echo "unknown")
+                    _sb_leaf_disp=$(display_proxy_name "$_sb_leaf")
+                    sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box остановлен</b>\n\nТуннель не работает.\n<b>Последний прокси:</b> <code>%s</code>\n\n<i>Маршрутизация трафика нарушена. Бот переключается на резервный канал.</i>' \
+                        "$_hn" "$E_ERR" "$_sb_leaf_disp")
+                    # IPC: force transport reset — tier1/tier2 SOCKS are dead without sing-box
+                    printf 'down' > "$ROUTE_CMD_FILE"
+                    logger -t podkop-bot "[Transport] sing-box stopped. Signalling route reset."
+                else
+                    new_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+                    # Get current leaf after recovery (may take a moment to settle)
+                    local _rec_leaf_disp
+                    _rec_leaf_disp=$(display_proxy_name "${last_leaf:-unknown}")
+                    sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box восстановлен</b>\n\nТуннель снова работает.\n<b>Активный прокси:</b> <code>%s</code>\n\n<i>Маршрутизация трафика восстановлена.</i>' \
+                        "$_hn" "$E_OK" "$_rec_leaf_disp")
+                    # IPC: signal recovery — let transport rediscover tier1
+                    printf 'up' > "$ROUTE_CMD_FILE"
+                    logger -t podkop-bot "[Transport] sing-box recovered. Signalling route rediscovery."
+                fi
+                if [ "$_lk_legacy" = "1" ]; then
+                    admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$sb_alert_txt" \
+                        '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                    send_health_alert "$admin_payload"
+                elif [ "$curr_sb_state" = "running" ] && [ "$_sb_stop_alerted" = "1" ] && [ "$_lk_send" = "1" ]; then
+                    # smart/critical: recovery only pairs with a stop alert that was sent
                     admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$sb_alert_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$admin_payload"
                 fi
+                _sb_stop_alerted=0
                 last_sb_state="$curr_sb_state"
+            elif [ "$curr_sb_state" = "stopped" ] && [ "$_sb_stop_alerted" = "0" ] && \
+                 [ "$_lk_send" = "1" ] && [ "$_lam" != "all" ]; then
+                # smart/critical: still stopped on the next check — a real outage,
+                # not a restart that the PID check happened to catch mid-way.
+                _sb_stop_alerted=1
+                admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
+                    "$(printf '<b>[%s]</b> %s <b>sing-box не работает</b>\n\nПроцесс не запущен уже две проверки подряд — туннель не работает.\n<b>Последний прокси:</b> <code>%s</code>\n\n<i>Бот переключается на резервный канал.</i>' \
+                        "$_hn" "$E_ERR" "$(html_escape "$(display_proxy_name "${last_leaf:-unknown}")")")" \
+                    '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                send_health_alert "$admin_payload"
             fi
             last_sb_pid="$curr_sb_pid"
 
@@ -6181,7 +6302,7 @@ start_health_daemon() {
                     fi
                     # If tier1 was down (bot was on tier2), send recovery alert
                     if [ "$last_tier1_state" = "down" ]; then
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        if [ "$_lk_legacy" = "1" ]; then
                             local _rec_txt
                             _rec_txt=$(printf '<b>[%s]</b> %s <b>Основной SOCKS-прокси восстановлен</b>\n\nБот возвращается на основной канал.\n\n<b>Адрес SOCKS:</b> <code>%s:%s</code>' \
                                 "$_hn" "$E_OK" "$m_ip" "$m_port")
@@ -6200,6 +6321,7 @@ start_health_daemon() {
                     # instead of staying on Direct indefinitely.
                     curr_socks_state="down"
                     local _tier1_was_up=1  # tier1 specifically down — used for alert
+                    _lk_t1_down=1
                     logger -t podkop-bot "[Watchdog] SOCKS proxy unreachable (${m_ip}:${m_port})"
                     local _fb_raw _fb _fb_ok=0 _fb_alive=""
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
@@ -6226,7 +6348,7 @@ start_health_daemon() {
                     # so user knows tier1 is down — even though bot itself is still reachable.
                     if [ "$_fb_ok" = "1" ] && [ "${last_tier1_state:-up}" = "up" ]; then
                         last_tier1_state="down"
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        if [ "$_lk_legacy" = "1" ]; then
                             local _deg_txt
                             _deg_txt=$(printf '<b>[%s]</b> %s <b>Основной SOCKS-прокси недоступен</b>\n\nБот переключился на резервный канал.\n\n<b>Недоступный адрес:</b> <code>%s:%s</code>\n<b>Рабочий резерв:</b> <code>%s</code>\n\n<i>Маршрутизация трафика Podkop может быть нарушена.</i>' \
                                 "$_hn" "$E_WARN" "$m_ip" "$m_port" "$(html_escape "$(_proxy_display "$_fb_alive")")")
@@ -6260,51 +6382,54 @@ start_health_daemon() {
 
             # Act on effective state transition
             if [ -n "$last_socks_state" ] && [ "$effective_socks" != "$last_socks_state" ]; then
-                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
-                    # Use last known leaf (populated by Check D) — avoids extra clash_request
-                    local active_px_display
-                    active_px_display=$(display_proxy_name "${last_leaf:-unknown}")
+                # Route IPC used to sit inside the alert_notify check, so turning
+                # alerts off also stopped the transport reset. Only the message
+                # is gated now.
+                # Use last known leaf (populated by Check D) — avoids extra clash_request
+                local active_px_display
+                active_px_display=$(display_proxy_name "${last_leaf:-unknown}")
 
-                    if [ "$effective_socks" = "down" ]; then
-                        # IPC: signal main process to reset route state and enter recovery mode.
-                        # Cannot modify parent variables directly (subshell isolation).
-                        printf 'down' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Watchdog] SOCKS down. Triggering route reset."
-                        # Build fallback availability from last probe file
-                        local _fb_avail=""
-                        if [ -f "$SOCKS_PROBE_FILE" ]; then
-                            local _fp=1
-                            while true; do
-                                local _fline; _fline=$(grep "^tier2_${_fp}=" "$SOCKS_PROBE_FILE" 2>/dev/null)
-                                [ -z "$_fline" ] && break
-                                local _flat; _flat=$(echo "$_fline" | cut -d= -f2 | awk '{print $1}')
-                                _fb_avail="${_fb_avail}  tier2_${_fp}=${_flat}\n"
-                                _fp=$((_fp + 1))
-                            done
-                        fi
-                        [ -z "$_fb_avail" ] && _fb_avail="  (не настроено)\n"
-                        socks_alert_txt=$(printf \
-                            '<b>[%s]</b> %s <b>Основной SOCKS-прокси недоступен</b>\n\nБот переключается на резервные каналы.\n\n<b>Недоступный адрес:</b> <code>%s:%s</code>\n<b>Активный прокси Podkop:</b> <code>%s</code>\n<b>Резервные каналы:</b>\n<code>%b</code>\n<i>Маршрутизация трафика Podkop может быть нарушена.</i>' \
-                            "$_hn" "$E_ERR" "$m_ip" "$m_port" \
-                            "$active_px_display" \
-                            "$_fb_avail")
-                    else
-                        # IPC: signal main process to clear recovery mode and rediscover tier1.
-                        sleep 3
-                        printf 'up' > "$ROUTE_CMD_FILE"
-                        last_ok_route="tier1"
-                        logger -t podkop-bot "[Watchdog] SOCKS recovered. Triggering route rediscovery."
-                        socks_alert_txt=$(printf \
-                            '<b>[%s]</b> %s <b>Основной SOCKS-прокси восстановлен</b>\n\nБот вернулся на основной канал.\n\n<b>Прокси:</b> <code>%s:%s</code>\n<b>Активный прокси Podkop:</b> <code>%s</code>' \
-                            "$_hn" "$E_OK" "$m_ip" "$m_port" \
-                            "$active_px_display")
+                if [ "$effective_socks" = "down" ]; then
+                    # IPC: signal main process to reset route state and enter recovery mode.
+                    # Cannot modify parent variables directly (subshell isolation).
+                    printf 'down' > "$ROUTE_CMD_FILE"
+                    logger -t podkop-bot "[Watchdog] SOCKS down. Triggering route reset."
+                    # Build fallback availability from last probe file
+                    local _fb_avail=""
+                    if [ -f "$SOCKS_PROBE_FILE" ]; then
+                        local _fp=1
+                        while true; do
+                            local _fline; _fline=$(grep "^tier2_${_fp}=" "$SOCKS_PROBE_FILE" 2>/dev/null)
+                            [ -z "$_fline" ] && break
+                            local _flat; _flat=$(echo "$_fline" | cut -d= -f2 | awk '{print $1}')
+                            _fb_avail="${_fb_avail}  tier2_${_fp}=${_flat}\n"
+                            _fp=$((_fp + 1))
+                        done
                     fi
+                    [ -z "$_fb_avail" ] && _fb_avail="  (не настроено)\n"
+                    socks_alert_txt=$(printf \
+                        '<b>[%s]</b> %s <b>Основной SOCKS-прокси недоступен</b>\n\nБот переключается на резервные каналы.\n\n<b>Недоступный адрес:</b> <code>%s:%s</code>\n<b>Активный прокси Podkop:</b> <code>%s</code>\n<b>Резервные каналы:</b>\n<code>%b</code>\n<i>Маршрутизация трафика Podkop может быть нарушена.</i>' \
+                        "$_hn" "$E_ERR" "$m_ip" "$m_port" \
+                        "$active_px_display" \
+                        "$_fb_avail")
+                else
+                    # IPC: signal main process to clear recovery mode and rediscover tier1.
+                    sleep 3
+                    printf 'up' > "$ROUTE_CMD_FILE"
+                    last_ok_route="tier1"
+                    logger -t podkop-bot "[Watchdog] SOCKS recovered. Triggering route rediscovery."
+                    socks_alert_txt=$(printf \
+                        '<b>[%s]</b> %s <b>Основной SOCKS-прокси восстановлен</b>\n\nБот вернулся на основной канал.\n\n<b>Прокси:</b> <code>%s:%s</code>\n<b>Активный прокси Podkop:</b> <code>%s</code>' \
+                        "$_hn" "$E_OK" "$m_ip" "$m_port" \
+                        "$active_px_display")
+                fi
+                if [ "$_lk_legacy" = "1" ]; then
                     admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$socks_alert_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$admin_payload"
-                    # Track recovery time to suppress duplicate "Telegram reachable" within 30s
-                    case "$socks_alert_txt" in *"Основной SOCKS-прокси восстановлен"*) _recovery_ts=$(date +%s) ;; esac
                 fi
+                # Track recovery time to suppress duplicate "Telegram reachable" within 30s
+                case "$socks_alert_txt" in *"Основной SOCKS-прокси восстановлен"*) _recovery_ts=$(date +%s) ;; esac
                 logger -t podkop-bot "[Watchdog] SOCKS state: ${last_socks_state} → ${effective_socks}"
                 last_socks_state="$effective_socks"
             fi
@@ -6423,7 +6548,7 @@ start_health_daemon() {
                     if [ "${last_bot_route_degraded:-0}" = "1" ]; then
                         last_bot_route_degraded=0
                         logger -t podkop-bot "[Watchdog] Bot route recovered: ${_wd_bot_route}"
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        if [ "$_lk_legacy" = "1" ]; then
                             local _route_name
                             _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             local _rec_route_txt
@@ -6441,7 +6566,7 @@ start_health_daemon() {
                     if [ "${last_bot_route_degraded:-0}" = "0" ]; then
                         last_bot_route_degraded=1
                         logger -t podkop-bot "[Watchdog] Bot route degraded: ${_wd_bot_route}"
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        if [ "$_lk_legacy" = "1" ]; then
                             local _route_name _deg_route_txt _deg_route_pl
                             _route_name=$(cat "$POLL_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
                             # Reaching tier4 means every earlier tier failed — including
@@ -6465,6 +6590,93 @@ start_health_daemon() {
                     fi
                     ;;
             esac
+
+            # ------------------------------------------------------------------
+            # Check F: link-alert accumulator (modes smart / critical / off).
+            # Mode "all" is fully handled by the per-event alerts above.
+            # bad  = bot is not on its primary channel (tier1 SOCKS down) or
+            #        has no failover path at all;
+            # nofb = no failover path: Direct/emergency IPs/fail, or Telegram
+            #        unreachable both directly and through the transport.
+            # ------------------------------------------------------------------
+            if [ "$_lam" = "all" ]; then
+                _lk_ep_start=0; _lk_ep_alerted=0; _lk_nofb_streak=0
+                _lk_dg_first=0; _lk_dg_blips=0; _lk_dg_max=0; _lk_dg_sbr=0
+            else
+                local _lk_now _lk_rk _lk_tr _lk_bad=0 _lk_nofb=0 _lk_rn _lk_txt _lk_pl _lk_dur
+                _lk_now=$(date +%s)
+                _lk_rk=$(cat "$POLL_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+                _lk_tr=$(uci -q get podkop_bot.settings.transport || echo "auto")
+                case "${_lk_rk:-unknown}" in
+                    tier5|fail) _lk_nofb=1 ;;
+                    tier4)      [ "$_lk_tr" != "direct" ] && _lk_nofb=1 ;;
+                esac
+                [ "$_tgd" != "ok" ] && [ "$_tgt" != "ok" ] && _lk_nofb=1
+                _lk_bad=$_lk_nofb
+                [ "$_lk_t1_down" = "1" ] && [ "$_lk_tr" != "direct" ] && _lk_bad=1
+                _lk_rn=$(cat "$POLL_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
+                [ -n "$_lk_rn" ] || _lk_rn="${_lk_rk:-unknown}"
+                _lk_rn=$(html_escape "$_lk_rn")
+
+                if [ "$_lk_bad" = "1" ]; then
+                    [ "$_lk_ep_start" -eq 0 ] && { _lk_ep_start=$_lk_now; _lk_ep_alerted=0; }
+                    if [ "$_lk_nofb" = "1" ]; then _lk_nofb_streak=$(( _lk_nofb_streak + 1 )); else _lk_nofb_streak=0; fi
+                    _lk_dur=$(( _lk_now - _lk_ep_start ))
+                    if [ "$_lk_send" = "1" ] && [ "$_lk_ep_alerted" = "0" ]; then
+                        _lk_txt=""
+                        if [ "$_lk_nofb_streak" -ge "$_LK_CRIT_STREAK" ]; then
+                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Бот не находит резервный путь</b>\n\n%s проверок подряд (≈ %s) все прокси недоступны.\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Если провайдер блокирует Telegram, бот может стать недоступен.</i>' \
+                                "$_hn" "$E_ERR" "$_lk_nofb_streak" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn")
+                        elif [ "$_lam" = "smart" ] && [ "$_lk_dur" -ge "$_LK_SMART_DELAY" ]; then
+                            local _lk_t1_s="отвечает" _lk_tg_s="доступен"
+                            [ "$_lk_t1_down" = "1" ] && _lk_t1_s="не отвечает"
+                            [ "$_tgd" != "ok" ] && [ "$_tgt" != "ok" ] && _lk_tg_s="недоступен"
+                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Проблема со связью бота</b>\n\nДлится уже %s.\n<b>Основной SOCKS:</b> %s\n<b>Telegram:</b> %s\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Короткие сбои не присылаются по отдельности — они попадают в сводку.</i>' \
+                                "$_hn" "$E_WARN" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_t1_s" "$_lk_tg_s" "$_lk_rn")
+                        fi
+                        if [ -n "$_lk_txt" ]; then
+                            _lk_ep_alerted=1
+                            logger -t podkop-bot "[Watchdog] Link problem alert (mode=${_lam} dur=${_lk_dur}s nofb_streak=${_lk_nofb_streak})"
+                            _lk_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_lk_txt" '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_lk_pl"
+                        fi
+                    fi
+                else
+                    if [ "$_lk_ep_start" -ne 0 ]; then
+                        _lk_dur=$(( _lk_now - _lk_ep_start ))
+                        if [ "$_lk_ep_alerted" = "1" ]; then
+                            if [ "$_lk_send" = "1" ]; then
+                                _lk_txt=$(printf '<b>[%s]</b> %s <b>Связь бота восстановлена</b>\n\nСбой длился %s.\n<b>Способ подключения:</b> <code>%s</code>' \
+                                    "$_hn" "$E_OK" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn")
+                                _lk_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_lk_txt" '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                                send_health_alert "$_lk_pl"
+                            fi
+                        elif [ "$_lam" = "smart" ]; then
+                            _lk_dg_blips=$(( _lk_dg_blips + 1 ))
+                            [ "$_lk_dur" -gt "$_lk_dg_max" ] && _lk_dg_max=$_lk_dur
+                            [ "$_lk_dg_first" -eq 0 ] && _lk_dg_first=$_lk_ep_start
+                        fi
+                        logger -t podkop-bot "[Watchdog] Link episode closed (mode=${_lam} dur=${_lk_dur}s alerted=${_lk_ep_alerted})"
+                        _lk_ep_start=0; _lk_ep_alerted=0
+                    fi
+                    _lk_nofb_streak=0
+                fi
+
+                # Summary of short blips and single sing-box restarts (smart).
+                # Held back during quiet hours instead of being dropped there.
+                if [ "$_lam" = "smart" ] && [ "$_lk_dg_first" -ne 0 ] && \
+                   [ $(( _lk_now - _lk_dg_first )) -ge "$_LK_DIGEST_WINDOW" ] && ! _is_quiet_hours; then
+                    if [ "$_lk_send" = "1" ]; then
+                        _lk_txt=$(printf '<b>[%s]</b> 📋 <b>Сводка стабильности за %s</b>\n' "$_hn" "$(_fmt_secs_ru $(( _lk_now - _lk_dg_first )))")
+                        [ "$_lk_dg_blips" -gt 0 ] && _lk_txt="${_lk_txt}$(printf '\nКратковременных сбоев связи бота: <b>%s</b> (самый долгий — %s)' "$_lk_dg_blips" "$(_fmt_secs_ru "$_lk_dg_max")")"
+                        [ "$_lk_dg_sbr" -gt 0 ] && _lk_txt="${_lk_txt}$(printf '\nПерезапусков sing-box: <b>%s</b>' "$_lk_dg_sbr")"
+                        _lk_txt="${_lk_txt}$(printf '\n\n<i>Всё восстановилось автоматически.</i>')"
+                        _lk_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_lk_txt" '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                        send_health_alert "$_lk_pl"
+                    fi
+                    _lk_dg_first=0; _lk_dg_blips=0; _lk_dg_max=0; _lk_dg_sbr=0
+                fi
+            fi
 
             # Per-cycle: if SOCKS is up but bot route is degraded (tier4/tier5/fail),
             # send IPC up every cycle to nudge main loop back to SOCKS discovery.
@@ -8247,7 +8459,7 @@ EOF
             # Plus: add URLTest Filters button when urltest mode active
             local _uf_btn=""
             [ "$PODKOP_VARIANT" = "plus" ] && [ "$proxy_mode" = "proxy:urltest" ] && _uf_btn="yes"
-            kb="${kb}[{\"text\":\"${E_TGT} URLTest\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_NET} DNS-резолвер\",\"callback_data\":\"domain_resolver_settings\"}],"
+            kb="${kb}[{\"text\":\"${E_TGT} Параметры URLTest\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_NET} DNS-резолвер\",\"callback_data\":\"domain_resolver_settings\"}],"
             [ "$PODKOP_VARIANT" = "forkop" ] && kb="${kb}[{\"text\":\"${E_TGT} Условия\",\"callback_data\":\"fk_conds\"},{\"text\":\"${E_LINK} Через секцию\",\"callback_data\":\"fk_detour\"}],"
             if [ "$PODKOP_VARIANT" = "forkop" ]; then
                 kb="${kb}[{\"text\":\"${E_EDIT} Метка: $(json_escape "$(_utf8_head "$_fk_label" 24)")\",\"callback_data\":\"fk_label\"}],"
@@ -8478,7 +8690,7 @@ EOF
                         local _utl_count
                         _utl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
                         if [ "${_utl_count:-0}" -eq 0 ]; then
-                            warn_txt=$(printf '%s <b>Переключиться в режим URLTest?</b>\n\n%s <b>Список ссылок URLTest пуст.</b>\nПосле переключения Podkop не сможет запуститься.\n\n<b>Сначала добавьте ссылки:</b> Настройки → Ядро → URLTest → Прокси\n\nСекция: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
+                            warn_txt=$(printf '%s <b>Переключиться в режим URLTest?</b>\n\n%s <b>Список ссылок URLTest пуст.</b>\nПосле переключения Podkop не сможет запуститься.\n\n<b>Сначала добавьте ссылки:</b> Настройки секции → Параметры URLTest → Список прокси\n\nСекция: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                         else
                             warn_txt=$(printf '%s <b>Переключиться в режим URLTest?</b>\n\nURLTest: sing-box автоматически выбирает самый быстрый прокси.\n<b>Ручной выбор прокси будет отключён.</b>\nПрокси для URLTest: <b>%s</b>.\n\nСекция: <code>%s</code>' "$E_WARN" "$_utl_count" "$sec")
                         fi
@@ -8829,7 +9041,7 @@ _handle_section_extras() {
         esac
         case "$cmd:$state" in
             STATE_INPUT:wait_urltest_*|STATE_INPUT:wait_dr_server|STATE_INPUT:wait_outbound_iface|STATE_INPUT:wait_vpn_iface|STATE_INPUT:wait_utl_link|\
-            cmd_set_ut_*:*|do_utfilter_*:*|urltest_filters_*:*|cmd_set_dr_server:*|do_toggle_dr:*|set_dr_type_*:*|cmd_set_outbound_iface:*|cmd_clone_*:*|cmd_utl_add:*|ask_del_utl_*:*|do_del_utl_*:*)
+            cmd_set_ut_*:*|do_utfilter_*:*|urltest_filters_*:*|cmd_set_dr_server:*|do_toggle_dr:*|set_dr_type_*:*|cmd_set_outbound_iface:*|cmd_clone_*:*|ask_clone_*:*|cmd_utl_add:*|ask_del_utl_*:*|do_del_utl_*:*)
                 forkop_readonly_notice "$mid" "section_settings" "URLTest, DNS-резолвер и интерфейсы"
                 return
                 ;;
@@ -8900,7 +9112,9 @@ _handle_section_extras() {
                 else
                     send_or_edit "$_return_mid" "$(printf '%s <b>URLTest...</b>' "$E_RST")" "{\"inline_keyboard\":[[{\"text\":\"...\",\"callback_data\":\"noop\"}]]}"
                     uci set ${PODKOP_UCI}.${sec}.urltest_testing_url="$val"
-                    if uci_commit_safe ${PODKOP_UCI} && safe_reload_podkop "force"; then
+                    # Restart only when URLTest is the active mode: in Selector mode the
+                    # value is just stored for later and a tunnel restart buys nothing.
+                    if uci_commit_safe ${PODKOP_UCI} && { ! section_urltest_enabled "$sec" || safe_reload_podkop "force"; }; then
                         send_or_edit "$_return_mid" "$(printf '%s <b>OK</b> · <code>%s</code>' "$E_OK" "$(html_escape "$val")")" ""
                         sleep 1
                         _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
@@ -8920,7 +9134,9 @@ _handle_section_extras() {
                 else
                     send_or_edit "$_return_mid" "$(printf '%s <b>URLTest...</b>' "$E_RST")" "{\"inline_keyboard\":[[{\"text\":\"...\",\"callback_data\":\"noop\"}]]}"
                     uci set ${PODKOP_UCI}.${sec}.urltest_check_interval="$val"
-                    if uci_commit_safe ${PODKOP_UCI} && safe_reload_podkop "force"; then
+                    # Restart only when URLTest is the active mode: in Selector mode the
+                    # value is just stored for later and a tunnel restart buys nothing.
+                    if uci_commit_safe ${PODKOP_UCI} && { ! section_urltest_enabled "$sec" || safe_reload_podkop "force"; }; then
                         send_or_edit "$_return_mid" "$(printf '%s <b>OK</b> · <code>%s</code>' "$E_OK" "$(html_escape "$val")")" ""
                         sleep 1
                         _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
@@ -8940,7 +9156,9 @@ _handle_section_extras() {
                 else
                     send_or_edit "$_return_mid" "$(printf '%s <b>URLTest...</b>' "$E_RST")" "{\"inline_keyboard\":[[{\"text\":\"...\",\"callback_data\":\"noop\"}]]}"
                     uci set ${PODKOP_UCI}.${sec}.urltest_tolerance="$val"
-                    if uci_commit_safe ${PODKOP_UCI} && safe_reload_podkop "force"; then
+                    # Restart only when URLTest is the active mode: in Selector mode the
+                    # value is just stored for later and a tunnel restart buys nothing.
+                    if uci_commit_safe ${PODKOP_UCI} && { ! section_urltest_enabled "$sec" || safe_reload_podkop "force"; }; then
                         send_or_edit "$_return_mid" "$(printf '%s <b>OK</b> · <code>%s</code>' "$E_OK" "$(html_escape "$val")")" ""
                         sleep 1
                         _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
@@ -9469,11 +9687,70 @@ EOF
             # play; with the filter off they are dead controls.
             local _kb_extra=""
             if [ "$_show_exc" = "1" ] || [ "$_show_inc" = "1" ]; then
-                _kb_extra="[{\"text\":\"🌍 Страны определять: ${_dc_disp}\",\"callback_data\":\"do_utfilter_cycle_dc\"}],[{\"text\":\"${_hide} Скрывать отфильтрованные\",\"callback_data\":\"do_utfilter_toggle_hide\"}],"
+                _kb_extra="[{\"text\":\"🌍 Страны определять: ${_dc_disp}\",\"callback_data\":\"ask_utfilter_cycle_dc\"}],[{\"text\":\"${_hide} Скрывать отфильтрованные\",\"callback_data\":\"ask_utfilter_toggle_hide\"}],"
             fi
             send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code>]\n<i>URLTest сам выбирает самый быстрый прокси. Здесь — из каких он выбирает.</i>\n\n%s' \
                 "$E_TGT" "$sec" "$_body")" \
-                "{\"inline_keyboard\":[[{\"text\":\"Режим: ${_fm_disp} ▸ ${_next_fm_disp}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"}],${_kb_lists}${_kb_extra}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"Режим фильтра: ${_fm_disp} ▸\",\"callback_data\":\"utfilter_mode_menu\"}],${_kb_lists}${_kb_extra}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+            ;;
+
+        "utfilter_mode_menu")
+            # Tapping the old "Режим: A ▸ B" button cycled the mode AND restarted
+            # Podkop Plus in one go — four taps through four modes meant four
+            # restarts, and passing "include" with nothing selected left URLTest
+            # with no proxies at all. Now: pick explicitly, then confirm.
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
+            local _fm _b_dis="Выключен" _b_exc="Исключение" _b_inc="Только выбранные" _b_mix="Смешанный"
+            _fm=$(_plus_urltest_filter_mode "$sec")
+            case "$_fm" in
+                disabled) _b_dis="✓ Выключен" ;; exclude) _b_exc="✓ Исключение" ;;
+                include)  _b_inc="✓ Только выбранные" ;; mixed) _b_mix="✓ Смешанный" ;;
+            esac
+            send_or_edit "$mid" "$(printf '%s <b>Режим фильтра URLTest</b> [<code>%s</code>]\n\n<b>Выключен</b> — URLTest перебирает все прокси секции.\n<b>Исключение</b> — все, кроме выбранных стран/прокси.\n<b>Только выбранные</b> — только выбранные страны/прокси; если ничего не выбрано, прокси не останется.\n<b>Смешанный</b> — сначала «только выбранные», затем из них убираются исключённые.\n\n<i>Смена режима перезапускает Podkop Plus — бот попросит подтверждение.</i>' "$E_TGT" "$sec")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_b_dis}\",\"callback_data\":\"ask_utfilter_mode_disabled\"},{\"text\":\"${_b_exc}\",\"callback_data\":\"ask_utfilter_mode_exclude\"}],[{\"text\":\"${_b_inc}\",\"callback_data\":\"ask_utfilter_mode_include\"},{\"text\":\"${_b_mix}\",\"callback_data\":\"ask_utfilter_mode_mixed\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"urltest_filters_menu\"}]]}"
+            ;;
+
+        "ask_utfilter_mode_"*)
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
+            local _nm="${cmd#ask_utfilter_mode_}" _nm_disp _warn="" _ic _io
+            case "$_nm" in
+                disabled) _nm_disp="выключен" ;; exclude) _nm_disp="исключение" ;;
+                include)  _nm_disp="только выбранные" ;; mixed) _nm_disp="смешанный" ;;
+                *) CB_ANSWER_TEXT="Некорректный режим URLTest"; return ;;
+            esac
+            if [ "$_nm" = "$(_plus_urltest_filter_mode "$sec")" ]; then
+                CB_ANSWER_TEXT="Этот режим уже установлен"
+                _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return
+            fi
+            if [ "$_nm" = "include" ] || [ "$_nm" = "mixed" ]; then
+                _ic=$(_plus_urltest_list_read "$sec" urltest_include_countries | grep -c .); case "$_ic" in ''|*[!0-9]*) _ic=0 ;; esac
+                _io=$(_plus_urltest_list_read "$sec" urltest_include_outbounds | grep -c .); case "$_io" in ''|*[!0-9]*) _io=0 ;; esac
+                [ "$_ic" -eq 0 ] && [ "$_io" -eq 0 ] && \
+                    _warn=$(printf '\n\n%s <b>Список «только выбранные» пуст.</b> После перезапуска в URLTest не останется ни одного прокси и туннель перестанет работать. Сначала выберите страны или прокси.' "$E_ERR")
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Сменить режим фильтра URLTest на «%s»?</b>\n\nPodkop Plus будет перезапущен один раз.%s' "$E_WARN" "$_nm_disp" "$_warn")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"do_utfilter_mode_${_nm}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"utfilter_mode_menu\"}]]}"
+            ;;
+
+        "ask_utfilter_cycle_dc"|"ask_utfilter_toggle_hide")
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_section_extras "urltest_filters_menu" "$mid" "" ""; return; }
+            local _q _go
+            if [ "$cmd" = "ask_utfilter_cycle_dc" ]; then
+                case "$(uci -q get ${PODKOP_UCI}.${sec}.detect_server_country 2>/dev/null)" in
+                    country_is) _q="Определять страну прокси <b>по флагу</b> в имени (🇩🇪, 🇳🇱 …)?" ;;
+                    *)          _q="Определять страну прокси <b>по названию страны</b> в имени (Germany, Нидерланды …)?" ;;
+                esac
+                _go="do_utfilter_cycle_dc"
+            else
+                if [ "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_hide_filtered_outbounds 2>/dev/null)" = "1" ]; then
+                    _q="<b>Показывать</b> отфильтрованные прокси в общем списке (выбирать их вручную всё равно можно)?"
+                else
+                    _q="<b>Скрывать</b> отфильтрованные прокси из общего списка?"
+                fi
+                _go="do_utfilter_toggle_hide"
+            fi
+            send_or_edit "$mid" "$(printf '%s %s\n\n<i>Podkop Plus будет перезапущен один раз.</i>' "$E_WARN" "$_q")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"${_go}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"urltest_filters_menu\"}]]}"
             ;;
 
         "do_utfilter_mode_"*)
@@ -9519,53 +9796,87 @@ EOF
 
         "urltest_settings")
             rm -f "$STATE_FILE"
-            local ut_url ut_interval ut_tol ut_links_count sel_links_count
+            local ut_url ut_interval ut_tol ut_links_count sel_links_count _ut_active=0 _ut_state _ut_apply
             ut_url=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (по умолчанию)")
             ut_interval=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_check_interval 2>/dev/null || echo "3m (по умолчанию)")
             ut_tol=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_tolerance 2>/dev/null || echo "50 (по умолчанию)")
-            _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
-            _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
-            local _clone_btn=""
-            if [ "${sel_links_count:-0}" -gt 0 ]; then
-                _clone_btn="[{\"text\":\"${E_RST} Selector → URLTest (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+            section_urltest_enabled "$sec" && _ut_active=1
+            # Say up front whether these values do anything right now. The old
+            # card looked identical in Selector and URLTest mode, so an edit in
+            # Selector mode restarted the tunnel for a setting nobody used.
+            if [ "$_ut_active" = "1" ]; then
+                _ut_state="${E_OK} <b>URLTest включён</b> — sing-box сам выбирает самый быстрый прокси."
+                _ut_apply="<i>Изменение любого параметра перезапускает Podkop.</i>"
             else
-                # Fallback: check Clash API for proxy count even if UCI is empty
-                local _clash_count
-                _clash_count=$(clash_request "/proxies" 2>/dev/null | \
-                    jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
-                [ "${_clash_count:-0}" -gt 0 ] && \
-                    _clone_btn="[{\"text\":\"${E_RST} Selector → URLTest (${_clash_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+                _ut_state="${E_OFF} <b>URLTest выключен</b> — секция в режиме Selector, прокси выбирается вручную."
+                _ut_apply="<i>Параметры можно подготовить заранее: они сохраняются без перезапуска и заработают после включения URLTest (Настройки секции → Режим).</i>"
             fi
-            local _links_hint=""
-            [ "${ut_links_count:-0}" -eq 0 ] && \
-                _links_hint="\n${E_ERR} <b>Список пуст — Podkop не запустится в режиме URLTest.</b>"
+            local _kb_rows="" _links_line="" _links_hint=""
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                # Plus takes URLTest servers from the subscription; the parent
+                # urltest_proxy_links list is not used, so neither its count nor
+                # the "empty list — won't start" warning applies here.
+                _links_line="<b>Прокси:</b> из подписки ($(get_subscription_server_count "$sec" 2>/dev/null || echo "?"))"
+            else
+                _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
+                _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
+                if [ "${sel_links_count:-0}" -eq 0 ]; then
+                    # Fallback: check Clash API for proxy count even if UCI is empty
+                    sel_links_count=$(clash_request "/proxies" 2>/dev/null | \
+                        jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
+                    case "$sel_links_count" in ''|*[!0-9]*) sel_links_count=0 ;; esac
+                fi
+                _links_line="<b>Список прокси URLTest:</b> ${ut_links_count}"
+                if [ "${ut_links_count:-0}" -eq 0 ]; then
+                    if [ "$_ut_active" = "1" ]; then
+                        _links_hint="\n${E_ERR} <b>Список пуст — Podkop не запустится в режиме URLTest.</b>"
+                    else
+                        _links_hint="\n${E_WARN} <i>Список пуст: до включения URLTest добавьте прокси или скопируйте их из Selector.</i>"
+                    fi
+                fi
+                _kb_rows="[{\"text\":\"${E_GLOB} Список прокси (${ut_links_count})\",\"callback_data\":\"urltest_links_menu\"}],"
+                [ "${sel_links_count:-0}" -gt 0 ] && \
+                    _kb_rows="${_kb_rows}[{\"text\":\"📋 Скопировать из Selector (${sel_links_count})\",\"callback_data\":\"ask_clone_sel_to_utl\"}],"
+            fi
             send_or_edit "$mid" \
-                "$(printf '%s <b>Настройки URLTest</b> [<code>%s</code>]\n\n<b>Адрес проверки:</b>\n<code>%s</code>\n\n<b>Интервал проверки:</b> <code>%s</code>\n<i>Как часто sing-box проверяет прокси. Формат: <code>3m</code>, <code>180s</code> или <code>1h</code>.</i>\n\n<b>Допуск задержки:</b> <code>%s мс</code>\n<i>Максимальная разница задержки для переключения. Чем меньше значение, тем чаще URLTest может переключать прокси.</i>\n\n<b>Прокси для URLTest:</b> %s%b' \
-                    "$E_TGT" "$sec" "$ut_url" "$ut_interval" "$ut_tol" "$ut_links_count" "$_links_hint")" \
-                "{\"inline_keyboard\":[${_clone_btn}[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"cmd_set_ut_url\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"cmd_set_ut_interval\"}],[{\"text\":\"${E_EDIT} Допуск задержки\",\"callback_data\":\"cmd_set_ut_tolerance\"},{\"text\":\"${E_GLOB} Прокси URLTest\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+                "$(printf '%s <b>Параметры URLTest</b> [<code>%s</code>]\n%s\n\n<b>Адрес проверки:</b>\n<code>%s</code>\n<i>Куда sing-box отправляет тестовый запрос через каждый прокси.</i>\n\n<b>Интервал проверки:</b> <code>%s</code>\n<i>Как часто прокси перепроверяются. Формат: <code>3m</code>, <code>180s</code> или <code>1h</code>.</i>\n\n<b>Допуск задержки:</b> <code>%s мс</code>\n<i>Переключение происходит, только если другой прокси быстрее на это значение. Меньше — чаще переключения, больше — стабильнее.</i>\n\n%s%b\n\n%s' \
+                    "$E_TGT" "$sec" "$_ut_state" "$(html_escape "$ut_url")" "$ut_interval" "$ut_tol" "$_links_line" "$_links_hint" "$_ut_apply")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"cmd_set_ut_url\"}],[{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"cmd_set_ut_interval\"},{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"cmd_set_ut_tolerance\"}],${_kb_rows}[{\"text\":\"${E_TGT} Режим секции\",\"callback_data\":\"proxy_mode_menu\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+            ;;
+
+        "ask_clone_sel_to_utl")
+            # Copying used to run straight from a button labelled
+            # "Selector → URLTest", which read as a mode switch.
+            local _cs_n
+            _cs_n=$(clash_request "/proxies" 2>/dev/null | \
+                jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
+            case "$_cs_n" in ''|*[!0-9]*) _cs_n="?" ;; esac
+            send_or_edit "$mid" \
+                "$(printf '📋 <b>Скопировать прокси из Selector в список URLTest?</b>\n\nПрокси в Selector: <b>%s</b>. Уже имеющиеся в списке URLTest будут пропущены.\n\n<i>Режим секции не меняется, Podkop не перезапускается.</i>' "$_cs_n")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Скопировать\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
         "cmd_set_ut_url")
             echo "wait_urltest_url" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Адрес проверки прокси</b>\n\nТекущее значение: <code>%s</code>\n\nОтправьте новый URL, начинающийся с <code>http://</code> или <code>https://</code>.\nПо умолчанию: <code>https://www.gstatic.com/generate_204</code>' \
-                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_testing_url || echo "не задано")")" \
+                "$(printf '%s <b>Адрес проверки прокси</b>\n\nТекущее значение: <code>%s</code>\n\nОтправьте новый URL, начинающийся с <code>http://</code> или <code>https://</code>.\nПо умолчанию: <code>https://www.gstatic.com/generate_204</code>%s' \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_testing_url || echo "не задано")" "$(section_urltest_enabled "$sec" && printf '\n\n<i>После сохранения Podkop будет перезапущен.</i>' || printf '\n\n<i>Сейчас режим Selector — значение сохранится без перезапуска.</i>')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
         "cmd_set_ut_interval")
             echo "wait_urltest_interval" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Интервал проверки прокси</b>\n\nТекущее значение: <code>%s</code>\n\nФормат: <code>3m</code>, <code>180s</code>, <code>1h</code>\nПо умолчанию: <code>3m</code>.' \
-                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_check_interval || echo "не задано")")" \
+                "$(printf '%s <b>Интервал проверки прокси</b>\n\nТекущее значение: <code>%s</code>\n\nФормат: <code>3m</code>, <code>180s</code>, <code>1h</code>\nПо умолчанию: <code>3m</code>.%s' \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_check_interval || echo "не задано")" "$(section_urltest_enabled "$sec" && printf '\n\n<i>После сохранения Podkop будет перезапущен.</i>' || printf '\n\n<i>Сейчас режим Selector — значение сохранится без перезапуска.</i>')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
         "cmd_set_ut_tolerance")
             echo "wait_urltest_tolerance" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Допуск задержки URLTest</b>\n\nТекущее значение: <code>%s мс</code>\n\nВведите значение в миллисекундах.\nПо умолчанию: <code>50 мс</code>. Чем меньше значение, тем чаще URLTest может переключать прокси.' \
-                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_tolerance || echo "не задано")")" \
+                "$(printf '%s <b>Допуск задержки URLTest</b>\n\nТекущее значение: <code>%s мс</code>\n\nВведите значение в миллисекундах.\nПо умолчанию: <code>50 мс</code>. Чем меньше значение, тем чаще URLTest может переключать прокси.%s' \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_tolerance || echo "не задано")" "$(section_urltest_enabled "$sec" && printf '\n\n<i>После сохранения Podkop будет перезапущен.</i>' || printf '\n\n<i>Сейчас режим Selector — значение сохранится без перезапуска.</i>')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
@@ -12620,8 +12931,8 @@ ${_ip}"; fi
             _ttol=$(uci -q get "${PODKOP_UCI}.${_ch}.tolerance" 2>/dev/null)
             [ -z "$_ttol" ] && _ttol=$(uci -q get "${PODKOP_UCI}.${_ch}.urltest_tolerance" 2>/dev/null)
             _tie=$(uci -q get "${PODKOP_UCI}.${_ch}.interrupt_exist_connections" 2>/dev/null); [ -z "$_tie" ] && _tie=1
-            send_or_edit "$mid" "$(printf '%s <b>Настройки URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Адрес проверки:</b> <code>%s</code>\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск задержки:</b> <code>%s</code> мс\n<b>Разрывать соединения при переключении:</b> %s' "$E_TGT" "$sec" "$_ch" "$(html_escape "${_turl:-gstatic (по умолчанию)}")" "${_tint:-3m}" "${_ttol:-50}" "$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"fkut_u_${_ch}\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkut_i_${_ch}\"}],[{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"fkut_t_${_ch}\"},{\"text\":\"$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkut_e_${_ch}_$( [ "$_tie" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"🔬 Фильтры ротации\",\"callback_data\":\"fkutf_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+            send_or_edit "$mid" "$(printf '%s <b>Параметры URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Адрес проверки:</b> <code>%s</code>\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск задержки:</b> <code>%s</code> мс\n<i>Переключение происходит, только если другой прокси быстрее на это значение.</i>\n<b>Разрывать соединения при переключении:</b> %s\n\n<i>Любое изменение перезапускает Forkop.</i>' "$E_TGT" "$sec" "$_ch" "$(html_escape "${_turl:-gstatic (по умолчанию)}")" "${_tint:-3m}" "${_ttol:-50}" "$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"fkut_u_${_ch}\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkut_i_${_ch}\"}],[{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"fkut_t_${_ch}\"},{\"text\":\"$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkut_a_${_ch}_$( [ "$_tie" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"🔬 Фильтры ротации\",\"callback_data\":\"fkutf_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
             ;;
         "fkutf_"*)
             rm -f "$STATE_FILE"
@@ -12636,8 +12947,8 @@ ${_ip}"; fi
             _exc_c=$(_fk_child_list_read "$_ch" "urltest" "$sec" "exclude_countries" | grep -c .)
             _exc_o=$(_fk_child_list_read "$_ch" "urltest" "$sec" "exclude_outbounds" | grep -c .)
             case "$_mode" in
-                disabled) _mode_ru="выключен"; _mode_btn="[{\"text\":\"▶ Включить исключения\",\"callback_data\":\"fkufm_${_ch}_exclude\"}]," ;;
-                exclude)  _mode_ru="исключение"; _mode_btn="[{\"text\":\"⏸ Отключить фильтр\",\"callback_data\":\"fkufm_${_ch}_disabled\"}]," ;;
+                disabled) _mode_ru="выключен"; _mode_btn="[{\"text\":\"▶ Включить исключения\",\"callback_data\":\"fkufa_${_ch}_exclude\"}]," ;;
+                exclude)  _mode_ru="исключение"; _mode_btn="[{\"text\":\"⏸ Отключить фильтр\",\"callback_data\":\"fkufa_${_ch}_disabled\"}]," ;;
                 mixed)    _mode_ru="mixed"; _mode_note="\n<i>Режим mixed задан в Forkop/LuCI. Бот меняет только exclude-часть и не трогает include-фильтры.</i>" ;;
                 include)  _mode_ru="include"; _mode_note="\n<i>Режим include задан в Forkop/LuCI. exclude-поля в нём не применяются; бот не меняет этот расширенный режим автоматически.</i>" ;;
                 *)        _mode_ru="$_mode"; _mode_note="\n<i>Неизвестный режим: изменение фильтров заблокировано.</i>" ;;
@@ -12647,6 +12958,32 @@ ${_ip}"; fi
                 "{\"inline_keyboard\":[${_mode_btn}[{\"text\":\"🌍 Исключить страны по флагу\",\"callback_data\":\"fkuc_${_token}\"}],[{\"text\":\"🖥 Исключить прокси вручную\",\"callback_data\":\"fkuo_${_token}_0\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
             ;;
 
+        "fkut_a_"*)
+            # The toggle used to apply (and restart Forkop) on the first tap.
+            local _rest="${cmd#fkut_a_}" _ch _nv _q
+            _ch="${_rest%_[01]}"; _nv="${_rest##*_}"
+            _fk_child_owned "$_ch" "urltest" "$sec" || { CB_ANSWER_TEXT="URLTest не текущей секции"; return; }
+            if [ "$_nv" = "1" ]; then
+                _q="<b>Разрывать открытые соединения</b> при переключении URLTest на другой прокси?\n\n<i>Плюс: весь трафик сразу идёт через новый прокси. Минус: обрываются загрузки, звонки, SSH-сессии.</i>"
+            else
+                _q="<b>Не разрывать</b> открытые соединения при переключении URLTest?\n\n<i>Текущие соединения доживут на старом прокси, новые пойдут через новый.</i>"
+            fi
+            send_or_edit "$mid" "$(printf '%s %s\n\nForkop будет перезапущен один раз.' "$E_WARN" "$_q")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"fkut_e_${_ch}_${_nv}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
+            ;;
+        "fkufa_"*)
+            local _rest="${cmd#fkufa_}" _ch _nv _q
+            _ch="${_rest%_*}"; _nv="${_rest##*_}"
+            case "$_nv" in disabled|exclude) ;; *) CB_ANSWER_TEXT="Недопустимый режим"; return ;; esac
+            _fk_child_owned "$_ch" "urltest" "$sec" || { CB_ANSWER_TEXT="URLTest не текущей секции"; return; }
+            if [ "$_nv" = "exclude" ]; then
+                _q="<b>Включить исключения</b> для URLTest? Выбранные страны и прокси перестанут участвовать в автовыборе."
+            else
+                _q="<b>Отключить фильтр</b> URLTest? Автовыбор снова будет перебирать все прокси; списки исключений сохранятся."
+            fi
+            send_or_edit "$mid" "$(printf '%s %s\n\n<i>Forkop будет перезапущен один раз.</i>' "$E_WARN" "$_q")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"fkufm_${_ch}_${_nv}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fkutf_${_ch}\"}]]}"
+            ;;
         "fkufm_"*)
             local _rest="${cmd#fkufm_}" _ch _nv _rc
             _ch="${_rest%_*}"; _nv="${_rest##*_}"
@@ -12980,7 +13317,7 @@ EOF
             esac
             _fk_child_owned "$_ch" "urltest" "$sec" || { CB_ANSWER_TEXT="URLTest не текущей секции"; return; }
             echo "$_st" > "$STATE_FILE"
-            send_or_edit "$mid" "$(printf '%s Отправьте %s.' "$E_EDIT" "$_what")" \
+            send_or_edit "$mid" "$(printf '%s Отправьте %s.\n\n<i>После сохранения Forkop будет перезапущен.</i>' "$E_EDIT" "$_what")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
             ;;
         "fkut_e_"*)
@@ -15883,6 +16220,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
             [ "$bi" = "Not set" ]                 && bi_btn="{\"text\":\"${E_ADD} Привязать интерфейс\",\"callback_data\":\"cmd_bind_iface\"}"                 || bi_btn="{\"text\":\"${E_DEL} Отвязать интерфейс\",\"callback_data\":\"cmd_clear_bind_iface\"}"
             [ "$st" = "1" ] && st_icon="$E_ON" || st_icon="$E_OFF"
             [ "$al" = "1" ] && al_icon="$E_ON" || al_icon="$E_OFF"
+            local lam_disp; lam_disp=$(_link_alert_mode_label "$(_link_alert_mode)")
 
             kb=$(cat <<EOF
 {"inline_keyboard":[
@@ -15893,6 +16231,7 @@ $(_fmt_tier "tier5" "Аварийные IP")"
   [${bi_btn}],
   [{"text":"${st_icon} Сообщать о запуске","callback_data":"toggle_bot_st"}],
   [{"text":"${al_icon} Сообщать о сбоях","callback_data":"toggle_bot_al"}],
+  [{"text":"🔔 Связь и sing-box: ${lam_disp}","callback_data":"link_alert_menu"}],
   [{"text":"${bc_icon} Уведомлять всех","callback_data":"toggle_broadcast_alerts"}],
   [{"text":"${ram_al_icon} Контроль памяти","callback_data":"toggle_ram_alert"}],
   [{"text":"${qh_icon} Режим тишины","callback_data":"toggle_quiet_hours"},{"text":"⏰ Время","callback_data":"cmd_set_quiet_hours"}],
@@ -16000,6 +16339,36 @@ EOF
             ;;
         "toggle_bot_st") toggle_uci_bool "podkop_bot.settings" "startup_notify"; _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_bot_al") toggle_uci_bool "podkop_bot.settings" "alert_notify";   _handle_bot "bot_settings" "$mid" "" "" ;;
+        "link_alert_menu")
+            local _lam _l_all _l_smart _l_crit _l_off _usw _usw_icon _al_note=""
+            _lam=$(_link_alert_mode)
+            _l_all="Все"; _l_smart="Умные"; _l_crit="Только критичные"; _l_off="Выключены"
+            case "$_lam" in
+                all)      _l_all="✓ Все" ;;
+                critical) _l_crit="✓ Только критичные" ;;
+                off)      _l_off="✓ Выключены" ;;
+                *)        _l_smart="✓ Умные" ;;
+            esac
+            _usw=$(uci -q get podkop_bot.settings.urltest_switch_notify || echo "1")
+            [ "$_usw" = "1" ] && _usw_icon="$E_ON" || _usw_icon="$E_OFF"
+            [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" != "1" ] && \
+                _al_note=$(printf '\n\n%s <i>Сейчас выключено «Сообщать о сбоях» — пока оно выключено, бот не присылает ни одно из этих уведомлений.</i>' "$E_WARN")
+            send_or_edit "$mid" "$(printf '🔔 <b>Уведомления о связи бота и sing-box</b>\n\nОтносится к сообщениям «Telegram снова доступен», «Соединение бота восстановлено», «Основной SOCKS-прокси восстановлен/недоступен» и «sing-box перезапущен».\n\n<b>Все</b> — каждое событие сразу, как раньше.\n<b>Умные</b> — короткие сбои и одиночные перезапуски sing-box копятся и приходят одной сводкой (не чаще раза в 3 ч). Отдельное сообщение — только если проблема держится дольше 5 мин, sing-box флапает или не поднимается. Плюс одно сообщение о восстановлении.\n<b>Только критичные</b> — только если бот %s проверок подряд не нашёл резервный путь (остался на прямом подключении или аварийных IP), sing-box флапает или не запускается.\n<b>Выключены</b> — ни одного из этих сообщений.\n\nПерезапуски sing-box, которые вызвал сам бот (применение настроек), в режимах «Умные» и «Только критичные» не сообщаются.\n\n<b>Переключения URLTest</b> (🔀 «A → B») настраиваются отдельно.%s' "10" "$_al_note")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_l_smart}\",\"callback_data\":\"set_link_alert_smart\"},{\"text\":\"${_l_crit}\",\"callback_data\":\"set_link_alert_critical\"}],[{\"text\":\"${_l_all}\",\"callback_data\":\"set_link_alert_all\"},{\"text\":\"${_l_off}\",\"callback_data\":\"set_link_alert_off\"}],[{\"text\":\"${_usw_icon} Переключения URLTest\",\"callback_data\":\"toggle_urltest_switch_notify\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"}]]}"
+            ;;
+        "set_link_alert_"*)
+            local _new_lam="${cmd#set_link_alert_}"
+            case "$_new_lam" in all|smart|critical|off) ;; *) _new_lam="smart" ;; esac
+            uci set podkop_bot.settings.link_alert_mode="$_new_lam"
+            uci_commit_safe podkop_bot
+            CB_ANSWER_TEXT="Уведомления о связи: $(_link_alert_mode_label "$_new_lam")"
+            _handle_bot "link_alert_menu" "$mid" "" ""
+            ;;
+        "toggle_urltest_switch_notify")
+            [ -z "$(uci -q get podkop_bot.settings.urltest_switch_notify)" ] && uci set podkop_bot.settings.urltest_switch_notify="1"
+            toggle_uci_bool "podkop_bot.settings" "urltest_switch_notify"
+            _handle_bot "link_alert_menu" "$mid" "" ""
+            ;;
         "toggle_broadcast_alerts") toggle_uci_bool "podkop_bot.settings" "broadcast_alerts"; _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_ram_alert")        toggle_uci_bool "podkop_bot.settings" "ram_alert";        _handle_bot "bot_settings" "$mid" "" "" ;;
         "toggle_quiet_hours")      toggle_uci_bool "podkop_bot.settings" "quiet_hours_enabled"; _handle_bot "bot_settings" "$mid" "" "" ;;
@@ -17249,7 +17618,7 @@ handle_command() {
         # directly to _handle_forkop_ext made the visible URLTest button a no-op.
         urltest_settings|cmd_set_ut_url|cmd_set_ut_interval|cmd_set_ut_tolerance|\
         urltest_links_menu|urltest_links_p_*|cmd_utl_add|ask_del_utl_*|do_del_utl_*|\
-        cmd_clone_sel_to_utl|cmd_clone_utl_to_sel|\
+        cmd_clone_sel_to_utl|cmd_clone_utl_to_sel|ask_clone_sel_to_utl|\
         cmd_set_mixed_port|cmd_set_outbound_iface)
             _handle_section_extras "$cmd" "$mid" "" "" ;;
 
@@ -17260,8 +17629,8 @@ handle_command() {
         fk_conds|fk_c_*|fkc_add_*|fkc_del_*|fk_dev_list|fk_dev_a_*|\
         fk_detour|fkd_t_*|fkd_pick|fkd_s_*|\
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
-        fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|\
-        fkutf_*|fkufm_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
+        fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|fkut_a_*|\
+        fkutf_*|fkufm_*|fkufa_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
         ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
             if _ts_backend_control_available; then
                 _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id"
@@ -17287,7 +17656,7 @@ handle_command() {
         do_dpi_toggle_*)
             _handle_settings "$cmd" "$mid" "$cid" "$cb_id" ;;
 
-        urltest_filters_menu|\
+        urltest_filters_menu|utfilter_mode_menu|ask_utfilter_mode_*|ask_utfilter_cycle_dc|ask_utfilter_toggle_hide|\
         do_utfilter_mode_*|do_utfilter_cycle_dc|do_utfilter_toggle_hide|\
         puuc_*|puuca_*|puucc_*|puuflag_*|puuo_*|puuot_*|puuoa_*|puuoc_*)
             _handle_section_extras "$cmd" "$mid" "$cid" "$cb_id" ;;
