@@ -2996,7 +2996,31 @@ get_tg_latency() {
 # SECTION 3: Authorization & Chat Context
 # ==============================================================================
 
-get_active_section() { cat "$ACTIVE_SECTION_FILE" 2>/dev/null || echo "main"; }
+# get_active_section — the section the UI works with. The file deliberately
+# survives bot restarts, which also let it outlive the section itself: a
+# section renamed (main -> akenai) or a switch of podkop variant left the bot
+# on a "main" that no longer exists — field case Podkop Plus with only
+# "akenai": the proxy screen looked for main-out and showed an empty list.
+# A stale value is replaced by the first enabled proxy section (else the
+# first section) and written back.
+get_active_section() {
+    local _s _all _c _en _first=""
+    _s=$(cat "$ACTIVE_SECTION_FILE" 2>/dev/null)
+    if [ -n "$_s" ] && [ "$(uci -q get "${PODKOP_UCI}.${_s}" 2>/dev/null)" = "section" ]; then
+        printf '%s\n' "$_s"; return 0
+    fi
+    _all=$(uci -q show "${PODKOP_UCI}" 2>/dev/null | sed -n "s/^${PODKOP_UCI}\.\([^.=]*\)=section\$/\1/p")
+    [ -n "$_all" ] || { printf '%s\n' "${_s:-main}"; return 0; }
+    for _c in $_all; do
+        [ -z "$_first" ] && _first="$_c"
+        _en=$(uci -q get "${PODKOP_UCI}.${_c}.enabled" 2>/dev/null); [ -z "$_en" ] && _en=1
+        [ "$_en" = "1" ] && section_is_proxy "$_c" 2>/dev/null && { _first="$_c"; break; }
+    done
+    printf '%s\n' "$_first" > "${ACTIVE_SECTION_FILE}.tmp.$$" 2>/dev/null && \
+        mv "${ACTIVE_SECTION_FILE}.tmp.$$" "$ACTIVE_SECTION_FILE" 2>/dev/null
+    logger -t podkop-bot "[Sections] active section '${_s:-<none>}' does not exist — switched to '${_first}'"
+    printf '%s\n' "$_first"
+}
 
 set_chat_context() {
     TARGET_CHAT_ID="$1"; TARGET_MESSAGE_ID="$2"
@@ -18322,12 +18346,9 @@ EOF
 
 # Initialize active section file BEFORE launching daemons so build_all_caches
 # inside send_startup_notification_async uses the correct section.
-if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
-    _first_sec=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep "^${PODKOP_UCI}\.[^.]*=section$" \
-        | head -1 | cut -d. -f2 | cut -d= -f1)
-    echo "${_first_sec:-main}" > "$ACTIVE_SECTION_FILE"
-fi
+# get_active_section validates the remembered section and repairs a stale one
+# (e.g. "main" left over after the section was renamed).
+get_active_section >/dev/null
 
 _traffic_stats_init || logger -t podkop-bot "[Traffic] UCI stats initialization failed; using RAM accumulator only."
 send_startup_notification_async &
