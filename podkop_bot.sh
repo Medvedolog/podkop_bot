@@ -2208,16 +2208,62 @@ _warp_rescue_flags() {
     printf -- '-x %s %s' "$(printf '%s' "$_p" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
 }
 
+# WARP node rotation. A WARP node can stay "ON-AIR" with working internet
+# (gstatic 204) while Telegram through it is dead — field case RAX3000Me: the
+# controller only restarts a dead process, it never notices that. Every
+# Telegram attempt through a live WARP (transport tier and follower probe)
+# reports here; after _WARP_TG_FAIL_LIMIT failures in a row the bot asks the
+# controller for the next VALID node ("Следующий WARP"), at most once per
+# _WARP_NEXT_COOLDOWN. Shared via files: transport runs in the main loop, the
+# follower in the watchdog.
+_WARP_TG_FAIL_FILE="${BOT_DIR}/warp_tg_fail"
+_WARP_NEXT_TS_FILE="${BOT_DIR}/warp_next_ts"
+_WARP_TG_FAIL_LIMIT=2
+_WARP_NEXT_COOLDOWN=180
+
+_warp_rescue_note_tg() {
+    local _res="$1" _now _cnt=0 _last=0 _trig=0 _tmp _resp
+    if [ "$_res" = "ok" ]; then
+        rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+        return 0
+    fi
+    _now=$(date +%s 2>/dev/null || echo 0)
+    # A node the bot has just armed is still coming up — not a verdict on it.
+    [ -r "$_WARP_RESCUE_TRIGGER_TS_FILE" ] && _trig=$(cat "$_WARP_RESCUE_TRIGGER_TS_FILE" 2>/dev/null)
+    case "$_trig" in ''|*[!0-9]*) _trig=0 ;; esac
+    [ $((_now - _trig)) -lt 30 ] && return 0
+    [ -r "$_WARP_TG_FAIL_FILE" ] && _cnt=$(cat "$_WARP_TG_FAIL_FILE" 2>/dev/null)
+    case "$_cnt" in ''|*[!0-9]*) _cnt=0 ;; esac
+    _cnt=$((_cnt + 1))
+    _tmp="${_WARP_TG_FAIL_FILE}.tmp.$$"
+    printf '%s\n' "$_cnt" > "$_tmp" && mv "$_tmp" "$_WARP_TG_FAIL_FILE" 2>/dev/null
+    [ "$_cnt" -ge "$_WARP_TG_FAIL_LIMIT" ] || return 0
+    [ -r "$_WARP_NEXT_TS_FILE" ] && _last=$(cat "$_WARP_NEXT_TS_FILE" 2>/dev/null)
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    [ $((_now - _last)) -ge "$_WARP_NEXT_COOLDOWN" ] || return 0
+    printf '%s\n' "$_now" > "$_WARP_NEXT_TS_FILE"
+    rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+    _resp=$(ubus call podkop_bot_warpscout_rescue next '{}' 2>/dev/null || true)
+    if printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1 || [ -z "$_resp" ]; then
+        logger -t podkop-bot "[Transport] WARP Rescue: Telegram unreachable through the current node ${_cnt} checks in a row — switched to the next node."
+    else
+        logger -t podkop-bot "[Transport] WARP Rescue: next node requested after ${_cnt} Telegram failures, controller answered: $(printf '%s' "$_resp" | tr -d '\n' | cut -c1-160)"
+    fi
+}
+
 _try_warp_rescue() {
     local _args="$1" _max_time="$2" _ct="$3" _proxy
     [ "$_t_policy" != "direct" ] || return 1
     _proxy=$(_warp_rescue_flags 1) || return 1
     logger -t podkop-bot "[Transport] Trying WARP Rescue for ${_ROUTE_PROFILE:-unknown}"
     if _try_curl "$_proxy" "$_max_time" "$_args" "$_ct"; then
+        _warp_rescue_note_tg ok
         ROUTE_KEY="warp_rescue"
         ROUTE_NAME="WARP Rescue"
         return 0
     fi
+    # Telegram answering with an error (409/429) still proves the node works.
+    if [ "${_TG_NO_DEMOTE:-0}" = "1" ]; then _warp_rescue_note_tg ok; else _warp_rescue_note_tg fail; fi
     logger -t podkop-bot "[Transport] WARP Rescue failed for ${_ROUTE_PROFILE:-unknown}"
     return 1
 }
@@ -2379,6 +2425,7 @@ _route_request() {
                     _warp_proxy=$(_warp_rescue_flags 1 2>/dev/null || true)
                     [ -n "$_warp_proxy" ] && \
                     _try_curl "$_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                        _warp_rescue_note_tg ok
                         LAST_ROUTE="warp_rescue"; LAST_ROUTE_NAME="WARP Rescue"
                         _write_route_state "$_ROUTE_PROFILE" "warp_rescue" "$LAST_ROUTE_NAME"
                         eval "$_rvar=warp_rescue"; return 0
@@ -2754,6 +2801,7 @@ probe_all_socks_write() {
         (
             _lat=$(probe_telegram_proxy_latency "$(printf '%s' "$_warp_follow" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)")
             printf 'warp_rescue=%s\n' "$_lat" > "$_probe_dir/warp_rescue"
+            case "$_lat" in *ms) _warp_rescue_note_tg ok ;; *) _warp_rescue_note_tg fail ;; esac
         ) & _pids="$_pids $!"
     fi
 
