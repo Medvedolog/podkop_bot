@@ -2157,6 +2157,13 @@ _warp_rescue_cfg_get() {
     sed -n "s/^$1=//p" "$_WARP_RESCUE_CONFIG" 2>/dev/null | head -1
 }
 
+# The Revolver controller is an rpcd object shipped by Podkop BearGuard with
+# WARPSCOUT. warpscout.conf can outlive an uninstall, so "enabled=1" alone does
+# not mean there is anything to talk to.
+_warp_rescue_ctl_present() {
+    ubus list podkop_bot_warpscout_rescue >/dev/null 2>&1
+}
+
 _warp_rescue_pid_alive() {
     [ -s "$_WARP_RESCUE_PID_FILE" ] || return 1
     local _p
@@ -2244,8 +2251,10 @@ _warp_rescue_note_tg() {
     printf '%s\n' "$_now" > "$_WARP_NEXT_TS_FILE"
     rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
     _resp=$(ubus call podkop_bot_warpscout_rescue next '{}' 2>/dev/null || true)
-    if printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1 || [ -z "$_resp" ]; then
+    if printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
         logger -t podkop-bot "[Transport] WARP Rescue: Telegram unreachable through the current node ${_cnt} checks in a row — switched to the next node."
+    elif [ -z "$_resp" ]; then
+        logger -t podkop-bot "[Transport] WARP Rescue: Telegram unreachable through the current node ${_cnt} checks in a row, but the Revolver controller does not answer (WARPSCOUT / BearGuard missing?)."
     else
         logger -t podkop-bot "[Transport] WARP Rescue: next node requested after ${_cnt} Telegram failures, controller answered: $(printf '%s' "$_resp" | tr -d '\n' | cut -c1-160)"
     fi
@@ -14808,6 +14817,8 @@ _handle_fallback_socks() {
                 [ "$_wr_loc" = "$_wr_meta" ] && _wr_loc=""
                 if _warp_rescue_pid_alive; then
                     _wr_state="ON-AIR${_wr_lat:+ · $_wr_lat}"
+                elif ! _warp_rescue_ctl_present; then
+                    _wr_state="Revolver не установлен"
                 else
                     _wr_state="ожидает Revolver"
                 fi
@@ -14854,6 +14865,11 @@ _handle_fallback_socks() {
             _w_en=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
             if [ "$_w_en" != "1" ]; then
                 send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>\n\nWARP Rescue выключен. Включается в веб-интерфейсе Podkop BearGuard.')" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+                return
+            fi
+            if ! _warp_rescue_ctl_present; then
+                send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>\n\n%s Revolver (WARPSCOUT) на роутере не найден, хотя WARP Rescue включён в настройках.\n\nWARP Rescue работает только с веб-интерфейсом <b>Podkop BearGuard</b> и установленным в нём WARPSCOUT: «Установка / удаление WARPSCOUT» на странице WARP Rescue. Пока его нет, бот WARP не использует.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
                 return
             fi
