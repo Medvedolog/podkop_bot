@@ -542,10 +542,21 @@ _write_state_file() {
     printf '%s' "$_val" > "$_tmp" && mv "$_tmp" "$_dst" 2>/dev/null
 }
 
+# ROUTE_LOG: "epoch|route_key" appended by the main loop whenever the POLL route
+# actually changes (transient "unknown" after a watchdog reset is not logged).
+# The daily report derives from it how long the bot spent off its primary
+# channel; one short line per change, trimmed to 8 days by the report.
+ROUTE_LOG="${BOT_DIR}/route_log"
+_ROUTE_LOG_LAST=""
+
 _write_route_state() {
     local _profile="$1" _key="$2" _name="$3"
     case "$_profile" in
         poll)
+            if [ "$_key" != "unknown" ] && [ "$_key" != "$_ROUTE_LOG_LAST" ]; then
+                printf '%s|%s\n' "$(date +%s)" "$_key" >> "$ROUTE_LOG" 2>/dev/null
+                _ROUTE_LOG_LAST="$_key"
+            fi
             LAST_ROUTE_POLL="$_key"
             LAST_ROUTE_POLL_NAME="$_name"
             case "$_key" in
@@ -3760,8 +3771,13 @@ uci_commit_safe() {
 # ==============================================================================
 
 get_selector_tag() {
-    local proxies="$1" sec tag
-    sec=$(get_active_section)
+    _section_selector_tag "$(get_active_section)" "$1"
+}
+
+# _section_selector_tag SECTION [PROXIES_JSON] — Clash selector/urltest tag of
+# any section (get_selector_tag is this for the active section).
+_section_selector_tag() {
+    local sec="$1" proxies="$2" tag
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
     tag=$(printf '%s' "$proxies" | jq -r --arg s "$sec" \
         'if .proxies[$s] then $s
@@ -5680,8 +5696,11 @@ send_daily_report() {
         local _sw_day_cutoff; _sw_day_cutoff=$(( $(date +%s) - 86400 ))
         _sw_day_count=$(awk -F'|' -v c="$_sw_day_cutoff" '$1>=c{n++} END{print n+0}' "$SWITCH_LOG" 2>/dev/null || echo 0)
     fi
-    [ "${_sw_day_count:-0}" -gt 0 ] 2>/dev/null && \
-        _switch_disp="${_switch_disp} (${_sw_day_count} за 24 ч)"
+    local _sw_day_man=0 _sw_day_auto=0
+    if [ "${_sw_day_count:-0}" -gt 0 ] 2>/dev/null; then
+        _sw_day_man=$(awk -F'|' -v c="$_sw_day_cutoff" '$1>=c && $2=="manual"{n++} END{print n+0}' "$SWITCH_LOG" 2>/dev/null || echo 0)
+        _sw_day_auto=$(awk -F'|' -v c="$_sw_day_cutoff" '$1>=c && $2=="urltest"{n++} END{print n+0}' "$SWITCH_LOG" 2>/dev/null || echo 0)
+    fi
     # Версии
     # Режим секции
     local _sec_mode _sec_mode_disp
@@ -5803,20 +5822,93 @@ send_daily_report() {
     _cur_tier=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "?")
     # Mask credentials in route string (e.g. socks5h://user:pass@host)
     _cur_tier=$(printf '%s' "$_cur_tier" | sed 's#://\([^:/@]*\):[^@]*@#://\1:**@#g')
-    # Резервные каналы из probe file
+    _load_transport_ctx
+    # Every channel from the follower probe (Telegram getMe latency), now with
+    # its address: "Резервный SOCKS №2: 120 мс" alone did not say which section
+    # or proxy that was.
+    local _tier_name _tier_val _tier_ms _tier_url
     while IFS='=' read -r _tier_name _tier_val; do
         [ -z "$_tier_name" ] && continue
-        local _tier_ms; _tier_ms=$(printf '%s' "$_tier_val" | awk '{print $1}')
+        _tier_ms=$(printf '%s' "$_tier_val" | awk '{print $1}')
+        _tier_url=""
+        case "$_tier_val" in *" url="*) _tier_url=$(html_escape "${_tier_val#* url=}") ;; esac
         case "$_tier_ms" in
-            timeout|fail|"") _tier_ms="${_tier_ms:-?}" ;;
+            timeout|fail|"") _tier_ms="❌ ${_tier_ms:-?}" ;;
             *ms) _tier_ms="${_tier_ms%ms} мс" ;;
             *[0-9]) _tier_ms="${_tier_ms} мс" ;;
         esac
         case "$_tier_name" in
-            tier2_*) _tier_chain="${_tier_chain}   Резервный SOCKS №${_tier_name#tier2_}: <code>${_tier_ms}</code>\n" ;;
-            tier3)   _tier_chain="${_tier_chain}   Прокси бота: <code>${_tier_ms}</code>\n" ;;
+            tier1)       _tier_chain="${_tier_chain}   Основной SOCKS <code>$(html_escape "${_t_ip}:${_t_port}")</code> [<code>$(html_escape "$_t_sec")</code>]: <code>${_tier_ms}</code>\n" ;;
+            tier2_*)     _tier_chain="${_tier_chain}   Резерв №${_tier_name#tier2_} <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>\n" ;;
+            tier3)       _tier_chain="${_tier_chain}   Прокси бота <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>\n" ;;
+            warp_rescue) _tier_chain="${_tier_chain}   WARP Rescue: <code>${_tier_ms}</code>\n" ;;
         esac
     done < "$SOCKS_PROBE_FILE" 2>/dev/null
+
+    # ── Секции ────────────────────────────────────────────────────────────────
+    # All sections, not only the active one: mode, local mixed-proxy address
+    # (the address other devices and the bot use), Telegram latency through it
+    # from the follower probe, and the outbound each section is on right now.
+    local _secs_block="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
+    for _s in $_t_all_secs; do
+        _s_en=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_s_en" ] && _s_en=1
+        _s_type=$(get_section_type "$_s" 2>/dev/null || echo "?")
+        _s_mode=$(section_mode_label "$_s_type")
+        if [ "$_s_en" != "1" ]; then
+            _secs_block="${_secs_block}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")"
+            continue
+        fi
+        _s_line=$(printf '\n%s <code>%s</code> · %s' "$( [ "$_s" = "$_sec" ] && echo "▶" || echo "🟢")" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")
+        _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
+        _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
+        if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
+            _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
+            if [ "$_s" = "$_t_sec" ]; then
+                _s_lat=$(sed -n 's/^tier1=\([^ ]*\).*/\1/p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
+            else
+                _s_lat=$(grep "^tier2_[0-9]*=.* url=.*${_s_ip}:${_s_mp}\$" "$SOCKS_PROBE_FILE" 2>/dev/null | head -1 | sed 's/^[^=]*=\([^ ]*\).*/\1/')
+            fi
+            case "$_s_lat" in *ms) _s_lat="TG ${_s_lat%ms} мс" ;; "") _s_lat="" ;; *) _s_lat="TG ❌" ;; esac
+            _s_line="${_s_line}$(printf '\n   mixed <code>%s:%s</code>%s' "$(html_escape "$_s_ip")" "$_s_mp" "${_s_lat:+ · ${_s_lat}}")"
+        fi
+        case "$_s_type" in block|exclusion|bypass|direct|dns|zapret*|byedpi|vpn|vpn:*) _s_sel="" ;; *) _s_sel="x" ;; esac
+        if [ -n "$_proxies" ] && [ -n "$_s_sel" ]; then
+            _s_sel=$(_section_selector_tag "$_s" "$_proxies")
+            _s_now=$(printf '%s' "$_proxies" | jq -r --arg t "$_s_sel" '.proxies[$t] | if .type == "Selector" or .type == "URLTest" or .type == "Fallback" then (.now // empty) else empty end' 2>/dev/null)
+            if [ -n "$_s_now" ]; then
+                _s_leaf=$(_resolve_leaf "$_s_now" "$_proxies")
+                _s_delay=$(printf '%s' "$_proxies" | jq -r --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // empty' 2>/dev/null)
+                case "$_s_delay" in ''|0|*[!0-9]*) _s_delay="" ;; esac
+                _s_line="${_s_line}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")")" "${_s_delay:+ · ${_s_delay} мс}")"
+            fi
+        fi
+        _secs_block="${_secs_block}${_s_line}"
+    done
+
+    # ── За 24 часа: канал бота ────────────────────────────────────────────────
+    # From ROUTE_LOG: route changes in the window, and how long the bot sat off
+    # its primary channel — on a reserve proxy, on Direct/emergency IPs, or with
+    # no connection at all. The state at the window start is the last entry
+    # before it, so a reserve stint that began yesterday is counted correctly.
+    local _rt_stats _rt_changes=0 _rt_reserve=0 _rt_direct=0 _rt_fail=0
+    if [ -s "$ROUTE_LOG" ]; then
+        _rt_stats=$(awk -F'|' -v now="$(date +%s)" '
+            BEGIN { c = now - 86400; prev = ""; pts = c }
+            function add(k, a, b) { if (b <= a) return
+                if (k ~ /^(tier2_|tier3|warp_rescue)/) res += b - a
+                else if (k ~ /^tier[45]$/) dir += b - a
+                else if (k == "fail") fl += b - a }
+            $1 < c { prev = $2; next }
+            { add(prev, pts, $1); if (prev != "" || NR > 1) ch++; prev = $2; pts = $1 }
+            END { add(prev, pts, now); printf "%d %d %d %d", ch, res, dir, fl }' "$ROUTE_LOG" 2>/dev/null)
+        read -r _rt_changes _rt_reserve _rt_direct _rt_fail <<EOF
+$_rt_stats
+EOF
+        case "$_rt_changes$_rt_reserve$_rt_direct$_rt_fail" in ''|*[!0-9]*) _rt_changes=0; _rt_reserve=0; _rt_direct=0; _rt_fail=0 ;; esac
+        # trim to 8 days
+        awk -F'|' -v c=$(( $(date +%s) - 691200 )) '$1>=c' "$ROUTE_LOG" > "${ROUTE_LOG}.tmp" 2>/dev/null \
+            && mv "${ROUTE_LOG}.tmp" "$ROUTE_LOG" 2>/dev/null
+    fi
 
     # ── Подписка Plus ─────────────────────────────────────────────────────────
     local _sub_block=""
@@ -5884,6 +5976,8 @@ send_daily_report() {
         "$(html_escape "$_sb_ver")" "${_sb_since:+ · работает ${_sb_since}}" "$_sec_mode_disp" "$(html_escape "$_sec")" \
         "$_ob_disp" "$_switch_disp" "$_sb_restarts" "$_reload_line_d")"
 
+    [ -n "$_secs_block" ] && _text="${_text}$(printf '\n\n🧩 <b>Секции</b>')${_secs_block}"
+
     if [ "$_dl_fmt" = "—" ]; then
         _text="${_text}$(printf '\n\n📊 <b>Трафик</b>\n<i>Сбор суточной статистики начат заново. Данные появятся в следующем отчёте.</i>\nАктивных соединений: <code>%s</code>' \
             "$_curr_conn")"
@@ -5891,6 +5985,20 @@ send_daily_report() {
         _text="${_text}$(printf '\n\n📊 <b>Трафик</b> <i>(за %s)</i>\n↓ <code>%s</code> · ↑ <code>%s</code> · Соединений: <code>%s</code>' \
             "$_period_label" "$_dl_fmt" "$_ul_fmt" "$_curr_conn")"
     fi
+
+    local _day_block
+    _day_block=$(printf '\n\n📈 <b>За 24 часа</b>\nПереключений прокси: <code>%s</code>' "${_sw_day_count:-0}")
+    [ "${_sw_day_count:-0}" -gt 0 ] 2>/dev/null && \
+        _day_block="${_day_block}$(printf ' (✋ %s · 🤖 URLTest %s)' "$_sw_day_man" "$_sw_day_auto")"
+    _day_block="${_day_block}$(printf '\nСмен канала бота: <code>%s</code>' "$_rt_changes")"
+    if [ "$_rt_reserve" -gt 0 ] || [ "$_rt_direct" -gt 0 ] || [ "$_rt_fail" -gt 0 ]; then
+        [ "$_rt_reserve" -gt 0 ] && _day_block="${_day_block}$(printf '\n   на резервном канале: <code>%s</code>' "$(_fmt_secs_ru "$_rt_reserve")")"
+        [ "$_rt_direct" -gt 0 ]  && _day_block="${_day_block}$(printf '\n   напрямую / аварийные IP: <code>%s</code>' "$(_fmt_secs_ru "$_rt_direct")")"
+        [ "$_rt_fail" -gt 0 ]    && _day_block="${_day_block}$(printf '\n   без связи с Telegram: <code>%s</code>' "$(_fmt_secs_ru "$_rt_fail")")"
+    elif [ -s "$ROUTE_LOG" ]; then
+        _day_block="${_day_block}$(printf ' · всё время на основном канале')"
+    fi
+    _text="${_text}${_day_block}"
 
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' \
         "$(html_escape "$_cur_tier")")"
