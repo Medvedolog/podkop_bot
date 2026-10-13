@@ -15259,7 +15259,7 @@ _handle_fallback_socks() {
                 _wr_test_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
                 if [ -n "$_wr_test_proxy" ]; then
                     _probe_channel "$(printf '%s' "$_wr_test_proxy" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
-                    _append_channel "WARP Rescue" "$(html_escape "$_wr_test_proxy")"
+                    _append_channel "WARP Rescue" "$(html_escape "$(printf '%s' "$_wr_test_proxy" | sed 's#^socks5h://#socks5://#')") · Telegram по IP ${TG_EMERGENCY_IPS%% *}"
                 else
                     CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
                     CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="не удалось запустить"
