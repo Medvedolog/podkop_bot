@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.21
+# Podkop Telegram Bot v0.19.22
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.21"
+BOT_VERSION="0.19.22"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -2157,6 +2157,13 @@ _warp_rescue_cfg_get() {
     sed -n "s/^$1=//p" "$_WARP_RESCUE_CONFIG" 2>/dev/null | head -1
 }
 
+# The Revolver controller is an rpcd object shipped by Podkop BearGuard with
+# WARPSCOUT. warpscout.conf can outlive an uninstall, so "enabled=1" alone does
+# not mean there is anything to talk to.
+_warp_rescue_ctl_present() {
+    ubus list podkop_bot_warpscout_rescue >/dev/null 2>&1
+}
+
 _warp_rescue_pid_alive() {
     [ -s "$_WARP_RESCUE_PID_FILE" ] || return 1
     local _p
@@ -2187,16 +2194,85 @@ _warp_rescue_proxy() {
     printf 'socks5h://127.0.0.1:%s' "$_port"
 }
 
+# Telegram through WARP must be addressed by a real api.telegram.org IP.
+# Field test (RAX3000Me): socks5h:// and socks5:// both timed out at 15s, the
+# same request with --resolve to a Telegram IP answered in 0.5s. The router's
+# resolver is podkop's (fake-IP / tunnel-only answers for listed domains) and
+# the WARP SOCKS does not resolve it usefully either, so the name never maps
+# to an address WARP can reach. TG_EMERGENCY_IPS holds real Bot API IPs kept
+# fresh via DoH.
+_warp_tg_resolve() {
+    local _ip="${TG_EMERGENCY_IPS%% *}"
+    case "$_ip" in ''|*[!0-9.]*) _ip="149.154.167.220" ;; esac
+    printf -- '--resolve api.telegram.org:443:%s' "$_ip"
+}
+
+# _warp_rescue_flags [ALLOW_START] — curl flags for a Telegram request via WARP.
+# socks5:// (not socks5h://) so that curl honours --resolve and hands WARP the IP.
+_warp_rescue_flags() {
+    local _p
+    _p=$(_warp_rescue_proxy "${1:-0}") || return 1
+    printf -- '-x %s %s' "$(printf '%s' "$_p" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
+}
+
+# WARP node rotation. A WARP node can stay "ON-AIR" with working internet
+# (gstatic 204) while Telegram through it is dead — field case RAX3000Me: the
+# controller only restarts a dead process, it never notices that. Every
+# Telegram attempt through a live WARP (transport tier and follower probe)
+# reports here; after _WARP_TG_FAIL_LIMIT failures in a row the bot asks the
+# controller for the next VALID node ("Следующий WARP"), at most once per
+# _WARP_NEXT_COOLDOWN. Shared via files: transport runs in the main loop, the
+# follower in the watchdog.
+_WARP_TG_FAIL_FILE="${BOT_DIR}/warp_tg_fail"
+_WARP_NEXT_TS_FILE="${BOT_DIR}/warp_next_ts"
+_WARP_TG_FAIL_LIMIT=2
+_WARP_NEXT_COOLDOWN=180
+
+_warp_rescue_note_tg() {
+    local _res="$1" _now _cnt=0 _last=0 _trig=0 _tmp _resp
+    if [ "$_res" = "ok" ]; then
+        rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+        return 0
+    fi
+    _now=$(date +%s 2>/dev/null || echo 0)
+    # A node the bot has just armed is still coming up — not a verdict on it.
+    [ -r "$_WARP_RESCUE_TRIGGER_TS_FILE" ] && _trig=$(cat "$_WARP_RESCUE_TRIGGER_TS_FILE" 2>/dev/null)
+    case "$_trig" in ''|*[!0-9]*) _trig=0 ;; esac
+    [ $((_now - _trig)) -lt 30 ] && return 0
+    [ -r "$_WARP_TG_FAIL_FILE" ] && _cnt=$(cat "$_WARP_TG_FAIL_FILE" 2>/dev/null)
+    case "$_cnt" in ''|*[!0-9]*) _cnt=0 ;; esac
+    _cnt=$((_cnt + 1))
+    _tmp="${_WARP_TG_FAIL_FILE}.tmp.$$"
+    printf '%s\n' "$_cnt" > "$_tmp" && mv "$_tmp" "$_WARP_TG_FAIL_FILE" 2>/dev/null
+    [ "$_cnt" -ge "$_WARP_TG_FAIL_LIMIT" ] || return 0
+    [ -r "$_WARP_NEXT_TS_FILE" ] && _last=$(cat "$_WARP_NEXT_TS_FILE" 2>/dev/null)
+    case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+    [ $((_now - _last)) -ge "$_WARP_NEXT_COOLDOWN" ] || return 0
+    printf '%s\n' "$_now" > "$_WARP_NEXT_TS_FILE"
+    rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+    _resp=$(ubus call podkop_bot_warpscout_rescue next '{}' 2>/dev/null || true)
+    if printf '%s' "$_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+        logger -t podkop-bot "[Transport] WARP Rescue: Telegram unreachable through the current node ${_cnt} checks in a row — switched to the next node."
+    elif [ -z "$_resp" ]; then
+        logger -t podkop-bot "[Transport] WARP Rescue: Telegram unreachable through the current node ${_cnt} checks in a row, but the Revolver controller does not answer (WARPSCOUT / BearGuard missing?)."
+    else
+        logger -t podkop-bot "[Transport] WARP Rescue: next node requested after ${_cnt} Telegram failures, controller answered: $(printf '%s' "$_resp" | tr -d '\n' | cut -c1-160)"
+    fi
+}
+
 _try_warp_rescue() {
     local _args="$1" _max_time="$2" _ct="$3" _proxy
     [ "$_t_policy" != "direct" ] || return 1
-    _proxy=$(_warp_rescue_proxy 1) || return 1
+    _proxy=$(_warp_rescue_flags 1) || return 1
     logger -t podkop-bot "[Transport] Trying WARP Rescue for ${_ROUTE_PROFILE:-unknown}"
-    if _try_curl "-x $_proxy" "$_max_time" "$_args" "$_ct"; then
+    if _try_curl "$_proxy" "$_max_time" "$_args" "$_ct"; then
+        _warp_rescue_note_tg ok
         ROUTE_KEY="warp_rescue"
         ROUTE_NAME="WARP Rescue"
         return 0
     fi
+    # Telegram answering with an error (409/429) still proves the node works.
+    if [ "${_TG_NO_DEMOTE:-0}" = "1" ]; then _warp_rescue_note_tg ok; else _warp_rescue_note_tg fail; fi
     logger -t podkop-bot "[Transport] WARP Rescue failed for ${_ROUTE_PROFILE:-unknown}"
     return 1
 }
@@ -2355,9 +2431,10 @@ _route_request() {
                     ;;
                 warp_rescue)
                     local _warp_proxy=""
-                    _warp_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
+                    _warp_proxy=$(_warp_rescue_flags 1 2>/dev/null || true)
                     [ -n "$_warp_proxy" ] && \
-                    _try_curl "-x $_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                    _try_curl "$_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                        _warp_rescue_note_tg ok
                         LAST_ROUTE="warp_rescue"; LAST_ROUTE_NAME="WARP Rescue"
                         _write_route_state "$_ROUTE_PROFILE" "warp_rescue" "$LAST_ROUTE_NAME"
                         eval "$_rvar=warp_rescue"; return 0
@@ -2637,9 +2714,10 @@ probe_socks_latency() {
 # proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:
 # Telegram answered, even though the application request itself was rejected.
 probe_telegram_proxy_latency() {
-    local _proxy="$1" _tmp _out _code _time
+    local _proxy="$1" _extra="$2" _tmp _out _code _time
     _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }
-    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \
+    # shellcheck disable=SC2086
+    _out=$(curl -s -k -x "$_proxy" $_extra --connect-timeout 4 --max-time 8 \
         -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)
     _code="${_out%%:*}"
     _time="${_out#*:}"
@@ -2730,8 +2808,9 @@ probe_all_socks_write() {
     if [ -n "$_warp_follow" ]; then
         _slots="$_slots warp_rescue"
         (
-            _lat=$(probe_telegram_proxy_latency "$_warp_follow")
+            _lat=$(probe_telegram_proxy_latency "$(printf '%s' "$_warp_follow" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)")
             printf 'warp_rescue=%s\n' "$_lat" > "$_probe_dir/warp_rescue"
+            case "$_lat" in *ms) _warp_rescue_note_tg ok ;; *) _warp_rescue_note_tg fail ;; esac
         ) & _pids="$_pids $!"
     fi
 
@@ -2833,9 +2912,9 @@ api_document() {
             }
         fi
         local _warp_doc=""
-        _warp_doc=$(_warp_rescue_proxy 1 2>/dev/null || true)
+        _warp_doc=$(_warp_rescue_flags 1 2>/dev/null || true)
         if [ -n "$_warp_doc" ]; then
-            res=$(_do_curl_doc "-x $_warp_doc")
+            res=$(_do_curl_doc "$_warp_doc")
             _is_telegram_response "$res" && {
                 unset -f _do_curl_doc
                 LAST_ROUTE_DOC="warp_rescue"; return 0
@@ -2891,9 +2970,9 @@ get_tg_latency() {
             ;;
         warp_rescue)
             local _warp_lat=""
-            _warp_lat=$(_warp_rescue_proxy 0 2>/dev/null || true)
+            _warp_lat=$(_warp_rescue_flags 0 2>/dev/null || true)
             [ -n "$_warp_lat" ] || { echo "Нет данных"; return; }
-            p_args="-x $_warp_lat"
+            p_args="$_warp_lat"
             ;;
         tier4)
             p_args="$if_flag"
@@ -2917,7 +2996,31 @@ get_tg_latency() {
 # SECTION 3: Authorization & Chat Context
 # ==============================================================================
 
-get_active_section() { cat "$ACTIVE_SECTION_FILE" 2>/dev/null || echo "main"; }
+# get_active_section — the section the UI works with. The file deliberately
+# survives bot restarts, which also let it outlive the section itself: a
+# section renamed (main -> akenai) or a switch of podkop variant left the bot
+# on a "main" that no longer exists — field case Podkop Plus with only
+# "akenai": the proxy screen looked for main-out and showed an empty list.
+# A stale value is replaced by the first enabled proxy section (else the
+# first section) and written back.
+get_active_section() {
+    local _s _all _c _en _first=""
+    _s=$(cat "$ACTIVE_SECTION_FILE" 2>/dev/null)
+    if [ -n "$_s" ] && [ "$(uci -q get "${PODKOP_UCI}.${_s}" 2>/dev/null)" = "section" ]; then
+        printf '%s\n' "$_s"; return 0
+    fi
+    _all=$(uci -q show "${PODKOP_UCI}" 2>/dev/null | sed -n "s/^${PODKOP_UCI}\.\([^.=]*\)=section\$/\1/p")
+    [ -n "$_all" ] || { printf '%s\n' "${_s:-main}"; return 0; }
+    for _c in $_all; do
+        [ -z "$_first" ] && _first="$_c"
+        _en=$(uci -q get "${PODKOP_UCI}.${_c}.enabled" 2>/dev/null); [ -z "$_en" ] && _en=1
+        [ "$_en" = "1" ] && section_is_proxy "$_c" 2>/dev/null && { _first="$_c"; break; }
+    done
+    printf '%s\n' "$_first" > "${ACTIVE_SECTION_FILE}.tmp.$$" 2>/dev/null && \
+        mv "${ACTIVE_SECTION_FILE}.tmp.$$" "$ACTIVE_SECTION_FILE" 2>/dev/null
+    logger -t podkop-bot "[Sections] active section '${_s:-<none>}' does not exist — switched to '${_first}'"
+    printf '%s\n' "$_first"
+}
 
 set_chat_context() {
     TARGET_CHAT_ID="$1"; TARGET_MESSAGE_ID="$2"
@@ -5228,6 +5331,137 @@ _flush_autoswitch_summary() {
 # ==============================================================================
 # WEEKLY REPORT
 # ==============================================================================
+# ==============================================================================
+# Report building blocks shared by the daily and weekly reports
+# ==============================================================================
+
+# _report_channels_block — one line per bot channel from the follower probe
+# (Telegram getMe latency) with its address. Needs _load_transport_ctx.
+_report_channels_block() {
+    local _tier_name _tier_val _tier_ms _tier_url _out=""
+    while IFS='=' read -r _tier_name _tier_val; do
+        [ -z "$_tier_name" ] && continue
+        _tier_ms=$(printf '%s' "$_tier_val" | awk '{print $1}')
+        _tier_url=""
+        case "$_tier_val" in *" url="*) _tier_url=$(html_escape "${_tier_val#* url=}") ;; esac
+        case "$_tier_ms" in
+            timeout|fail|"") _tier_ms="❌ ${_tier_ms:-?}" ;;
+            *ms) _tier_ms="${_tier_ms%ms} мс" ;;
+            *[0-9]) _tier_ms="${_tier_ms} мс" ;;
+        esac
+        case "$_tier_name" in
+            tier1)       _out="${_out}
+   Основной SOCKS <code>$(html_escape "${_t_ip}:${_t_port}")</code> [<code>$(html_escape "$_t_sec")</code>]: <code>${_tier_ms}</code>" ;;
+            tier2_*)     _out="${_out}
+   Резерв №${_tier_name#tier2_} <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>" ;;
+            tier3)       _out="${_out}
+   Прокси бота <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>" ;;
+            warp_rescue) _out="${_out}
+   WARP Rescue: <code>${_tier_ms}</code>" ;;
+        esac
+    done < "$SOCKS_PROBE_FILE" 2>/dev/null
+    printf '%s' "$_out"
+}
+
+# _report_sections_block PROXIES_JSON ACTIVE_SECTION — every section: mode,
+# local mixed-proxy address with Telegram latency through it (follower probe)
+# and the outbound it is on now. Needs _load_transport_ctx (_t_all_secs).
+_report_sections_block() {
+    local _proxies="$1" _sec="$2" _out="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
+    for _s in $_t_all_secs; do
+        _s_en=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_s_en" ] && _s_en=1
+        _s_type=$(get_section_type "$_s" 2>/dev/null || echo "?")
+        _s_mode=$(section_mode_label "$_s_type")
+        if [ "$_s_en" != "1" ]; then
+            _out="${_out}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")"
+            continue
+        fi
+        _s_line=$(printf '\n%s <code>%s</code> · %s' "$( [ "$_s" = "$_sec" ] && echo "▶" || echo "🟢")" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")
+        _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
+        _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
+        if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
+            _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
+            if [ "$_s" = "$_t_sec" ]; then
+                _s_lat=$(sed -n 's/^tier1=\([^ ]*\).*/\1/p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
+            else
+                _s_lat=$(grep "^tier2_[0-9]*=.* url=.*${_s_ip}:${_s_mp}\$" "$SOCKS_PROBE_FILE" 2>/dev/null | head -1 | sed 's/^[^=]*=\([^ ]*\).*/\1/')
+            fi
+            case "$_s_lat" in *ms) _s_lat="TG ${_s_lat%ms} мс" ;; "") _s_lat="" ;; *) _s_lat="TG ❌" ;; esac
+            _s_line="${_s_line}$(printf '\n   mixed <code>%s:%s</code>%s' "$(html_escape "$_s_ip")" "$_s_mp" "${_s_lat:+ · ${_s_lat}}")"
+        fi
+        case "$_s_type" in block|exclusion|bypass|direct|dns|zapret*|byedpi|vpn|vpn:*) _s_sel="" ;; *) _s_sel="x" ;; esac
+        if [ -n "$_proxies" ] && [ -n "$_s_sel" ]; then
+            _s_sel=$(_section_selector_tag "$_s" "$_proxies")
+            _s_now=$(printf '%s' "$_proxies" | jq -r --arg t "$_s_sel" '.proxies[$t] | if .type == "Selector" or .type == "URLTest" or .type == "Fallback" then (.now // empty) else empty end' 2>/dev/null)
+            if [ -n "$_s_now" ]; then
+                _s_leaf=$(_resolve_leaf "$_s_now" "$_proxies")
+                _s_delay=$(printf '%s' "$_proxies" | jq -r --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // empty' 2>/dev/null)
+                case "$_s_delay" in ''|0|*[!0-9]*) _s_delay="" ;; esac
+                _s_line="${_s_line}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")")" "${_s_delay:+ · ${_s_delay} мс}")"
+            fi
+        fi
+        _out="${_out}${_s_line}"
+    done
+    printf '%s' "$_out"
+}
+
+# _report_link_stats WINDOW_SECONDS — bot channel stats from ROUTE_LOG: changes
+# in the window, time on a reserve channel / Direct+emergency IPs / without
+# Telegram, and Telegram availability over the part of the window the journal
+# covers. The state at the window start is the last entry before it. When the
+# journal starts inside the window (bot restarted, router rebooted — it lives
+# in tmpfs), that is said explicitly instead of passing for a quiet period.
+_report_link_stats() {
+    local _win="$1" _now _st _ch=0 _res=0 _dir=0 _fl=0 _first=0 _cov=0 _out _pct
+    [ -s "$ROUTE_LOG" ] || return 0
+    _now=$(date +%s)
+    _st=$(awk -F'|' -v now="$_now" -v w="$_win" '
+        BEGIN { c = now - w; prev = ""; pts = c }
+        function add(k, a, b) { if (b <= a) return
+            if (k ~ /^(tier2_|tier3|warp_rescue)/) res += b - a
+            else if (k ~ /^tier[45]$/) dir += b - a
+            else if (k == "fail") fl += b - a }
+        NR == 1 { first = $1 }
+        $1 < c { prev = $2; next }
+        { if (prev == "") pts = $1; else add(prev, pts, $1)
+          if (prev != "") ch++
+          prev = $2; pts = $1 }
+        END { add(prev, pts, now); s = (first > c ? first : c)
+              printf "%d %d %d %d %d %d", ch, res, dir, fl, first, now - s }' "$ROUTE_LOG" 2>/dev/null)
+    read -r _ch _res _dir _fl _first _cov <<EOF
+$_st
+EOF
+    case "$_ch$_res$_dir$_fl$_first$_cov" in ''|*[!0-9]*) return 0 ;; esac
+    _out=$(printf '\nСмен канала бота: <code>%s</code>' "$_ch")
+    if [ "$_res" -gt 0 ] || [ "$_dir" -gt 0 ] || [ "$_fl" -gt 0 ]; then
+        [ "$_res" -gt 0 ] && _out="${_out}$(printf '\n   на резервном канале: <code>%s</code>' "$(_fmt_secs_ru "$_res")")"
+        [ "$_dir" -gt 0 ] && _out="${_out}$(printf '\n   напрямую / аварийные IP: <code>%s</code>' "$(_fmt_secs_ru "$_dir")")"
+        [ "$_fl" -gt 0 ]  && _out="${_out}$(printf '\n   без связи с Telegram: <code>%s</code>' "$(_fmt_secs_ru "$_fl")")"
+    else
+        _out="${_out} · всё время на основном канале"
+    fi
+    if [ "$_cov" -gt 0 ]; then
+        _pct=$(awk -v f="$_fl" -v c="$_cov" 'BEGIN{ printf "%.1f", 100 - f * 100 / c }')
+        _out="${_out}$(printf '\nСвязь бота с Telegram: <code>%s%%</code> времени' "$_pct")"
+    fi
+    [ "$_first" -gt $(( _now - _win )) ] && \
+        _out="${_out}$(printf '\n<i>Журнал смен ведётся с %s — раньше бот или роутер перезапускались.</i>' "$(awk -v t="$_first" 'BEGIN{print strftime("%d.%m %H:%M", t)}')")"
+    # trim to 8 days
+    awk -F'|' -v c=$(( _now - 691200 )) '$1>=c' "$ROUTE_LOG" > "${ROUTE_LOG}.tmp" 2>/dev/null \
+        && mv "${ROUTE_LOG}.tmp" "$ROUTE_LOG" 2>/dev/null
+    printf '%s' "$_out"
+}
+
+# _report_unauth_line WINDOW_SECONDS — unauthorized attempts in the window.
+_report_unauth_line() {
+    local _n _last
+    [ -s "$UNAUTH_LOG" ] || return 0
+    _n=$(awk -F'|' -v c=$(( $(date +%s) - $1 )) '$1>=c{n++} END{print n+0}' "$UNAUTH_LOG" 2>/dev/null)
+    case "$_n" in ''|*[!0-9]*|0) return 0 ;; esac
+    _last=$(tail -n 1 "$UNAUTH_LOG" 2>/dev/null | awk -F'|' '{ printf "%s, %s", strftime("%d.%m %H:%M", $1), $2 }')
+    printf '\n⚠ Чужие попытки доступа: <code>%s</code> (последняя %s)' "$_n" "$(html_escape "$_last")"
+}
+
 send_weekly_report() {
     # mode: scheduled (default) advances weekly baselines; manual is a read-only snapshot.
     local _wr_mode="${1:-scheduled}" _wr_mid="${2:-}"
@@ -5299,6 +5533,10 @@ send_weekly_report() {
     _p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
     [ -z "$_p_ver" ] && _p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | grep "^${PODKOP_PKG}" | head -1 | \
         awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//;s/-r[0-9]*$//" | cut -d'-' -f1)
+    if [ -z "$_p_ver" ] && [ -f "$PODKOP_BIN" ]; then
+        _p_ver=$(grep -m1 -oE 'VERSION="[^"]*"' "$PODKOP_BIN" 2>/dev/null | cut -d'"' -f2 | sed 's/^v//')
+        [ -z "$_p_ver" ] && _p_ver=$(grep -m1 "^VERSION=" "$PODKOP_BIN" 2>/dev/null | cut -d= -f2 | tr -d "'\042" | sed 's/^v//')
+    fi
     _p_ver=$(printf '%s' "${_p_ver:-?}" | sed 's/^v//')
     _sb_ver=$(get_singbox_version_display 2>/dev/null | sed 's/-extended.*$/-ext/' || echo "?")
 
@@ -5339,14 +5577,18 @@ send_weekly_report() {
         awk -v c=$(( $(date +%s) - 691200 )) '$1>=c' "$SB_RELOAD_LOG" > "${SB_RELOAD_LOG}.tmp" 2>/dev/null \
             && mv "${SB_RELOAD_LOG}.tmp" "$SB_RELOAD_LOG" 2>/dev/null
     fi
-    local _sw_week_count _sw_last_line _sw_last_ago _sw_last_method
+    local _sw_week_count _sw_week_man=0 _sw_last_line _sw_ago _sw_method
     # Переключения маршрута за 7 дней из switch_log
     _sw_week_count=0
     if [ -f "$SWITCH_LOG" ]; then
         _sw_cutoff=$(( $(date +%s) - 604800 ))
         _sw_week_count=$(awk -F'|' -v c="$_sw_cutoff" '$1>=c{n++} END{print n+0}' "$SWITCH_LOG")
+        _sw_week_man=$(awk -F'|' -v c="$_sw_cutoff" '$1>=c && $2=="manual"{n++} END{print n+0}' "$SWITCH_LOG")
         _sw_last_line=$(tail -1 "$SWITCH_LOG" 2>/dev/null)
     fi
+    local _sw_week_split=""
+    [ "${_sw_week_count:-0}" -gt 0 ] 2>/dev/null && \
+        _sw_week_split=" (✋ ${_sw_week_man:-0} · 🤖 URLTest $(( _sw_week_count - ${_sw_week_man:-0} )))"
     local _sw_disp="нет данных"
     if [ -n "$_sw_last_line" ]; then
         local _sw_ts _sw_elapsed
@@ -5385,9 +5627,6 @@ send_weekly_report() {
         "$_rw_min" "$([ "${_rw_min:-999}" -lt 30 ] 2>/dev/null && echo ' ⚠️' || true)")
     local _ram_alert_disp=""
     [ "${_rw_cnt:-0}" -gt 0 ] 2>/dev/null && _ram_alert_disp=$(printf '\nПредупреждений о памяти: <code>%s</code>' "$_rw_cnt")
-    # Only the scheduled report closes the accounting period. A manual report
-    # is a snapshot and must not erase RAM minima/alerts collected for Sunday.
-    [ "$_wr_mode" = "scheduled" ] && rm -f "$RAM_WEEK_FILE" 2>/dev/null
 
     # ── Туннель ───────────────────────────────────────────────────────────────
     local _proxies _active_ob _active_ob_disp _active_delay _active_cc
@@ -5432,15 +5671,12 @@ send_weekly_report() {
     # рестарты sing-box — поэтому reset-detection (как было в half-fix) здесь
     # больше не нужен: banked_dl/ul уже корректны независимо от того, сколько
     # раз sing-box перезапускался за неделю.
-    local _conn_data _total_dl _total_ul _curr_conn _dl_fmt _ul_fmt
+    local _conn_data _curr_conn
     _conn_data=$(clash_request "/connections" 2>/dev/null)
     _curr_conn=$(printf '%s' "$_conn_data" | jq -r '.connections | length // 0' 2>/dev/null || echo 0)
-    _total_dl=$(printf '%s' "$_conn_data" | jq -r '.downloadTotal // 0' 2>/dev/null || echo 0)
-    _total_ul=$(printf '%s' "$_conn_data" | jq -r '.uploadTotal // 0' 2>/dev/null || echo 0)
-    case "$_total_dl" in ''|*[!0-9]*) _total_dl=0 ;; esac
-    case "$_total_ul" in ''|*[!0-9]*) _total_ul=0 ;; esac
+    case "$_curr_conn" in ''|*[!0-9]*) _curr_conn=0 ;; esac
 
-    local _week_dl _week_ul _dl_week_fmt _ul_week_fmt _avg_day_fmt _traffic_note=""
+    local _week_dl _week_ul _dl_week_fmt _ul_week_fmt _avg_day_fmt _avg_ul_fmt="—" _days _avg_dl _traffic_note=""
     local _base_ts _base_banked_dl _base_banked_ul _cur_banked_dl _cur_banked_ul
     _base_ts=$(_traffic_uci_num weekly_base_ts 0)
     _base_banked_dl=$(_traffic_uci_num weekly_base_dl 0)
@@ -5474,6 +5710,8 @@ send_weekly_report() {
         _avg_dl=$(( _week_dl / _days ))
         _avg_day_fmt=$(awk "BEGIN{b=${_avg_dl};if(b>=1073741824)printf \"%.1f ГБ\",b/1073741824;
             else if(b>=1048576)printf \"%.1f МБ\",b/1048576;else printf \"%.0f КБ\",b/1024}")
+        _avg_ul_fmt=$(awk "BEGIN{b=$(( _week_ul / _days ));if(b>=1073741824)printf \"%.1f ГБ\",b/1073741824;
+            else if(b>=1048576)printf \"%.1f МБ\",b/1048576;else printf \"%.0f КБ\",b/1024}")
         # Больше не "частичные данные" — accumulator уже учёл рестарты,
         # цифры полные. Просто информационная пометка, если рестарты были.
         [ "$_sb_restarts" -gt 0 ] 2>/dev/null && \
@@ -5484,10 +5722,6 @@ send_weekly_report() {
         _avg_day_fmt="—"
         _traffic_note=" NODATA"
     fi
-    _dl_fmt=$(awk "BEGIN{b=${_total_dl};if(b>=1073741824)printf \"%.1f ГБ\",b/1073741824;
-        else if(b>=1048576)printf \"%.1f МБ\",b/1048576;else printf \"%.0f КБ\",b/1024}")
-    _ul_fmt=$(awk "BEGIN{b=${_total_ul};if(b>=1073741824)printf \"%.1f ГБ\",b/1073741824;
-        else if(b>=1048576)printf \"%.1f МБ\",b/1048576;else printf \"%.0f КБ\",b/1024}")
 
     # ── Подписка Plus ─────────────────────────────────────────────────────────
     local _sub_block=""
@@ -5570,12 +5804,16 @@ send_weekly_report() {
     local _reload_line_w=""
     [ "$_sb_reloads" -gt 0 ] 2>/dev/null && \
         _reload_line_w=$(printf '\nПерезагрузок на месте (SIGHUP): <code>%s</code> <i>— процесс не перезапускался</i>' "$_sb_reloads")
-    _text="${_text}$(printf '\n\n🩺 <b>Стабильность</b>\nВремя работы бота: <code>%s</code>\nВремя работы туннеля: <code>%s</code>\nПерезапусков sing-box за неделю: <code>%s</code>%s\nПереключений прокси за неделю: <code>%s</code>\nПоследнее переключение: %s\nTelegram: напрямую %s · через туннель %s' \
-        "$_bot_uptime" "$_sb_uptime" "$_sb_restarts" "$_reload_line_w" "$_sw_week_count" \
-        "$_sw_disp" "$_tg_direct_icon" "$_tg_tunnel_icon")"
+    _text="${_text}$(printf '\n\n🩺 <b>Стабильность</b>\nВремя работы бота: <code>%s</code>\nВремя работы туннеля: <code>%s</code>\nПерезапусков sing-box за неделю: <code>%s</code>%s\nПереключений прокси за неделю: <code>%s</code>%s\nПоследнее переключение: %s%s%s\nTelegram сейчас: напрямую %s · через туннель %s' \
+        "$_bot_uptime" "$_sb_uptime" "$_sb_restarts" "$_reload_line_w" "$_sw_week_count" "$_sw_week_split" \
+        "$_sw_disp" "$(_report_link_stats 604800)" "$(_report_unauth_line 604800)" "$_tg_direct_icon" "$_tg_tunnel_icon")"
 
-    _text="${_text}$(printf '\n\n💾 <b>Ресурсы</b>\nОЗУ: <code>%s / %s МБ (%s%%)</code>%s%s' \
-        "$_ram_used" "$_ram_total_mb" "$_ram_pct" \
+    local _sys_uptime _sys_load
+    _sys_uptime=$(awk '{d=int($1/86400);h=int(($1%86400)/3600);m=int(($1%3600)/60);
+        if(d>0) printf "%d д %d ч",d,h; else printf "%d ч %d мин",h,m}' /proc/uptime 2>/dev/null)
+    _sys_load=$(awk '{printf "%s %s %s",$1,$2,$3}' /proc/loadavg 2>/dev/null)
+    _text="${_text}$(printf '\n\n💾 <b>Ресурсы</b>\nВремя работы роутера: <code>%s</code> · Нагрузка: <code>%s</code>\nОЗУ: <code>%s / %s МБ (%s%%)</code>%s%s' \
+        "${_sys_uptime:-?}" "${_sys_load:-?}" "$_ram_used" "$_ram_total_mb" "$_ram_pct" \
         "${_ram_min_disp}" "${_ram_alert_disp}")"
 
     _text="${_text}$(printf '\n\n🔀 <b>Туннель</b>\nРежим: <code>%s</code> [<code>%s</code>]%s\nАктивный прокси: %s' \
@@ -5585,14 +5823,19 @@ send_weekly_report() {
         _text="${_text}$(printf '\n\n📊 <b>Трафик</b>\n<i>Сбор недельной статистики начат заново. Данные появятся в следующем отчёте.</i>\nСоединений: <code>%s</code>' \
             "$_curr_conn")"
     else
-        _text="${_text}$(printf '\n\n📊 <b>Трафик</b>%s\nНеделя: ↓ <code>%s</code> · ↑ <code>%s</code>\nВ среднем за день: ↓ <code>%s</code>\nСоединений: <code>%s</code>' \
-            "$_traffic_note" "$_dl_week_fmt" "$_ul_week_fmt" "$_avg_day_fmt" "$_curr_conn")"
+        _text="${_text}$(printf '\n\n📊 <b>Трафик</b>%s\nНеделя: ↓ <code>%s</code> · ↑ <code>%s</code>\nВ среднем за день: ↓ <code>%s</code> · ↑ <code>%s</code>\nСоединений сейчас: <code>%s</code>' \
+            "$_traffic_note" "$_dl_week_fmt" "$_ul_week_fmt" "$_avg_day_fmt" "$_avg_ul_fmt" "$_curr_conn")"
     fi
+
+    local _w_secs; _load_transport_ctx; _w_secs=$(_report_sections_block "$_proxies" "$_sec")
+    [ -n "$_w_secs" ] && _text="${_text}$(printf '\n\n🧩 <b>Секции</b>')${_w_secs}"
 
     [ -n "$_sub_block" ] && _text="${_text}${_sub_block}"
 
-    _text="${_text}$(printf '\n\n⚙️ <b>Настройки бота</b>\nПодключение: <code>%s</code>\nИнтервал проверки: <code>%s с</code>\nРежим тишины: <code>%s</code>\nРассылка уведомлений: <code>%s</code> · Контроль памяти: <code>%s</code>\nЕжедневный отчёт: <code>%s</code>' \
-        "$(html_escape "$_cur_tier")" "$_hi" "$_qh_disp" \
+    _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' "$(html_escape "$_cur_tier")")$(_report_channels_block)"
+
+    _text="${_text}$(printf '\n\n⚙️ <b>Настройки бота</b>\nИнтервал проверки: <code>%s с</code>\nУведомления о связи: <code>%s</code> · Режим тишины: <code>%s</code>\nРассылка уведомлений: <code>%s</code> · Контроль памяти: <code>%s</code>\nЕжедневный отчёт: <code>%s</code>' \
+        "$_hi" "$(_link_alert_mode_label "$(_link_alert_mode)")" "$_qh_disp" \
         "$([ "$_bc" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_ram_al" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_dr_en" = "1" ] && echo "вкл." || echo "выкл.")")"
@@ -5614,6 +5857,9 @@ send_weekly_report() {
 
     # Only a delivered scheduled report advances the weekly window. On the
     # weekly day it also closes the skipped Daily window in the same UCI commit.
+    # Only a delivered scheduled report closes the RAM accounting period: a
+    # manual snapshot, or a send that failed, must not erase the week's minima.
+    [ "$_wr_mode" = "scheduled" ] && [ "$_wr_delivered" -eq 1 ] && rm -f "$RAM_WEEK_FILE" 2>/dev/null
     if [ "$_wr_mode" = "scheduled" ] && [ "$_wr_delivered" -eq 1 ] && [ -s "$TRAFFIC_ACCUM_FILE" ]; then
         _traffic_persist_after_report weekly "$_cur_banked_dl" "$_cur_banked_ul" || \
             logger -t podkop-bot "[Traffic] Failed to persist weekly UCI baseline/checkpoint."
@@ -5860,92 +6106,9 @@ send_daily_report() {
     # Mask credentials in route string (e.g. socks5h://user:pass@host)
     _cur_tier=$(printf '%s' "$_cur_tier" | sed 's#://\([^:/@]*\):[^@]*@#://\1:**@#g')
     _load_transport_ctx
-    # Every channel from the follower probe (Telegram getMe latency), now with
-    # its address: "Резервный SOCKS №2: 120 мс" alone did not say which section
-    # or proxy that was.
-    local _tier_name _tier_val _tier_ms _tier_url
-    while IFS='=' read -r _tier_name _tier_val; do
-        [ -z "$_tier_name" ] && continue
-        _tier_ms=$(printf '%s' "$_tier_val" | awk '{print $1}')
-        _tier_url=""
-        case "$_tier_val" in *" url="*) _tier_url=$(html_escape "${_tier_val#* url=}") ;; esac
-        case "$_tier_ms" in
-            timeout|fail|"") _tier_ms="❌ ${_tier_ms:-?}" ;;
-            *ms) _tier_ms="${_tier_ms%ms} мс" ;;
-            *[0-9]) _tier_ms="${_tier_ms} мс" ;;
-        esac
-        case "$_tier_name" in
-            tier1)       _tier_chain="${_tier_chain}   Основной SOCKS <code>$(html_escape "${_t_ip}:${_t_port}")</code> [<code>$(html_escape "$_t_sec")</code>]: <code>${_tier_ms}</code>\n" ;;
-            tier2_*)     _tier_chain="${_tier_chain}   Резерв №${_tier_name#tier2_} <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>\n" ;;
-            tier3)       _tier_chain="${_tier_chain}   Прокси бота <code>${_tier_url:-?}</code>: <code>${_tier_ms}</code>\n" ;;
-            warp_rescue) _tier_chain="${_tier_chain}   WARP Rescue: <code>${_tier_ms}</code>\n" ;;
-        esac
-    done < "$SOCKS_PROBE_FILE" 2>/dev/null
-
-    # ── Секции ────────────────────────────────────────────────────────────────
-    # All sections, not only the active one: mode, local mixed-proxy address
-    # (the address other devices and the bot use), Telegram latency through it
-    # from the follower probe, and the outbound each section is on right now.
-    local _secs_block="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
-    for _s in $_t_all_secs; do
-        _s_en=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_s_en" ] && _s_en=1
-        _s_type=$(get_section_type "$_s" 2>/dev/null || echo "?")
-        _s_mode=$(section_mode_label "$_s_type")
-        if [ "$_s_en" != "1" ]; then
-            _secs_block="${_secs_block}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")"
-            continue
-        fi
-        _s_line=$(printf '\n%s <code>%s</code> · %s' "$( [ "$_s" = "$_sec" ] && echo "▶" || echo "🟢")" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")
-        _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
-        _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
-        if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
-            _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
-            if [ "$_s" = "$_t_sec" ]; then
-                _s_lat=$(sed -n 's/^tier1=\([^ ]*\).*/\1/p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
-            else
-                _s_lat=$(grep "^tier2_[0-9]*=.* url=.*${_s_ip}:${_s_mp}\$" "$SOCKS_PROBE_FILE" 2>/dev/null | head -1 | sed 's/^[^=]*=\([^ ]*\).*/\1/')
-            fi
-            case "$_s_lat" in *ms) _s_lat="TG ${_s_lat%ms} мс" ;; "") _s_lat="" ;; *) _s_lat="TG ❌" ;; esac
-            _s_line="${_s_line}$(printf '\n   mixed <code>%s:%s</code>%s' "$(html_escape "$_s_ip")" "$_s_mp" "${_s_lat:+ · ${_s_lat}}")"
-        fi
-        case "$_s_type" in block|exclusion|bypass|direct|dns|zapret*|byedpi|vpn|vpn:*) _s_sel="" ;; *) _s_sel="x" ;; esac
-        if [ -n "$_proxies" ] && [ -n "$_s_sel" ]; then
-            _s_sel=$(_section_selector_tag "$_s" "$_proxies")
-            _s_now=$(printf '%s' "$_proxies" | jq -r --arg t "$_s_sel" '.proxies[$t] | if .type == "Selector" or .type == "URLTest" or .type == "Fallback" then (.now // empty) else empty end' 2>/dev/null)
-            if [ -n "$_s_now" ]; then
-                _s_leaf=$(_resolve_leaf "$_s_now" "$_proxies")
-                _s_delay=$(printf '%s' "$_proxies" | jq -r --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // empty' 2>/dev/null)
-                case "$_s_delay" in ''|0|*[!0-9]*) _s_delay="" ;; esac
-                _s_line="${_s_line}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")")" "${_s_delay:+ · ${_s_delay} мс}")"
-            fi
-        fi
-        _secs_block="${_secs_block}${_s_line}"
-    done
-
-    # ── За 24 часа: канал бота ────────────────────────────────────────────────
-    # From ROUTE_LOG: route changes in the window, and how long the bot sat off
-    # its primary channel — on a reserve proxy, on Direct/emergency IPs, or with
-    # no connection at all. The state at the window start is the last entry
-    # before it, so a reserve stint that began yesterday is counted correctly.
-    local _rt_stats _rt_changes=0 _rt_reserve=0 _rt_direct=0 _rt_fail=0
-    if [ -s "$ROUTE_LOG" ]; then
-        _rt_stats=$(awk -F'|' -v now="$(date +%s)" '
-            BEGIN { c = now - 86400; prev = ""; pts = c }
-            function add(k, a, b) { if (b <= a) return
-                if (k ~ /^(tier2_|tier3|warp_rescue)/) res += b - a
-                else if (k ~ /^tier[45]$/) dir += b - a
-                else if (k == "fail") fl += b - a }
-            $1 < c { prev = $2; next }
-            { add(prev, pts, $1); if (prev != "" || NR > 1) ch++; prev = $2; pts = $1 }
-            END { add(prev, pts, now); printf "%d %d %d %d", ch, res, dir, fl }' "$ROUTE_LOG" 2>/dev/null)
-        read -r _rt_changes _rt_reserve _rt_direct _rt_fail <<EOF
-$_rt_stats
-EOF
-        case "$_rt_changes$_rt_reserve$_rt_direct$_rt_fail" in ''|*[!0-9]*) _rt_changes=0; _rt_reserve=0; _rt_direct=0; _rt_fail=0 ;; esac
-        # trim to 8 days
-        awk -F'|' -v c=$(( $(date +%s) - 691200 )) '$1>=c' "$ROUTE_LOG" > "${ROUTE_LOG}.tmp" 2>/dev/null \
-            && mv "${ROUTE_LOG}.tmp" "$ROUTE_LOG" 2>/dev/null
-    fi
+    local _tier_chain _secs_block
+    _tier_chain=$(_report_channels_block)
+    _secs_block=$(_report_sections_block "$_proxies" "$_sec")
 
     # ── Подписка Plus ─────────────────────────────────────────────────────────
     local _sub_block=""
@@ -6027,26 +6190,12 @@ EOF
     _day_block=$(printf '\n\n📈 <b>За 24 часа</b>\nПереключений прокси: <code>%s</code>' "${_sw_day_count:-0}")
     [ "${_sw_day_count:-0}" -gt 0 ] 2>/dev/null && \
         _day_block="${_day_block}$(printf ' (✋ %s · 🤖 URLTest %s)' "$_sw_day_man" "$_sw_day_auto")"
-    _day_block="${_day_block}$(printf '\nСмен канала бота: <code>%s</code>' "$_rt_changes")"
-    if [ "$_rt_reserve" -gt 0 ] || [ "$_rt_direct" -gt 0 ] || [ "$_rt_fail" -gt 0 ]; then
-        [ "$_rt_reserve" -gt 0 ] && _day_block="${_day_block}$(printf '\n   на резервном канале: <code>%s</code>' "$(_fmt_secs_ru "$_rt_reserve")")"
-        [ "$_rt_direct" -gt 0 ]  && _day_block="${_day_block}$(printf '\n   напрямую / аварийные IP: <code>%s</code>' "$(_fmt_secs_ru "$_rt_direct")")"
-        [ "$_rt_fail" -gt 0 ]    && _day_block="${_day_block}$(printf '\n   без связи с Telegram: <code>%s</code>' "$(_fmt_secs_ru "$_rt_fail")")"
-    elif [ -s "$ROUTE_LOG" ]; then
-        _day_block="${_day_block}$(printf ' · всё время на основном канале')"
-    fi
-    local _ua_day=0 _ua_last=""
-    if [ -s "$UNAUTH_LOG" ]; then
-        _ua_day=$(awk -F'|' -v c=$(( $(date +%s) - 86400 )) '$1>=c{n++} END{print n+0}' "$UNAUTH_LOG" 2>/dev/null)
-        case "$_ua_day" in ''|*[!0-9]*) _ua_day=0 ;; esac
-        [ "$_ua_day" -gt 0 ] && _ua_last=$(tail -n 1 "$UNAUTH_LOG" 2>/dev/null | awk -F'|' '{ printf "%s, %s", strftime("%H:%M", $1), $2 }')
-    fi
-    [ "$_ua_day" -gt 0 ] && _day_block="${_day_block}$(printf '\n⚠ Чужие попытки доступа: <code>%s</code> (последняя %s)' "$_ua_day" "$(html_escape "$_ua_last")")"
+    _day_block="${_day_block}$(_report_link_stats 86400)$(_report_unauth_line 86400)"
     _text="${_text}${_day_block}"
 
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' \
         "$(html_escape "$_cur_tier")")"
-    [ -n "$_tier_chain" ] && _text="${_text}$(printf '\n%b' "$_tier_chain")"
+    [ -n "$_tier_chain" ] && _text="${_text}${_tier_chain}"
 
     [ -n "$_sub_block" ] && _text="${_text}${_sub_block}"
 
@@ -6209,20 +6358,23 @@ start_health_daemon() {
                 probe_all_socks_write &
                 _last_probe_pid=$!
 
+                # ── Weekly RAM minimum: min_free|alert_count|last_check_ts ──
+                # Tracked whatever the alert settings are — the weekly report
+                # showed no minimum at all when RAM alerts were switched off.
+                local _ram_free_kb _ram_free_mb _now_ts
+                _ram_free_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 999999)
+                _ram_free_mb=$(( _ram_free_kb / 1024 ))
+                _now_ts=$(date +%s)
+                _rw_min=$(awk -F'|' '{print $1}' "$RAM_WEEK_FILE" 2>/dev/null)
+                _rw_cnt=$(awk -F'|' '{print $2}' "$RAM_WEEK_FILE" 2>/dev/null || echo 0)
+                if [ -z "$_rw_min" ] || [ "$_ram_free_mb" -lt "$_rw_min" ] 2>/dev/null; then
+                    _rw_min=$_ram_free_mb
+                fi
+                printf '%s|%s|%s\n' "$_rw_min" "${_rw_cnt:-0}" "$_now_ts" > "$RAM_WEEK_FILE" 2>/dev/null || true
+
                 # ── RAM low-memory alert (every 5 cycles = PROBE_EVERY×interval) ──
                 if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ] && \
                    [ "$(uci -q get podkop_bot.settings.ram_alert || echo 1)" = "1" ]; then
-                    local _ram_free_kb _ram_free_mb _now_ts
-                    _ram_free_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 999999)
-                    _ram_free_mb=$(( _ram_free_kb / 1024 ))
-                    _now_ts=$(date +%s)
-                    # Update weekly RAM tracking: min_free|alert_count|last_check_ts
-                    _rw_min=$(awk -F'|' '{print $1}' "$RAM_WEEK_FILE" 2>/dev/null)
-                    _rw_cnt=$(awk -F'|' '{print $2}' "$RAM_WEEK_FILE" 2>/dev/null || echo 0)
-                    if [ -z "$_rw_min" ] || [ "$_ram_free_mb" -lt "$_rw_min" ] 2>/dev/null; then
-                        _rw_min=$_ram_free_mb
-                    fi
-                    printf '%s|%s|%s\n' "$_rw_min" "${_rw_cnt:-0}" "$_now_ts" > "$RAM_WEEK_FILE" 2>/dev/null || true
                     if [ "$_ram_free_mb" -lt 30 ] && [ "$_ram_alert_active" = "0" ]; then
                         # Enter low-RAM state — send alert
                         _ram_alert_active=1
@@ -6822,11 +6974,25 @@ start_health_daemon() {
                             _lk_txt=$(printf '<b>[%s]</b> %s <b>Бот не находит резервный путь</b>\n\n%s проверок подряд (≈ %s) все прокси недоступны.\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Если провайдер блокирует Telegram, бот может стать недоступен.</i>' \
                                 "$_hn" "$E_ERR" "$_lk_nofb_streak" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn")
                         elif [ "$_lam" = "smart" ] && [ "$_lk_dur" -ge "$_LK_SMART_DELAY" ]; then
-                            local _lk_t1_s="отвечает" _lk_tg_s="доступен"
-                            [ "$_lk_t1_down" = "1" ] && _lk_t1_s="не отвечает"
-                            [ "$_tgd" != "ok" ] && [ "$_tgt" != "ok" ] && _lk_tg_s="недоступен"
-                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Проблема со связью бота</b>\n\nДлится уже %s.\n<b>Основной SOCKS:</b> %s\n<b>Telegram:</b> %s\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Короткие сбои не присылаются по отдельности — они попадают в сводку.</i>' \
-                                "$_hn" "$E_WARN" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_t1_s" "$_lk_tg_s" "$_lk_rn")
+                            # Lead with what the BOT sees (its POLL route). The old
+                            # card led with the watchdog's one-shot probes — "SOCKS
+                            # answers, Telegram reachable" next to "no connection" —
+                            # which read as a false alarm when the tunnel was flaky:
+                            # single probes got through, the bot's connection did not.
+                            local _lk_state _lk_t1_s="проходит" _lk_d_s="проходит" _lk_hint=""
+                            case "${_lk_rk:-unknown}" in
+                                fail)  _lk_state="Бот не может подключиться к Telegram ни по одному каналу." ;;
+                                tier4) _lk_state="Бот работает напрямую — прокси-каналы до Telegram не доходят." ;;
+                                tier5) _lk_state="Бот работает через аварийные IP Telegram — остальные каналы не доходят." ;;
+                                tier1) _lk_state="Бот на основном канале, но основной SOCKS не доходит до Telegram в фоновых проверках." ;;
+                                *)     _lk_state="Бот работает через резервный канал — основной SOCKS не доходит до Telegram." ;;
+                            esac
+                            [ "$_lk_t1_down" = "1" ] && _lk_t1_s="не проходит"
+                            [ "$_tgd" != "ok" ] && _lk_d_s="не проходит"
+                            [ "${_lk_rk:-}" = "fail" ] && [ "$_lk_t1_down" != "1" ] && \
+                                _lk_hint=$(printf '\n<i>Отдельные запросы через туннель проходят, а подключение бота обрывается — сервер туннеля работает с перебоями.</i>')
+                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Проблема со связью бота</b>\n\n%s\nДлится уже %s.\n<b>Способ подключения:</b> <code>%s</code>\n\n<b>Фоновая проверка Telegram:</b> через основной SOCKS — %s · напрямую — %s%s\n\n<i>Короткие сбои не присылаются по отдельности — они попадают в сводку.</i>' \
+                                "$_hn" "$E_WARN" "$_lk_state" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn" "$_lk_t1_s" "$_lk_d_s" "$_lk_hint")
                         fi
                         if [ -n "$_lk_txt" ]; then
                             _lk_ep_alerted=1
@@ -6835,6 +7001,11 @@ start_health_daemon() {
                             send_health_alert "$_lk_pl"
                         fi
                     fi
+                elif [ "$_lk_ep_start" -ne 0 ] && { [ -z "$_lk_rk" ] || [ "$_lk_rk" = "unknown" ]; }; then
+                    # POLL route is being re-checked after a watchdog reset: not a
+                    # recovery yet. Closing the episode here produced "restored"
+                    # with route "Перепроверка…".
+                    :
                 else
                     if [ "$_lk_ep_start" -ne 0 ]; then
                         _lk_dur=$(( _lk_now - _lk_ep_start ))
@@ -14670,6 +14841,8 @@ _handle_fallback_socks() {
                 [ "$_wr_loc" = "$_wr_meta" ] && _wr_loc=""
                 if _warp_rescue_pid_alive; then
                     _wr_state="ON-AIR${_wr_lat:+ · $_wr_lat}"
+                elif ! _warp_rescue_ctl_present; then
+                    _wr_state="Revolver не установлен"
                 else
                     _wr_state="ожидает Revolver"
                 fi
@@ -14678,6 +14851,7 @@ _handle_fallback_socks() {
 \
 <code>warp_rescue</code>%s WARP Rescue <code>socks5h://127.0.0.1:%s</code> — <i>%s</i>' \
                     "$list_text" "$_row_lbl" "$_wr_port" "$_wr_state")
+                rows="${rows}[{\"text\":\"🌀 WARP Rescue · узел и магазин\",\"callback_data\":\"np_warp\"}],"
                 if [ -n "$_wr_ep" ]; then
                     local _wr_desc="Сервер выхода: $_wr_ep"
                     [ -n "$_wr_loc" ] && _wr_desc="${_wr_desc} · $_wr_loc"
@@ -14700,6 +14874,110 @@ _handle_fallback_socks() {
             text=$(printf '%s' "$text" | sed 's/\\$//') # r44-proxy-ui-sync
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} SOCKS\",\"callback_data\":\"cmd_fb_socks_add\"}${_add_t3_btn}],[{\"text\":\"${E_TEST} Проверить все\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"net_proxies_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        # WARP Rescue card: the Revolver controller's own actions, reachable from
+        # Telegram — the same ubus calls the BearGuard LuCI page makes:
+        # "Следующий WARP" = next, "Перезарядить" = reload (Discovery + Telegram
+        # qualification + magazine + FIRE), "Запустить" = trigger. next/reload are
+        # asynchronous: the controller answers {"ok":true} at once and works in
+        # the background (status.busy), so the card reports controller state
+        # rather than probing a node that is still being switched.
+        "np_warp"|"np_warp_next"|"np_warp_start"|"np_warp_reload_ask"|"np_warp_reload")
+            rm -f "$STATE_FILE"
+            local _w_en _w_resp _w_reason _w_note="" _w_st _w_run _w_busy _w_state _w_ep _w_idx _w_tot _w_meta _w_loc _w_node _w_tg _w_state_disp
+            _w_en=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+            if [ "$_w_en" != "1" ]; then
+                send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>\n\nWARP Rescue выключен. Включается в веб-интерфейсе Podkop BearGuard.')" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+                return
+            fi
+            if ! _warp_rescue_ctl_present; then
+                send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>\n\n%s Revolver (WARPSCOUT) на роутере не найден, хотя WARP Rescue включён в настройках.\n\nWARP Rescue работает только с веб-интерфейсом <b>Podkop BearGuard</b> и установленным в нём WARPSCOUT: «Установка / удаление WARPSCOUT» на странице WARP Rescue. Пока его нет, бот WARP не использует.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+                return
+            fi
+            _warp_err_ru() {
+                case "$1" in
+                    warpscout_disabled)    printf 'WARP Rescue выключен' ;;
+                    not_ready)             printf 'WARPSCOUT или учётная запись WARP ещё не готовы' ;;
+                    not_installed)         printf 'WARPSCOUT не установлен' ;;
+                    controller_busy)       printf 'револьвер уже выполняет другую команду' ;;
+                    qualification_running) printf 'сейчас выполняется проверка Telegram API' ;;
+                    discovery_running)     printf 'сейчас выполняется поиск WARP-узлов' ;;
+                    runtime_handoff_failed) printf 'не удалось освободить тестовый WARP SOCKS' ;;
+                    account_missing)       printf 'нет учётной записи WARP' ;;
+                    already_running)       printf 'операция уже выполняется' ;;
+                    *)                     printf '%s' "${1:-нет ответа}" ;;
+                esac
+            }
+            case "$cmd" in
+                np_warp_reload_ask)
+                    send_or_edit "$mid" "$(printf '%s <b>Перезарядить магазин WARP?</b>\n\nRevolver заново найдёт WARP-узлы, проверит через них Telegram API, соберёт магазин и запустит лучший узел. Это занимает несколько минут; на это время WARP Rescue недоступен.\n\n<i>Если нужно просто сменить узел — хватит «Следующий WARP».</i>' "$E_WARN")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Перезарядить\",\"callback_data\":\"np_warp_reload\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"np_warp\"}]]}"
+                    return ;;
+                np_warp_reload|np_warp_next|np_warp_start)
+                    case "$cmd" in
+                        np_warp_reload) _w_resp=$(ubus call podkop_bot_warpscout_rescue reload '{}' 2>/dev/null) ;;
+                        np_warp_next)   _w_resp=$(ubus call podkop_bot_warpscout_rescue next '{}' 2>/dev/null) ;;
+                        np_warp_start)  _w_resp=$(ubus call podkop_bot_warpscout_rescue trigger '{}' 2>/dev/null) ;;
+                    esac
+                    logger -t podkop-bot "Audit: ${audit_str:-admin} -> WARP Rescue ${cmd#np_warp_}"
+                    if printf '%s' "$_w_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+                        rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+                        [ "$cmd" = "np_warp_next" ] && printf '%s\n' "$(date +%s)" > "$_WARP_NEXT_TS_FILE"
+                        case "$cmd" in
+                            np_warp_reload) _w_note="🔄 Перезарядка запущена. Через несколько минут нажмите «Обновить»." ;;
+                            np_warp_next)   _w_note="⏭ Переключаюсь на следующий узел — Revolver проверит через него Telegram перед запуском." ;;
+                            np_warp_start)  _w_note="▶ Запуск отправлен." ;;
+                        esac
+                    else
+                        _w_reason=$(printf '%s' "$_w_resp" | jq -r '.reason // .error // empty' 2>/dev/null)
+                        _w_note="${E_WARN} Revolver не выполнил команду: $(_warp_err_ru "$_w_reason")"
+                    fi ;;
+            esac
+            _w_st=$(ubus call podkop_bot_warpscout_rescue status '{}' 2>/dev/null)
+            _w_run=$(printf '%s' "$_w_st" | jq -r '.running // false' 2>/dev/null)
+            _w_busy=$(printf '%s' "$_w_st" | jq -r '.busy // false' 2>/dev/null)
+            _w_state=$(printf '%s' "$_w_st" | jq -r '.state // empty' 2>/dev/null)
+            _w_ep=$(printf '%s' "$_w_st" | jq -r '.endpoint // empty' 2>/dev/null)
+            _w_idx=$(printf '%s' "$_w_st" | jq -r '.index // 0' 2>/dev/null)
+            _w_tot=$(printf '%s' "$_w_st" | jq -r '.total // 0' 2>/dev/null)
+            _w_reason=$(printf '%s' "$_w_st" | jq -r '.reason // empty' 2>/dev/null)
+            [ -z "$_w_ep" ] && _w_ep=$(sed -n 's/^endpoint=//p' /tmp/podkop_bot/warpscout_rescue.state 2>/dev/null | head -n1)
+            if [ "$_w_busy" = "true" ]; then
+                case "$_w_state" in
+                    reloading) _w_state_disp="⏳ перезарядка магазина…" ;;
+                    firing)    _w_state_disp="⏳ запуск узла, проверка Telegram…" ;;
+                    *)         _w_state_disp="⏳ выполняется команда…" ;;
+                esac
+            elif [ "$_w_run" = "true" ] || _warp_rescue_pid_alive; then
+                _w_state_disp="ON-AIR"
+            else
+                case "$_w_state" in
+                    exhausted)                _w_state_disp="❌ магазин исчерпан — нужна перезарядка" ;;
+                    reload_failed)            _w_state_disp="❌ перезарядка не удалась" ;;
+                    start_failed|fire_failed) _w_state_disp="❌ узел не прошёл проверку Telegram" ;;
+                    stopped)                  _w_state_disp="остановлен" ;;
+                    *)                        _w_state_disp="не запущен${_w_state:+ ($_w_state)}" ;;
+                esac
+            fi
+            # Telegram through WARP right now — only when a node is actually up.
+            _w_tg="—"
+            if [ "$_w_busy" != "true" ] && _warp_rescue_pid_alive; then
+                _w_tg=$(probe_telegram_proxy_latency "$(printf '%s' "$(_warp_rescue_proxy 0)" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)")
+                case "$_w_tg" in *ms) _warp_rescue_note_tg ok; _w_tg="✅ ${_w_tg%ms} мс" ;; *) _w_tg="❌ не отвечает" ;; esac
+            fi
+            _w_meta=$(awk -F'|' -v e="$_w_ep" '$1==e {print $6 "|" $7; exit}' /etc/podkop_bot/warpscout-shortlist.tsv 2>/dev/null)
+            _w_node=${_w_meta%%|*}; _w_loc=${_w_meta#*|}; [ "$_w_loc" = "$_w_meta" ] && _w_loc=""
+            local _w_start_btn=""
+            { [ "$_w_run" = "true" ] || [ "$_w_busy" = "true" ] || _warp_rescue_pid_alive; } || \
+                _w_start_btn="[{\"text\":\"▶ Запустить WARP\",\"callback_data\":\"np_warp_start\"}],"
+            send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>%s\n\n<b>Состояние:</b> %s\n<b>Узел:</b> <code>%s</code>%s\n<b>Позиция в магазине:</b> %s / %s\n<b>Telegram через WARP:</b> %s\n\n<i>Бот сам переключает узел, если Telegram через него не проходит 2 проверки подряд.</i>' \
+                    "${_w_note:+$(printf '\n%s' "$_w_note")}" "$_w_state_disp" "$(html_escape "${_w_ep:-—}")" \
+                    "$( [ -n "$_w_loc$_w_node" ] && printf ' · %s' "$(html_escape "${_w_loc}${_w_node:+ · $_w_node}")")" "${_w_idx:-0}" "${_w_tot:-0}" "$_w_tg")" \
+                "{\"inline_keyboard\":[${_w_start_btn}[{\"text\":\"⏭ Следующий WARP\",\"callback_data\":\"np_warp_next\"},{\"text\":\"🔄 Перезарядить\",\"callback_data\":\"np_warp_reload_ask\"}],[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"np_warp\"},{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+            unset -f _warp_err_ru
             ;;
 
         # Entry card. Mirrors the outbound-card pattern: details plus the actions
@@ -14928,7 +15206,7 @@ _handle_fallback_socks() {
             # Deliberately diagnostic-only: this function never writes route state.
             # gstatic measures generic egress; getMe proves THIS bot can use Telegram.
             _probe_channel() {
-                local _pc_proxy="$1" _pc_out _pc_code _pc_time _pc_body
+                local _pc_proxy="$1" _pc_tg_extra="$2" _pc_out _pc_code _pc_time _pc_body
                 CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
                 CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="тайм-аут"
 
@@ -14942,7 +15220,8 @@ _handle_fallback_socks() {
                 fi
 
                 _pc_body="${BOT_DIR}/channel_tg_$$"
-                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                # shellcheck disable=SC2086
+                _pc_out=$(curl -s -k -x "$_pc_proxy" $_pc_tg_extra --connect-timeout 3 --max-time 5 \
                     -o "$_pc_body" -w '%{http_code}:%{time_total}' \
                     "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
                 _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
@@ -15003,8 +15282,8 @@ _handle_fallback_socks() {
             if [ "$_wr_test_enabled" = "1" ]; then
                 _wr_test_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
                 if [ -n "$_wr_test_proxy" ]; then
-                    _probe_channel "$_wr_test_proxy"
-                    _append_channel "WARP Rescue" "$(html_escape "$_wr_test_proxy")"
+                    _probe_channel "$(printf '%s' "$_wr_test_proxy" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
+                    _append_channel "WARP Rescue" "$(html_escape "$(printf '%s' "$_wr_test_proxy" | sed 's#^socks5h://#socks5://#')") · Telegram по IP ${TG_EMERGENCY_IPS%% *}"
                 else
                     CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
                     CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="не удалось запустить"
@@ -17921,7 +18200,8 @@ handle_command() {
 
         admins_menu|cmd_admin_add|ask_del_admin_*|do_del_admin_*|toggle_anon_admins|cmd_bot_invite_info|\
         fallback_socks_menu|net_proxies_menu|cmd_fb_socks_add|cmd_test_fb_socks|ask_del_fb_*|do_del_fb_*|\
-        np_view_fb_*|np_view_bot|np_edit_fb_*|np_del_fb_*|np_del_bot)
+        np_view_fb_*|np_view_bot|np_edit_fb_*|np_del_fb_*|np_del_bot|\
+        np_warp|np_warp_next|np_warp_start|np_warp_reload_ask|np_warp_reload)
             _handle_fallback_socks "$cmd" "$mid" "" "" ;;
 
         ask_*)
@@ -18066,12 +18346,9 @@ EOF
 
 # Initialize active section file BEFORE launching daemons so build_all_caches
 # inside send_startup_notification_async uses the correct section.
-if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
-    _first_sec=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-        | grep "^${PODKOP_UCI}\.[^.]*=section$" \
-        | head -1 | cut -d. -f2 | cut -d= -f1)
-    echo "${_first_sec:-main}" > "$ACTIVE_SECTION_FILE"
-fi
+# get_active_section validates the remembered section and repairs a stale one
+# (e.g. "main" left over after the section was renamed).
+get_active_section >/dev/null
 
 _traffic_stats_init || logger -t podkop-bot "[Traffic] UCI stats initialization failed; using RAM accumulator only."
 send_startup_notification_async &
