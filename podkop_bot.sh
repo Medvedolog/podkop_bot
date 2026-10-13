@@ -1181,6 +1181,11 @@ get_singbox_version_display() {
     if [ -s "$SB_VER_CACHE" ]; then
         local _cached_key _cached_sbv
         IFS='|' read -r _cached_key _cached_sbv < "$SB_VER_CACHE" 2>/dev/null
+        # Older bot versions could cache Forkop's full JSON metadata object
+        # instead of the .version field. Repair that entry on read.
+        case "$_cached_sbv" in
+            \{*) _cached_sbv=$(printf '%s' "$_cached_sbv" | jq -r '.version // empty | select(type == "string")' 2>/dev/null) ;;
+        esac
         if [ -n "$_cached_sbv" ] && [ "$_cached_sbv" != "unknown" ] && [ "$_cached_key" = "$_sb_key" ]; then
             printf '%s' "$_cached_sbv"; return
         fi
@@ -1196,8 +1201,18 @@ get_singbox_version_display() {
         _sb_ui_state="/var/run/forkop/ui-state/sing-box-version"
     fi
     [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
-    [ -z "$ver" ] && [ -n "$_sb_ui_state" ] && [ -r "$_sb_ui_state" ] && \
+    # Forkop's UI cache may be a JSON object with a .version property,
+    # while legacy metadata files contain only a plain version string.
+    # Never leak the complete JSON object into Status/daily reports.
+    case "$ver" in
+        \{*) ver=$(printf '%s' "$ver" | jq -r '.version // empty | select(type == "string")' 2>/dev/null) ;;
+    esac
+    if [ -z "$ver" ] && [ -n "$_sb_ui_state" ] && [ -r "$_sb_ui_state" ]; then
         ver=$(sed -n '1p' "$_sb_ui_state" 2>/dev/null)
+        case "$ver" in
+            \{*) ver=$(printf '%s' "$ver" | jq -r '.version // empty | select(type == "string")' 2>/dev/null) ;;
+        esac
+    fi
 
     # 2. opkg (OpenWrt 24.10 and earlier)
     if [ -z "$ver" ] && command -v opkg >/dev/null 2>&1; then
