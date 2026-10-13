@@ -14816,6 +14816,7 @@ _handle_fallback_socks() {
 \
 <code>warp_rescue</code>%s WARP Rescue <code>socks5h://127.0.0.1:%s</code> — <i>%s</i>' \
                     "$list_text" "$_row_lbl" "$_wr_port" "$_wr_state")
+                rows="${rows}[{\"text\":\"🌀 WARP Rescue · узел и магазин\",\"callback_data\":\"np_warp\"}],"
                 if [ -n "$_wr_ep" ]; then
                     local _wr_desc="Сервер выхода: $_wr_ep"
                     [ -n "$_wr_loc" ] && _wr_desc="${_wr_desc} · $_wr_loc"
@@ -14838,6 +14839,105 @@ _handle_fallback_socks() {
             text=$(printf '%s' "$text" | sed 's/\\$//') # r44-proxy-ui-sync
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} SOCKS\",\"callback_data\":\"cmd_fb_socks_add\"}${_add_t3_btn}],[{\"text\":\"${E_TEST} Проверить все\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"net_proxies_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        # WARP Rescue card: the Revolver controller's own actions, reachable from
+        # Telegram — the same ubus calls the BearGuard LuCI page makes:
+        # "Следующий WARP" = next, "Перезарядить" = reload (Discovery + Telegram
+        # qualification + magazine + FIRE), "Запустить" = trigger. next/reload are
+        # asynchronous: the controller answers {"ok":true} at once and works in
+        # the background (status.busy), so the card reports controller state
+        # rather than probing a node that is still being switched.
+        "np_warp"|"np_warp_next"|"np_warp_start"|"np_warp_reload_ask"|"np_warp_reload")
+            rm -f "$STATE_FILE"
+            local _w_en _w_resp _w_reason _w_note="" _w_st _w_run _w_busy _w_state _w_ep _w_idx _w_tot _w_meta _w_loc _w_node _w_tg _w_state_disp
+            _w_en=$(_warp_rescue_cfg_get enabled 2>/dev/null || true)
+            if [ "$_w_en" != "1" ]; then
+                send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>\n\nWARP Rescue выключен. Включается в веб-интерфейсе Podkop BearGuard.')" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+                return
+            fi
+            _warp_err_ru() {
+                case "$1" in
+                    warpscout_disabled)    printf 'WARP Rescue выключен' ;;
+                    not_ready)             printf 'WARPSCOUT или учётная запись WARP ещё не готовы' ;;
+                    not_installed)         printf 'WARPSCOUT не установлен' ;;
+                    controller_busy)       printf 'револьвер уже выполняет другую команду' ;;
+                    qualification_running) printf 'сейчас выполняется проверка Telegram API' ;;
+                    discovery_running)     printf 'сейчас выполняется поиск WARP-узлов' ;;
+                    runtime_handoff_failed) printf 'не удалось освободить тестовый WARP SOCKS' ;;
+                    account_missing)       printf 'нет учётной записи WARP' ;;
+                    already_running)       printf 'операция уже выполняется' ;;
+                    *)                     printf '%s' "${1:-нет ответа}" ;;
+                esac
+            }
+            case "$cmd" in
+                np_warp_reload_ask)
+                    send_or_edit "$mid" "$(printf '%s <b>Перезарядить магазин WARP?</b>\n\nRevolver заново найдёт WARP-узлы, проверит через них Telegram API, соберёт магазин и запустит лучший узел. Это занимает несколько минут; на это время WARP Rescue недоступен.\n\n<i>Если нужно просто сменить узел — хватит «Следующий WARP».</i>' "$E_WARN")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Перезарядить\",\"callback_data\":\"np_warp_reload\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"np_warp\"}]]}"
+                    return ;;
+                np_warp_reload|np_warp_next|np_warp_start)
+                    case "$cmd" in
+                        np_warp_reload) _w_resp=$(ubus call podkop_bot_warpscout_rescue reload '{}' 2>/dev/null) ;;
+                        np_warp_next)   _w_resp=$(ubus call podkop_bot_warpscout_rescue next '{}' 2>/dev/null) ;;
+                        np_warp_start)  _w_resp=$(ubus call podkop_bot_warpscout_rescue trigger '{}' 2>/dev/null) ;;
+                    esac
+                    logger -t podkop-bot "Audit: ${audit_str:-admin} -> WARP Rescue ${cmd#np_warp_}"
+                    if printf '%s' "$_w_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+                        rm -f "$_WARP_TG_FAIL_FILE" 2>/dev/null
+                        [ "$cmd" = "np_warp_next" ] && printf '%s\n' "$(date +%s)" > "$_WARP_NEXT_TS_FILE"
+                        case "$cmd" in
+                            np_warp_reload) _w_note="🔄 Перезарядка запущена. Через несколько минут нажмите «Обновить»." ;;
+                            np_warp_next)   _w_note="⏭ Переключаюсь на следующий узел — Revolver проверит через него Telegram перед запуском." ;;
+                            np_warp_start)  _w_note="▶ Запуск отправлен." ;;
+                        esac
+                    else
+                        _w_reason=$(printf '%s' "$_w_resp" | jq -r '.reason // .error // empty' 2>/dev/null)
+                        _w_note="${E_WARN} Revolver не выполнил команду: $(_warp_err_ru "$_w_reason")"
+                    fi ;;
+            esac
+            _w_st=$(ubus call podkop_bot_warpscout_rescue status '{}' 2>/dev/null)
+            _w_run=$(printf '%s' "$_w_st" | jq -r '.running // false' 2>/dev/null)
+            _w_busy=$(printf '%s' "$_w_st" | jq -r '.busy // false' 2>/dev/null)
+            _w_state=$(printf '%s' "$_w_st" | jq -r '.state // empty' 2>/dev/null)
+            _w_ep=$(printf '%s' "$_w_st" | jq -r '.endpoint // empty' 2>/dev/null)
+            _w_idx=$(printf '%s' "$_w_st" | jq -r '.index // 0' 2>/dev/null)
+            _w_tot=$(printf '%s' "$_w_st" | jq -r '.total // 0' 2>/dev/null)
+            _w_reason=$(printf '%s' "$_w_st" | jq -r '.reason // empty' 2>/dev/null)
+            [ -z "$_w_ep" ] && _w_ep=$(sed -n 's/^endpoint=//p' /tmp/podkop_bot/warpscout_rescue.state 2>/dev/null | head -n1)
+            if [ "$_w_busy" = "true" ]; then
+                case "$_w_state" in
+                    reloading) _w_state_disp="⏳ перезарядка магазина…" ;;
+                    firing)    _w_state_disp="⏳ запуск узла, проверка Telegram…" ;;
+                    *)         _w_state_disp="⏳ выполняется команда…" ;;
+                esac
+            elif [ "$_w_run" = "true" ] || _warp_rescue_pid_alive; then
+                _w_state_disp="ON-AIR"
+            else
+                case "$_w_state" in
+                    exhausted)                _w_state_disp="❌ магазин исчерпан — нужна перезарядка" ;;
+                    reload_failed)            _w_state_disp="❌ перезарядка не удалась" ;;
+                    start_failed|fire_failed) _w_state_disp="❌ узел не прошёл проверку Telegram" ;;
+                    stopped)                  _w_state_disp="остановлен" ;;
+                    *)                        _w_state_disp="не запущен${_w_state:+ ($_w_state)}" ;;
+                esac
+            fi
+            # Telegram through WARP right now — only when a node is actually up.
+            _w_tg="—"
+            if [ "$_w_busy" != "true" ] && _warp_rescue_pid_alive; then
+                _w_tg=$(probe_telegram_proxy_latency "$(printf '%s' "$(_warp_rescue_proxy 0)" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)")
+                case "$_w_tg" in *ms) _warp_rescue_note_tg ok; _w_tg="✅ ${_w_tg%ms} мс" ;; *) _w_tg="❌ не отвечает" ;; esac
+            fi
+            _w_meta=$(awk -F'|' -v e="$_w_ep" '$1==e {print $6 "|" $7; exit}' /etc/podkop_bot/warpscout-shortlist.tsv 2>/dev/null)
+            _w_node=${_w_meta%%|*}; _w_loc=${_w_meta#*|}; [ "$_w_loc" = "$_w_meta" ] && _w_loc=""
+            local _w_start_btn=""
+            { [ "$_w_run" = "true" ] || [ "$_w_busy" = "true" ] || _warp_rescue_pid_alive; } || \
+                _w_start_btn="[{\"text\":\"▶ Запустить WARP\",\"callback_data\":\"np_warp_start\"}],"
+            send_or_edit "$mid" "$(printf '🌀 <b>WARP Rescue</b>%s\n\n<b>Состояние:</b> %s\n<b>Узел:</b> <code>%s</code>%s\n<b>Позиция в магазине:</b> %s / %s\n<b>Telegram через WARP:</b> %s\n\n<i>Бот сам переключает узел, если Telegram через него не проходит 2 проверки подряд.</i>' \
+                    "${_w_note:+$(printf '\n%s' "$_w_note")}" "$_w_state_disp" "$(html_escape "${_w_ep:-—}")" \
+                    "$( [ -n "$_w_loc$_w_node" ] && printf ' · %s' "$(html_escape "${_w_loc}${_w_node:+ · $_w_node}")")" "${_w_idx:-0}" "${_w_tot:-0}" "$_w_tg")" \
+                "{\"inline_keyboard\":[${_w_start_btn}[{\"text\":\"⏭ Следующий WARP\",\"callback_data\":\"np_warp_next\"},{\"text\":\"🔄 Перезарядить\",\"callback_data\":\"np_warp_reload_ask\"}],[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"np_warp\"},{\"text\":\"${E_BACK} К списку\",\"callback_data\":\"net_proxies_menu\"}]]}"
+            unset -f _warp_err_ru
             ;;
 
         # Entry card. Mirrors the outbound-card pattern: details plus the actions
@@ -18060,7 +18160,8 @@ handle_command() {
 
         admins_menu|cmd_admin_add|ask_del_admin_*|do_del_admin_*|toggle_anon_admins|cmd_bot_invite_info|\
         fallback_socks_menu|net_proxies_menu|cmd_fb_socks_add|cmd_test_fb_socks|ask_del_fb_*|do_del_fb_*|\
-        np_view_fb_*|np_view_bot|np_edit_fb_*|np_del_fb_*|np_del_bot)
+        np_view_fb_*|np_view_bot|np_edit_fb_*|np_del_fb_*|np_del_bot|\
+        np_warp|np_warp_next|np_warp_start|np_warp_reload_ask|np_warp_reload)
             _handle_fallback_socks "$cmd" "$mid" "" "" ;;
 
         ask_*)
