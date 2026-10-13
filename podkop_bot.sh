@@ -6871,11 +6871,25 @@ start_health_daemon() {
                             _lk_txt=$(printf '<b>[%s]</b> %s <b>Бот не находит резервный путь</b>\n\n%s проверок подряд (≈ %s) все прокси недоступны.\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Если провайдер блокирует Telegram, бот может стать недоступен.</i>' \
                                 "$_hn" "$E_ERR" "$_lk_nofb_streak" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn")
                         elif [ "$_lam" = "smart" ] && [ "$_lk_dur" -ge "$_LK_SMART_DELAY" ]; then
-                            local _lk_t1_s="отвечает" _lk_tg_s="доступен"
-                            [ "$_lk_t1_down" = "1" ] && _lk_t1_s="не отвечает"
-                            [ "$_tgd" != "ok" ] && [ "$_tgt" != "ok" ] && _lk_tg_s="недоступен"
-                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Проблема со связью бота</b>\n\nДлится уже %s.\n<b>Основной SOCKS:</b> %s\n<b>Telegram:</b> %s\n<b>Способ подключения:</b> <code>%s</code>\n\n<i>Короткие сбои не присылаются по отдельности — они попадают в сводку.</i>' \
-                                "$_hn" "$E_WARN" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_t1_s" "$_lk_tg_s" "$_lk_rn")
+                            # Lead with what the BOT sees (its POLL route). The old
+                            # card led with the watchdog's one-shot probes — "SOCKS
+                            # answers, Telegram reachable" next to "no connection" —
+                            # which read as a false alarm when the tunnel was flaky:
+                            # single probes got through, the bot's connection did not.
+                            local _lk_state _lk_t1_s="проходит" _lk_d_s="проходит" _lk_hint=""
+                            case "${_lk_rk:-unknown}" in
+                                fail)  _lk_state="Бот не может подключиться к Telegram ни по одному каналу." ;;
+                                tier4) _lk_state="Бот работает напрямую — прокси-каналы до Telegram не доходят." ;;
+                                tier5) _lk_state="Бот работает через аварийные IP Telegram — остальные каналы не доходят." ;;
+                                tier1) _lk_state="Бот на основном канале, но основной SOCKS не доходит до Telegram в фоновых проверках." ;;
+                                *)     _lk_state="Бот работает через резервный канал — основной SOCKS не доходит до Telegram." ;;
+                            esac
+                            [ "$_lk_t1_down" = "1" ] && _lk_t1_s="не проходит"
+                            [ "$_tgd" != "ok" ] && _lk_d_s="не проходит"
+                            [ "${_lk_rk:-}" = "fail" ] && [ "$_lk_t1_down" != "1" ] && \
+                                _lk_hint=$(printf '\n<i>Отдельные запросы через туннель проходят, а подключение бота обрывается — сервер туннеля работает с перебоями.</i>')
+                            _lk_txt=$(printf '<b>[%s]</b> %s <b>Проблема со связью бота</b>\n\n%s\nДлится уже %s.\n<b>Способ подключения:</b> <code>%s</code>\n\n<b>Фоновая проверка Telegram:</b> через основной SOCKS — %s · напрямую — %s%s\n\n<i>Короткие сбои не присылаются по отдельности — они попадают в сводку.</i>' \
+                                "$_hn" "$E_WARN" "$_lk_state" "$(_fmt_secs_ru "$_lk_dur")" "$_lk_rn" "$_lk_t1_s" "$_lk_d_s" "$_lk_hint")
                         fi
                         if [ -n "$_lk_txt" ]; then
                             _lk_ep_alerted=1
@@ -6884,6 +6898,11 @@ start_health_daemon() {
                             send_health_alert "$_lk_pl"
                         fi
                     fi
+                elif [ "$_lk_ep_start" -ne 0 ] && { [ -z "$_lk_rk" ] || [ "$_lk_rk" = "unknown" ]; }; then
+                    # POLL route is being re-checked after a watchdog reset: not a
+                    # recovery yet. Closing the episode here produced "restored"
+                    # with route "Перепроверка…".
+                    :
                 else
                     if [ "$_lk_ep_start" -ne 0 ]; then
                         _lk_dur=$(( _lk_now - _lk_ep_start ))
