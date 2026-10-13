@@ -2187,12 +2187,33 @@ _warp_rescue_proxy() {
     printf 'socks5h://127.0.0.1:%s' "$_port"
 }
 
+# Telegram through WARP must be addressed by a real api.telegram.org IP.
+# Field test (RAX3000Me): socks5h:// and socks5:// both timed out at 15s, the
+# same request with --resolve to a Telegram IP answered in 0.5s. The router's
+# resolver is podkop's (fake-IP / tunnel-only answers for listed domains) and
+# the WARP SOCKS does not resolve it usefully either, so the name never maps
+# to an address WARP can reach. TG_EMERGENCY_IPS holds real Bot API IPs kept
+# fresh via DoH.
+_warp_tg_resolve() {
+    local _ip="${TG_EMERGENCY_IPS%% *}"
+    case "$_ip" in ''|*[!0-9.]*) _ip="149.154.167.220" ;; esac
+    printf -- '--resolve api.telegram.org:443:%s' "$_ip"
+}
+
+# _warp_rescue_flags [ALLOW_START] — curl flags for a Telegram request via WARP.
+# socks5:// (not socks5h://) so that curl honours --resolve and hands WARP the IP.
+_warp_rescue_flags() {
+    local _p
+    _p=$(_warp_rescue_proxy "${1:-0}") || return 1
+    printf -- '-x %s %s' "$(printf '%s' "$_p" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
+}
+
 _try_warp_rescue() {
     local _args="$1" _max_time="$2" _ct="$3" _proxy
     [ "$_t_policy" != "direct" ] || return 1
-    _proxy=$(_warp_rescue_proxy 1) || return 1
+    _proxy=$(_warp_rescue_flags 1) || return 1
     logger -t podkop-bot "[Transport] Trying WARP Rescue for ${_ROUTE_PROFILE:-unknown}"
-    if _try_curl "-x $_proxy" "$_max_time" "$_args" "$_ct"; then
+    if _try_curl "$_proxy" "$_max_time" "$_args" "$_ct"; then
         ROUTE_KEY="warp_rescue"
         ROUTE_NAME="WARP Rescue"
         return 0
@@ -2355,9 +2376,9 @@ _route_request() {
                     ;;
                 warp_rescue)
                     local _warp_proxy=""
-                    _warp_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
+                    _warp_proxy=$(_warp_rescue_flags 1 2>/dev/null || true)
                     [ -n "$_warp_proxy" ] && \
-                    _try_curl "-x $_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
+                    _try_curl "$_warp_proxy" "$_max" "$_args" "$_ct_sticky" && {
                         LAST_ROUTE="warp_rescue"; LAST_ROUTE_NAME="WARP Rescue"
                         _write_route_state "$_ROUTE_PROFILE" "warp_rescue" "$LAST_ROUTE_NAME"
                         eval "$_rvar=warp_rescue"; return 0
@@ -2637,9 +2658,10 @@ probe_socks_latency() {
 # proves that this exact path reaches api.telegram.org. 401/429 are transport-positive:
 # Telegram answered, even though the application request itself was rejected.
 probe_telegram_proxy_latency() {
-    local _proxy="$1" _tmp _out _code _time
+    local _proxy="$1" _extra="$2" _tmp _out _code _time
     _tmp=$(mktemp /tmp/podkop_tg_follow.XXXXXX 2>/dev/null) || { echo "timeout"; return; }
-    _out=$(curl -s -k -x "$_proxy" --connect-timeout 4 --max-time 8 \
+    # shellcheck disable=SC2086
+    _out=$(curl -s -k -x "$_proxy" $_extra --connect-timeout 4 --max-time 8 \
         -o "$_tmp" -w "%{http_code}:%{time_total}" "${API_URL}/getMe" 2>/dev/null)
     _code="${_out%%:*}"
     _time="${_out#*:}"
@@ -2730,7 +2752,7 @@ probe_all_socks_write() {
     if [ -n "$_warp_follow" ]; then
         _slots="$_slots warp_rescue"
         (
-            _lat=$(probe_telegram_proxy_latency "$_warp_follow")
+            _lat=$(probe_telegram_proxy_latency "$(printf '%s' "$_warp_follow" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)")
             printf 'warp_rescue=%s\n' "$_lat" > "$_probe_dir/warp_rescue"
         ) & _pids="$_pids $!"
     fi
@@ -2833,9 +2855,9 @@ api_document() {
             }
         fi
         local _warp_doc=""
-        _warp_doc=$(_warp_rescue_proxy 1 2>/dev/null || true)
+        _warp_doc=$(_warp_rescue_flags 1 2>/dev/null || true)
         if [ -n "$_warp_doc" ]; then
-            res=$(_do_curl_doc "-x $_warp_doc")
+            res=$(_do_curl_doc "$_warp_doc")
             _is_telegram_response "$res" && {
                 unset -f _do_curl_doc
                 LAST_ROUTE_DOC="warp_rescue"; return 0
@@ -2891,9 +2913,9 @@ get_tg_latency() {
             ;;
         warp_rescue)
             local _warp_lat=""
-            _warp_lat=$(_warp_rescue_proxy 0 2>/dev/null || true)
+            _warp_lat=$(_warp_rescue_flags 0 2>/dev/null || true)
             [ -n "$_warp_lat" ] || { echo "Нет данных"; return; }
-            p_args="-x $_warp_lat"
+            p_args="$_warp_lat"
             ;;
         tier4)
             p_args="$if_flag"
@@ -14996,7 +15018,7 @@ _handle_fallback_socks() {
             # Deliberately diagnostic-only: this function never writes route state.
             # gstatic measures generic egress; getMe proves THIS bot can use Telegram.
             _probe_channel() {
-                local _pc_proxy="$1" _pc_out _pc_code _pc_time _pc_body
+                local _pc_proxy="$1" _pc_tg_extra="$2" _pc_out _pc_code _pc_time _pc_body
                 CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
                 CH_TG_MS="—"; CH_TG_CODE="000"; CH_TG_DETAIL="тайм-аут"
 
@@ -15010,7 +15032,8 @@ _handle_fallback_socks() {
                 fi
 
                 _pc_body="${BOT_DIR}/channel_tg_$$"
-                _pc_out=$(curl -s -k -x "$_pc_proxy" --connect-timeout 3 --max-time 5 \
+                # shellcheck disable=SC2086
+                _pc_out=$(curl -s -k -x "$_pc_proxy" $_pc_tg_extra --connect-timeout 3 --max-time 5 \
                     -o "$_pc_body" -w '%{http_code}:%{time_total}' \
                     "https://api.telegram.org/bot${TOKEN}/getMe" 2>/dev/null)
                 _pc_code="${_pc_out%%:*}"; _pc_time="${_pc_out#*:}"
@@ -15071,7 +15094,7 @@ _handle_fallback_socks() {
             if [ "$_wr_test_enabled" = "1" ]; then
                 _wr_test_proxy=$(_warp_rescue_proxy 1 2>/dev/null || true)
                 if [ -n "$_wr_test_proxy" ]; then
-                    _probe_channel "$_wr_test_proxy"
+                    _probe_channel "$(printf '%s' "$_wr_test_proxy" | sed 's#^socks5h://#socks5://#')" "$(_warp_tg_resolve)"
                     _append_channel "WARP Rescue" "$(html_escape "$_wr_test_proxy")"
                 else
                     CH_INET_OK=0; CH_INET_MS="—"; CH_TG_OK=0; CH_TG_REACH=0
