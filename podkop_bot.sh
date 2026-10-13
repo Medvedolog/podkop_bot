@@ -611,7 +611,8 @@ _consume_poll_route_cmd() {
     fi
 }
 LAST_CMD_FILE="${BOT_DIR}/last_cmd"
-UNAUTH_FILE="${BOT_DIR}/unauth"
+UNAUTH_FILE="${BOT_DIR}/unauth"   # total|last_ts|last_actor — shown in Bot settings
+UNAUTH_LOG="${BOT_DIR}/unauth_log" # ts|actor per attempt — daily report (last 24h)
 # Menu/alert interleaving fix: track last menu msg_id and last health alert msg_id.
 # send_or_edit uses these to detect when an alert has pushed the menu up and
 # re-sends the menu as a new message (delete old + send new) to keep it current.
@@ -2980,9 +2981,30 @@ _security_actor_file() {
 }
 
 # Sets SECURITY_EVENT to: alert | journal | blocked_new | blocked.
+# _unauth_record UID SENDER_CHAT_ID [USERNAME] — keep the totals the Bot
+# settings card and the daily report show. Nothing wrote UNAUTH_FILE before, so
+# the card always said "0 попыток" however many strangers had knocked.
+_unauth_record() {
+    local _uid="$1" _scid="$2" _name="$3" _who _cnt=0 _now _tmp
+    _now=$(date +%s)
+    if [ -n "$_name" ] && [ "$_name" != "null" ]; then _who="@${_name}"
+    elif [ -n "$_uid" ] && [ "$_uid" != "null" ]; then _who="id ${_uid}"
+    else _who="chat ${_scid:-?}"; fi
+    [ -f "$UNAUTH_FILE" ] && IFS='|' read -r _cnt _ < "$UNAUTH_FILE"
+    case "$_cnt" in ''|*[!0-9]*) _cnt=0 ;; esac
+    _tmp="${UNAUTH_FILE}.tmp.$$"
+    printf '%s|%s|%s\n' "$((_cnt + 1))" "$_now" "$_who" > "$_tmp" && mv "$_tmp" "$UNAUTH_FILE" 2>/dev/null
+    printf '%s|%s\n' "$_now" "$_who" >> "$UNAUTH_LOG" 2>/dev/null
+    # bounded: a flood must not grow tmpfs without limit
+    if [ "$(wc -l < "$UNAUTH_LOG" 2>/dev/null || echo 0)" -gt 1000 ]; then
+        tail -n 500 "$UNAUTH_LOG" > "${UNAUTH_LOG}.tmp" 2>/dev/null && mv "${UNAUTH_LOG}.tmp" "$UNAUTH_LOG" 2>/dev/null
+    fi
+}
+
 security_note_unauthorized() {
     local _uid="$1" _scid="$2" _now _f _count=0 _start=0 _until=0
     _now=$(date +%s)
+    _unauth_record "$_uid" "$_scid" "$3"
     _f=$(_security_actor_file "$_uid" "$_scid")
     if [ -f "$_f" ]; then
         IFS='|' read -r _count _start _until < "$_f"
@@ -5998,6 +6020,13 @@ EOF
     elif [ -s "$ROUTE_LOG" ]; then
         _day_block="${_day_block}$(printf ' · всё время на основном канале')"
     fi
+    local _ua_day=0 _ua_last=""
+    if [ -s "$UNAUTH_LOG" ]; then
+        _ua_day=$(awk -F'|' -v c=$(( $(date +%s) - 86400 )) '$1>=c{n++} END{print n+0}' "$UNAUTH_LOG" 2>/dev/null)
+        case "$_ua_day" in ''|*[!0-9]*) _ua_day=0 ;; esac
+        [ "$_ua_day" -gt 0 ] && _ua_last=$(tail -n 1 "$UNAUTH_LOG" 2>/dev/null | awk -F'|' '{ printf "%s, %s", strftime("%H:%M", $1), $2 }')
+    fi
+    [ "$_ua_day" -gt 0 ] && _day_block="${_day_block}$(printf '\n⚠ Чужие попытки доступа: <code>%s</code> (последняя %s)' "$_ua_day" "$(html_escape "$_ua_last")")"
     _text="${_text}${_day_block}"
 
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' \
@@ -16321,7 +16350,9 @@ $(_fmt_tier "tier5" "Аварийные IP")"
                 ua_cnt=$(cut -d'|' -f1 "$UNAUTH_FILE"); ua_ts=$(cut -d'|' -f2 "$UNAUTH_FILE")
                 ua_usr=$(cut -d'|' -f3 "$UNAUTH_FILE")
                 ua_time=$(awk -v t="$ua_ts" 'BEGIN{print strftime("%d.%m.%Y %H:%M:%S",t)}' 2>/dev/null || echo "$ua_ts")
-                unauth_str=$(printf '%s %s попыток\nПоследняя: @%s в %s' "$E_RED" "$ua_cnt" "$ua_usr" "$ua_time")
+                case "$ua_cnt" in ''|*[!0-9]*) ua_cnt=0 ;; esac
+                case "$ua_usr" in @*|"id "*|"chat "*) ;; *) ua_usr="@${ua_usr}" ;; esac
+                unauth_str=$(printf '%s %s %s\nПоследняя: %s в %s' "$E_RED" "$ua_cnt" "$(_ru_plural "$ua_cnt" попытка попытки попыток)" "$(html_escape "$ua_usr")" "$ua_time")
             fi
 
             # Hints and compact keyboard labels. Telegram buttons do not wrap
@@ -18107,7 +18138,7 @@ EOF
             if is_manually_blocked_actor "$user_id" "$sender_chat_id"; then
                 continue
             fi
-            security_note_unauthorized "$user_id" "$sender_chat_id"
+            security_note_unauthorized "$user_id" "$sender_chat_id" "$u_name"
             _sec_actor="user"; _sec_id="$user_id"
             if [ -z "$_sec_id" ] || [ "$_sec_id" = "null" ]; then
                 _sec_actor="sender_chat"; _sec_id="$sender_chat_id"
