@@ -441,6 +441,7 @@ esac
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_day)" ]  && uci set podkop_bot.settings.weekly_report_day="7"
 [ -z "$(uci -q get podkop_bot.settings.weekly_report_time)" ] && uci set podkop_bot.settings.weekly_report_time="09:00"
 [ -z "$(uci -q get podkop_bot.settings.daily_report_time)" ] && uci set podkop_bot.settings.daily_report_time="08:00"
+[ -z "$(uci -q get podkop_bot.settings.report_style)" ]      && uci set podkop_bot.settings.report_style="classic"
 [ -z "$(uci -q get podkop_bot.settings.log_level)" ]         && uci set podkop_bot.settings.log_level="normal"
 
 # System journal verbosity. A tiny /tmp cache is shared by the main loop and
@@ -3195,8 +3196,54 @@ is_reply_to_bot() {
 # SECTION 4: Messaging Functions
 # ==============================================================================
 
+# REPORT_RICH_HTML, when set, makes send_message/edit_message try the rich
+# form first (sendRichMessage / editMessageText rich_message) and fall back to
+# the classic text only when Telegram explicitly rejects it. An unanswered
+# request is a failure as for sendMessage: a retry could duplicate the message.
+# Returns 0 delivered, 1 outcome unknown, 2 rejected.
+_send_rich_message() {
+    local kb="$1" payload resp new_mid
+    payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg h "$REPORT_RICH_HTML" --arg tid "${TARGET_REPLY_THREAD_ID:-}" --arg kb "${kb:-}" '
+        {chat_id:$cid, rich_message:{html:$h, skip_entity_detection:true}}
+        + (if $tid != "" and $tid != "null" then {message_thread_id:($tid|tonumber)} else {} end)
+        + (if $kb != "" and $kb != "null" then {reply_markup:($kb|fromjson)} else {} end)' 2>/dev/null) || return 2
+    resp=$(api_request "sendRichMessage" "$payload")
+    new_mid=$(printf '%s' "$resp" | jq -r '.result.message_id // empty' 2>/dev/null)
+    if [ -n "$new_mid" ]; then
+        printf '%s' "$new_mid" > "$LAST_MENU_MSG_FILE"
+        return 0
+    fi
+    if printf '%s' "$resp" | jq -e '.error_code' >/dev/null 2>&1; then
+        logger -t podkop-bot "[Telegram] sendRichMessage rejected, sending classic text: $(printf '%s' "$resp" | jq -r '.description // "?"' 2>/dev/null)"
+        return 2
+    fi
+    logger -t podkop-bot "[Telegram] sendRichMessage failed: no Telegram response"
+    return 1
+}
+
+_edit_rich_message() {
+    local mid="$1" kb="$2" payload resp _tg_desc
+    payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg h "$REPORT_RICH_HTML" --arg kb "${kb:-}" '
+        {chat_id:$cid, message_id:($mid|tonumber), rich_message:{html:$h, skip_entity_detection:true}}
+        + (if $kb != "" and $kb != "null" then {reply_markup:($kb|fromjson)} else {} end)' 2>/dev/null) || return 2
+    resp=$(api_request "editMessageText" "$payload")
+    printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1 && return 0
+    _tg_desc=$(printf '%s' "$resp" | jq -r '.description // empty' 2>/dev/null)
+    case "$_tg_desc" in *"message is not modified"*) return 0 ;; esac
+    if printf '%s' "$resp" | jq -e '.error_code' >/dev/null 2>&1; then
+        logger -t podkop-bot "[Telegram] rich editMessageText rejected, using classic text: ${_tg_desc:-unknown}"
+        return 2
+    fi
+    logger -t podkop-bot "[Telegram] rich editMessageText outcome unknown: no Telegram response"
+    return 1
+}
+
 send_message() {
     local txt="$1" kb="$2" payload="" resp new_mid
+    if [ -n "$REPORT_RICH_HTML" ]; then
+        _send_rich_message "$kb"
+        case $? in 0) return 0 ;; 1) return 1 ;; esac
+    fi
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" --argjson kb "$kb" \
@@ -3237,6 +3284,10 @@ send_message() {
 edit_message() {
     local mid="$1" txt="$2" kb="$3" payload=""
     [ -z "$mid" ] && { send_message "$txt" "$kb"; return; }
+    if [ -n "$REPORT_RICH_HTML" ]; then
+        _edit_rich_message "$mid" "$kb"
+        case $? in 0) return 0 ;; 1) return 1 ;; esac
+    fi
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" --argjson kb "$kb" \
             '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}' 2>/dev/null) || payload=""
@@ -5497,47 +5548,142 @@ _report_fit() {
     fi
 }
 
-# _report_sections_block PROXIES_JSON ACTIVE_SECTION [MAX] — every section:
-# mode, local mixed-proxy address with Telegram latency through it (follower
-# probe), the outbound it is on now, and its subscriptions and links (see
-# _report_section_sources; MAX defaults to 3). Needs _load_transport_ctx.
+# _report_sections_block PROXIES_JSON ACTIVE_SECTION [MAX] [STYLE] — every
+# section: mode, local mixed-proxy address with Telegram latency through it
+# (follower probe), the outbound it is on now, and its subscriptions and links
+# (see _report_section_sources; MAX defaults to 3). STYLE "rich" renders a
+# table plus a collapsible list of sources for sendRichMessage instead of the
+# classic lines. Needs _load_transport_ctx.
 _report_sections_block() {
-    local _proxies="$1" _sec="$2" _max="${3:-3}" _out="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
+    local _proxies="$1" _sec="$2" _max="${3:-3}" _style="${4:-classic}" _out="" _srcs="" _open=""
+    local _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_mx _s_px _s_src _s_mark _s_sel _s_now _s_leaf _s_delay
     for _s in $_t_all_secs; do
         _s_en=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_s_en" ] && _s_en=1
         _s_type=$(get_section_type "$_s" 2>/dev/null || echo "?")
         _s_mode=$(section_mode_label "$_s_type")
+        _s_mx=""; _s_lat=""; _s_px=""; _s_delay=""
         if [ "$_s_en" != "1" ]; then
-            _out="${_out}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")$(_report_section_sources "$_s" "$_max")"
+            _s_mark="⚪"
+        else
+            if [ "$_s" = "$_sec" ]; then _s_mark="▶"; else _s_mark="🟢"; fi
+            _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
+            _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
+            if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
+                _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
+                if [ "$_s" = "$_t_sec" ]; then
+                    _s_lat=$(sed -n 's/^tier1=\([^ ]*\).*/\1/p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
+                else
+                    _s_lat=$(grep "^tier2_[0-9]*=.* url=.*${_s_ip}:${_s_mp}\$" "$SOCKS_PROBE_FILE" 2>/dev/null | head -1 | sed 's/^[^=]*=\([^ ]*\).*/\1/')
+                fi
+                case "$_s_lat" in *ms) _s_lat="TG ${_s_lat%ms} мс" ;; "") _s_lat="" ;; *) _s_lat="TG ❌" ;; esac
+                _s_mx="${_s_ip}:${_s_mp}"
+            fi
+            case "$_s_type" in block|exclusion|bypass|direct|dns|zapret*|byedpi|vpn|vpn:*) _s_sel="" ;; *) _s_sel="x" ;; esac
+            if [ -n "$_proxies" ] && [ -n "$_s_sel" ]; then
+                _s_sel=$(_section_selector_tag "$_s" "$_proxies")
+                _s_now=$(printf '%s' "$_proxies" | jq -r --arg t "$_s_sel" '.proxies[$t] | if .type == "Selector" or .type == "URLTest" or .type == "Fallback" then (.now // empty) else empty end' 2>/dev/null)
+                if [ -n "$_s_now" ]; then
+                    _s_leaf=$(_resolve_leaf "$_s_now" "$_proxies")
+                    _s_delay=$(printf '%s' "$_proxies" | jq -r --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // empty' 2>/dev/null)
+                    case "$_s_delay" in ''|0|*[!0-9]*) _s_delay="" ;; esac
+                    _s_px=$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")
+                fi
+            fi
+        fi
+        _s_src=$(_report_section_sources "$_s" "$_max")
+
+        if [ "$_style" = "rich" ]; then
+            _out="${_out}$(printf '<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>' \
+                "$_s_mark" "$(html_escape "$_s")" \
+                "$(html_escape "$_s_mode")$( [ "$_s_en" != "1" ] && printf ' · <i>отключена</i>')" \
+                "${_s_px:+<code>$(html_escape "$_s_px")</code>}${_s_delay:+ · ${_s_delay} мс}$( [ -z "$_s_px" ] && printf '—')" \
+                "${_s_mx:+<code>$(html_escape "$_s_mx")</code>}${_s_lat:+ · ${_s_lat}}$( [ -z "$_s_mx" ] && printf '—')")"
+            if [ -n "$_s_src" ]; then
+                case "$_s_src" in *⚠️*) _open=" open" ;; esac
+                _srcs="${_srcs}$(printf '<p><code>%s</code></p><ul>%s</ul>' "$(html_escape "$_s")" \
+                    "$(printf '%s\n' "$_s_src" | sed -e '/^[[:space:]]*$/d' -e 's/^ *//' -e 's/.*/<li>&<\/li>/' | tr -d '\n')")"
+            fi
             continue
         fi
-        _s_line=$(printf '\n%s <code>%s</code> · %s' "$( [ "$_s" = "$_sec" ] && echo "▶" || echo "🟢")" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")
-        _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
-        _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
-        if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
-            _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
-            if [ "$_s" = "$_t_sec" ]; then
-                _s_lat=$(sed -n 's/^tier1=\([^ ]*\).*/\1/p' "$SOCKS_PROBE_FILE" 2>/dev/null | head -1)
-            else
-                _s_lat=$(grep "^tier2_[0-9]*=.* url=.*${_s_ip}:${_s_mp}\$" "$SOCKS_PROBE_FILE" 2>/dev/null | head -1 | sed 's/^[^=]*=\([^ ]*\).*/\1/')
-            fi
-            case "$_s_lat" in *ms) _s_lat="TG ${_s_lat%ms} мс" ;; "") _s_lat="" ;; *) _s_lat="TG ❌" ;; esac
-            _s_line="${_s_line}$(printf '\n   mixed <code>%s:%s</code>%s' "$(html_escape "$_s_ip")" "$_s_mp" "${_s_lat:+ · ${_s_lat}}")"
+
+        if [ "$_s_en" != "1" ]; then
+            _out="${_out}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")${_s_src}"
+            continue
         fi
-        case "$_s_type" in block|exclusion|bypass|direct|dns|zapret*|byedpi|vpn|vpn:*) _s_sel="" ;; *) _s_sel="x" ;; esac
-        if [ -n "$_proxies" ] && [ -n "$_s_sel" ]; then
-            _s_sel=$(_section_selector_tag "$_s" "$_proxies")
-            _s_now=$(printf '%s' "$_proxies" | jq -r --arg t "$_s_sel" '.proxies[$t] | if .type == "Selector" or .type == "URLTest" or .type == "Fallback" then (.now // empty) else empty end' 2>/dev/null)
-            if [ -n "$_s_now" ]; then
-                _s_leaf=$(_resolve_leaf "$_s_now" "$_proxies")
-                _s_delay=$(printf '%s' "$_proxies" | jq -r --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // empty' 2>/dev/null)
-                case "$_s_delay" in ''|0|*[!0-9]*) _s_delay="" ;; esac
-                _s_line="${_s_line}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")")" "${_s_delay:+ · ${_s_delay} мс}")"
-            fi
-        fi
-        _out="${_out}${_s_line}$(_report_section_sources "$_s" "$_max")"
+        _out="${_out}$(printf '\n%s <code>%s</code> · %s' "$_s_mark" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")"
+        [ -n "$_s_mx" ] && _out="${_out}$(printf '\n   mixed <code>%s</code>%s' "$(html_escape "$_s_mx")" "${_s_lat:+ · ${_s_lat}}")"
+        [ -n "$_s_px" ] && _out="${_out}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$_s_px")" "${_s_delay:+ · ${_s_delay} мс}")"
+        _out="${_out}${_s_src}"
     done
+    if [ "$_style" = "rich" ] && [ -n "$_out" ]; then
+        _out="<table bordered striped compact><tr><th>&nbsp;</th><th>Секция</th><th>Режим</th><th>Прокси</th><th>mixed</th></tr>${_out}</table>"
+        [ -n "$_srcs" ] && _out="${_out}<details${_open}><summary>📡 Подписки и ссылки</summary>${_srcs}</details>"
+    fi
     printf '%s' "$_out"
+}
+
+# ==============================================================================
+# Report style: classic HTML or rich message with tables
+# ==============================================================================
+# podkop_bot.settings.report_style: "classic" (sendMessage, default) or "rich"
+# (Bot API 10.1 sendRichMessage — tables, headings, collapsible blocks; no
+# Premium needed). The rich copy is built from the finished classic text, so
+# both always carry the same data. Telegram rejecting it (old Bot API, client,
+# markup error) falls back to the classic text — see send_message/edit_message.
+_report_style() {
+    case "$(uci -q get podkop_bot.settings.report_style 2>/dev/null)" in
+        rich) printf 'rich' ;;
+        *)    printf 'classic' ;;
+    esac
+}
+
+# _report_rich_convert HEAD — classic report HTML on stdin to rich HTML: the
+# title line becomes <h2>, the ──── rule <hr/>, every "<emoji> <b>Block</b>"
+# that opens a paragraph <h3>, a run of two or more "Label: value" lines one
+# bordered table, anything else <p>. HEAD=0 converts a tail that starts mid-report.
+_report_rich_convert() {
+    awk -v head="${1:-1}" '
+        # A lone "Label: value" line stays a paragraph: a one-row table is noise.
+        function close_table() {
+            if (rows == 1) printf "<p>%s</p>", one
+            else if (rows > 1) printf "<table bordered striped compact>%s</table>", buf
+            rows = 0; buf = ""; one = ""
+        }
+        function balanced(x,   a, b) { a = gsub(/<code>/, "&", x); b = gsub(/<\/code>/, "&", x); return a == b && x !~ /<[bi]>/ }
+        BEGIN { first = head; bstart = 1; rows = 0 }
+        {
+            line = $0
+            if (line ~ /^[[:space:]]*$/) { close_table(); bstart = 1; next }
+            if (line == "<code>────────────────────</code>") { close_table(); printf "<hr/>"; bstart = 0; next }
+            if (first) { gsub(/<\/?b>/, "", line); printf "<h2>%s</h2>", line; first = 0; bstart = 0; next }
+            if (bstart && line ~ /^[^ <][^<]* <b>[^<]+<\/b>/) {
+                close_table(); gsub(/<\/?b>/, "", line); printf "<h3>%s</h3>", line; bstart = 0; next
+            }
+            bstart = 0
+            sub(/^[[:space:]]+/, "", line)
+            i = index(line, ": ")
+            if (i > 1 && i <= 80 && balanced(substr(line, 1, i - 1))) {
+                buf = buf "<tr><td>" substr(line, 1, i - 1) "</td><td>" substr(line, i + 2) "</td></tr>"
+                rows++; one = line
+                next
+            }
+            close_table(); printf "<p>%s</p>", line
+        }
+        END { close_table() }'
+}
+
+# _report_rich TEXT SECTIONS_BLOCK SECTIONS_RICH — rich HTML for a finished
+# classic report, the sections block swapped for its table form. Empty when
+# the result is over the 32768-character rich message limit.
+_report_rich() {
+    local _r
+    if [ -n "$2" ] && [ -n "$3" ]; then
+        _r="$(printf '%s\n' "${1%%"$2"*}" | _report_rich_convert 1)${3}$(printf '%s\n' "${1#*"$2"}" | _report_rich_convert 0)"
+    else
+        _r=$(printf '%s\n' "$1" | _report_rich_convert 1)
+    fi
+    [ "$(_report_len "$_r")" -le 32000 ] || return 0
+    printf '%s' "$_r"
 }
 
 # _report_link_stats WINDOW_SECONDS — bot channel stats from ROUTE_LOG: changes
@@ -5942,6 +6088,9 @@ send_weekly_report() {
         "$([ "$_bc" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_ram_al" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_dr_en" = "1" ] && echo "вкл." || echo "выкл.")")"
+    REPORT_RICH_HTML=""
+    [ "$(_report_style)" = "rich" ] && \
+        REPORT_RICH_HTML=$(_report_rich "$_text" "$_w_secs" "$(_report_sections_block "$_proxies" "$_sec" 10 rich)")
     _text=$(_report_fit "$_text" "$_w_secs" "$_proxies" "$_sec")
 
     local _wr_kb _wr_delivered=0
@@ -5958,6 +6107,7 @@ send_weekly_report() {
     else
         send_to_all_admins "$_text" "$_wr_kb" && _wr_delivered=1
     fi
+    REPORT_RICH_HTML=""
 
     # Only a delivered scheduled report advances the weekly window. On the
     # weekly day it also closes the skipped Daily window in the same UCI commit.
@@ -6275,6 +6425,9 @@ send_daily_report() {
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' \
         "$(html_escape "$_cur_tier")")"
     [ -n "$_tier_chain" ] && _text="${_text}${_tier_chain}"
+    REPORT_RICH_HTML=""
+    [ "$(_report_style)" = "rich" ] && \
+        REPORT_RICH_HTML=$(_report_rich "$_text" "$_secs_block" "$(_report_sections_block "$_proxies" "$_sec" 10 rich)")
     _text=$(_report_fit "$_text" "$_secs_block" "$_proxies" "$_sec")
 
     local _dr_kb _dr_delivered=0
@@ -6288,6 +6441,7 @@ send_daily_report() {
     else
         send_to_all_admins "$_text" "$_dr_kb" && _dr_delivered=1
     fi
+    REPORT_RICH_HTML=""
     if [ "$_dr_mode" = "scheduled" ] && [ "$_dr_delivered" -eq 1 ] && [ -s "$TRAFFIC_ACCUM_FILE" ]; then
         _traffic_persist_after_report daily "$_cur_banked_dl" "$_cur_banked_ul" || \
             logger -t podkop-bot "[Traffic] Failed to persist daily UCI baseline/checkpoint."
@@ -16906,17 +17060,18 @@ EOF
             _n_wrt=$(uci -q get podkop_bot.settings.weekly_report_time || echo "09:00")
             _n_usw=$(uci -q get podkop_bot.settings.urltest_switch_notify || echo "1")
             _n_lam=$(_link_alert_mode_label "$(_link_alert_mode)")
+            local _n_rs; [ "$(_report_style)" = "rich" ] && _n_rs="таблицы" || _n_rs="классический"
             _n_wdn=$(case "$_n_wrd" in 1)echo пн;;2)echo вт;;3)echo ср;;4)echo чт;;5)echo пт;;6)echo сб;;*)echo вс;;esac)
             for _v in st al bc ram qh dr wr usw; do
                 eval "[ \"\$_n_${_v}\" = \"1\" ] && _i_${_v}=\"\$E_ON\" || _i_${_v}=\"\$E_OFF\""
             done
             [ "$_n_al" != "1" ] && _n_note=$(printf '\n\n%s <i>«Сообщать о сбоях» выключено — это общий выключатель: пока он выключен, не приходят ни сбои, ни сводки, ни переключения URLTest. Отчёты и сообщение о запуске работают отдельно.</i>' "$E_WARN")
-            send_or_edit "$mid" "$(printf '🔔 <b>Уведомления</b>\n<code>────────────────────</code>\n<b>Сбои:</b> %s · <b>связь и sing-box:</b> %s\n<b>Режим тишины:</b> %s (<code>%s–%s</code>)\n<b>Ежедневный отчёт:</b> %s (<code>%s</code>)\n<b>Еженедельный отчёт:</b> %s (<code>%s %s</code>)%s' \
+            send_or_edit "$mid" "$(printf '🔔 <b>Уведомления</b>\n<code>────────────────────</code>\n<b>Сбои:</b> %s · <b>связь и sing-box:</b> %s\n<b>Режим тишины:</b> %s (<code>%s–%s</code>)\n<b>Ежедневный отчёт:</b> %s (<code>%s</code>)\n<b>Еженедельный отчёт:</b> %s (<code>%s %s</code>)\n<b>Вид отчётов:</b> %s%s' \
                 "$( [ "$_n_al" = "1" ] && echo "вкл" || echo "выкл")" "$_n_lam" \
                 "$( [ "$_n_qh" = "1" ] && echo "вкл" || echo "выкл")" "$_n_qf" "$_n_qt" \
                 "$( [ "$_n_dr" = "1" ] && echo "вкл" || echo "выкл")" "$_n_drt" \
-                "$( [ "$_n_wr" = "1" ] && echo "вкл" || echo "выкл")" "$_n_wdn" "$_n_wrt" "$_n_note")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${_i_al} Сообщать о сбоях\",\"callback_data\":\"toggle_bot_al\"},{\"text\":\"${_i_st} О запуске\",\"callback_data\":\"toggle_bot_st\"}],[{\"text\":\"🔗 Связь и sing-box: ${_n_lam}\",\"callback_data\":\"link_alert_menu\"}],[{\"text\":\"${_i_usw} Переключения URLTest\",\"callback_data\":\"toggle_urltest_switch_notify\"},{\"text\":\"${_i_ram} Контроль памяти\",\"callback_data\":\"toggle_ram_alert\"}],[{\"text\":\"${_i_bc} Уведомлять всех админов\",\"callback_data\":\"toggle_broadcast_alerts\"}],[{\"text\":\"${_i_qh} Режим тишины\",\"callback_data\":\"toggle_quiet_hours\"},{\"text\":\"⏰ ${_n_qf}–${_n_qt}\",\"callback_data\":\"cmd_set_quiet_hours\"}],[{\"text\":\"${_i_dr} Ежедневный отчёт\",\"callback_data\":\"toggle_daily_report\"},{\"text\":\"⏰ ${_n_drt}\",\"callback_data\":\"cmd_set_dr_time\"}],[{\"text\":\"${_i_wr} Еженедельный отчёт\",\"callback_data\":\"toggle_weekly_report\"},{\"text\":\"⏰ ${_n_wdn} ${_n_wrt}\",\"callback_data\":\"cmd_set_wr\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+                "$( [ "$_n_wr" = "1" ] && echo "вкл" || echo "выкл")" "$_n_wdn" "$_n_wrt" "$_n_rs" "$_n_note")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${_i_al} Сообщать о сбоях\",\"callback_data\":\"toggle_bot_al\"},{\"text\":\"${_i_st} О запуске\",\"callback_data\":\"toggle_bot_st\"}],[{\"text\":\"🔗 Связь и sing-box: ${_n_lam}\",\"callback_data\":\"link_alert_menu\"}],[{\"text\":\"${_i_usw} Переключения URLTest\",\"callback_data\":\"toggle_urltest_switch_notify\"},{\"text\":\"${_i_ram} Контроль памяти\",\"callback_data\":\"toggle_ram_alert\"}],[{\"text\":\"${_i_bc} Уведомлять всех админов\",\"callback_data\":\"toggle_broadcast_alerts\"}],[{\"text\":\"${_i_qh} Режим тишины\",\"callback_data\":\"toggle_quiet_hours\"},{\"text\":\"⏰ ${_n_qf}–${_n_qt}\",\"callback_data\":\"cmd_set_quiet_hours\"}],[{\"text\":\"${_i_dr} Ежедневный отчёт\",\"callback_data\":\"toggle_daily_report\"},{\"text\":\"⏰ ${_n_drt}\",\"callback_data\":\"cmd_set_dr_time\"}],[{\"text\":\"${_i_wr} Еженедельный отчёт\",\"callback_data\":\"toggle_weekly_report\"},{\"text\":\"⏰ ${_n_wdn} ${_n_wrt}\",\"callback_data\":\"cmd_set_wr\"}],[{\"text\":\"🎨 Вид отчётов: ${_n_rs}\",\"callback_data\":\"toggle_report_style\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             ;;
         "link_alert_menu")
             local _lam _l_all _l_smart _l_crit _l_off _al_note=""
@@ -16961,6 +17116,17 @@ EOF
             ;;
         "toggle_daily_report") toggle_uci_bool "podkop_bot.settings" "daily_report"; _handle_bot "notify_menu" "$mid" "" "" ;;
         "toggle_weekly_report") toggle_uci_bool "podkop_bot.settings" "weekly_report"; _handle_bot "notify_menu" "$mid" "" "" ;;
+        "toggle_report_style")
+            if [ "$(_report_style)" = "rich" ]; then
+                uci set podkop_bot.settings.report_style="classic"
+                CB_ANSWER_TEXT="Отчёты: классический вид"
+            else
+                uci set podkop_bot.settings.report_style="rich"
+                CB_ANSWER_TEXT="Отчёты: таблицы. Если Telegram их не примет — придёт классический вид"
+            fi
+            uci_commit_safe podkop_bot
+            _handle_bot "notify_menu" "$mid" "" ""
+            ;;
         "cmd_set_wr")
             local _wr_day_cur _wr_time_cur
             _wr_day_cur=$(uci -q get podkop_bot.settings.weekly_report_day || echo "7")
