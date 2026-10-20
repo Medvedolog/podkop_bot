@@ -5363,17 +5363,152 @@ _report_channels_block() {
     printf '%s' "$_out"
 }
 
-# _report_sections_block PROXIES_JSON ACTIVE_SECTION — every section: mode,
-# local mixed-proxy address with Telegram latency through it (follower probe)
-# and the outbound it is on now. Needs _load_transport_ctx (_t_all_secs).
+# Telegram counts the text in characters, not bytes (Cyrillic is two bytes a
+# letter). Measured on the raw HTML, so tags make it an overestimate.
+_report_len() {
+    local _n
+    _n=$(printf '%s' "$1" | jq -Rrs 'length' 2>/dev/null)
+    case "$_n" in ''|*[!0-9]*) _n=${#1} ;; esac
+    printf '%s' "$_n"
+}
+
+# Subscription URL for a report: host and plain path words (api, v1, sub) stay,
+# every other segment (tokens, UUIDs, ids) becomes "…", and so does the query;
+# credentials and the fragment are dropped.
+_report_mask_sub_url() {
+    printf '%s' "$1" | awk '{
+        u = $0; sub(/#.*/, "", u); q = ""
+        i = index(u, "?"); if (i) { u = substr(u, 1, i - 1); q = "?…" }
+        sch = ""
+        if (match(u, /^[A-Za-z][A-Za-z0-9+.-]*:\/\//)) { sch = substr(u, 1, RLENGTH); u = substr(u, RLENGTH + 1) }
+        h = u; pth = ""; i = index(u, "/"); if (i) { h = substr(u, 1, i - 1); pth = substr(u, i) }
+        n = split(h, hp, "@"); h = hp[n]
+        out = ""; m = split(pth, sg, "/")
+        for (k = 2; k <= m; k++) {
+            t = sg[k]
+            if (t != "" && !(t ~ /^[A-Za-z._-]+$/ && length(t) <= 12) && t !~ /^v[0-9]$/) t = "…"
+            out = out "/" t
+        }
+        printf "%s%s%s%s", sch, h, out, q
+    }'
+}
+
+# Proxy link for a report: scheme, server:port and the #name only — never the
+# UUID, password or query. Base64 forms (vmess, legacy ss) give no host:port.
+_report_mask_proxy_link() {
+    local _l="$1" _sch _sp _nm
+    _sch=${_l%%://*}; [ "$_sch" = "$_l" ] && _sch="?"
+    _sp=$(extract_server_port_from_uri "$_l")
+    printf '%s' "$_sp" | grep -Eq '^[][A-Za-z0-9.:-]+:[0-9]+$' || _sp=""
+    _nm=$(get_proxy_human_name_from_link "$_l" 2>/dev/null)
+    [ "${#_nm}" -gt 32 ] && _nm="$(printf '%s' "$_nm" | cut -c1-31)…"
+    printf '%s' "$_sch"
+    [ -n "$_sp" ] && printf ' · %s' "$_sp"
+    [ -n "$_nm" ] && printf ' · «%s»' "$_nm"
+    return 0
+}
+
+# Manual proxy links of any section, one per line.
+_report_section_links() {
+    local _s="$1" _key _raw _ucl _l
+    case "$(get_section_type "$_s" 2>/dev/null)" in
+        proxy:url) get_url_proxy_links "$_s" 2>/dev/null; return 0 ;;
+        proxy:selector_text|proxy:urltest_text) get_text_proxy_links "$_s" 2>/dev/null; return 0 ;;
+        proxy:urltest) _key=urltest_proxy_links ;;
+        proxy:*) _key=selector_proxy_links ;;
+        *) return 0 ;;
+    esac
+    _raw=$(uci -q show "${PODKOP_UCI}.${_s}.${_key}" 2>/dev/null | cut -d= -f2-)
+    [ -n "$_raw" ] || return 0
+    { _ucl=$(uci_list_clean "$_raw"); eval "set -- $_ucl"; }
+    for _l in "$@"; do printf '%s\n' "$_l"; done
+}
+
+# _report_section_sources SECTION MAX — subscriptions (with Plus traffic/expiry
+# per URL) and manual links of a section, masked; at most MAX of each are
+# listed, the rest only counted. MAX=0 prints the counts alone.
+_report_section_sources() {
+    local _s="$1" _max="${2:-3}" _out="" _urls _links _cnt _i=0 _l _smj="" _m _meta _warn _exp _days _used _tot _pct _now
+    if section_is_subscription "$_s" 2>/dev/null; then
+        _urls=$(get_subscription_urls "$_s" 2>/dev/null | grep -v '^[[:space:]]*$')
+        _cnt=$(printf '%s\n' "$_urls" | grep -c .)
+        _variant_is_plus_like && _smj=$(_plus_sub_metadata "$_s" 2>/dev/null)
+        _now=$(date +%s)
+        _out=$(printf '\n   📡 подписок: <code>%s</code>' "$_cnt")
+        while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            _meta=""; _warn=""
+            if [ -n "$_smj" ] && [ "$_smj" != "null" ]; then
+                _m=$(printf '%s' "$_smj" | jq -c --argjson i "$_i" '[.[$i] // empty]' 2>/dev/null)
+                if [ -n "$_m" ] && [ "$_m" != "[]" ]; then
+                    _meta=$(_plus_format_sub_meta "$_m")
+                    _exp=$(printf '%s' "$_m" | jq -r '.[0].expire // 0' 2>/dev/null)
+                    case "$_exp" in ''|*[!0-9]*) _exp=0 ;; esac
+                    if [ "$_exp" -gt 0 ]; then
+                        _days=$(( (_exp - _now) / 86400 ))
+                        if [ "$_exp" -le "$_now" ]; then _warn=" ⚠️ <b>истекла</b>"
+                        elif [ "$_days" -lt 7 ]; then _warn=" ⚠️ <b>истекает через ${_days} дн.</b>"; fi
+                    fi
+                    _used=$(printf '%s' "$_m" | jq -r '.[0].traffic.used // 0' 2>/dev/null)
+                    _tot=$(printf '%s' "$_m" | jq -r 'if .[0].traffic.isUnlimited then 0 else (.[0].traffic.total // 0) end' 2>/dev/null)
+                    case "$_used" in ''|*[!0-9]*) _used=0 ;; esac
+                    case "$_tot" in ''|*[!0-9]*) _tot=0 ;; esac
+                    if [ "$_tot" -gt 0 ]; then
+                        _pct=$(awk -v u="$_used" -v t="$_tot" 'BEGIN{printf "%d", (u*100)/t}')
+                        [ "${_pct:-0}" -ge 80 ] 2>/dev/null && _warn="${_warn} ⚠️ <b>трафик ${_pct}%</b>"
+                    fi
+                fi
+            fi
+            _i=$((_i + 1))
+            if [ "$_i" -le "$_max" ]; then
+                _out="${_out}$(printf '\n   <code>%s</code>%s%s' "$(html_escape "$(_report_mask_sub_url "$_l")")" \
+                    "${_meta:+ · $(html_escape "$_meta")}" "$_warn")"
+            elif [ -n "$_warn" ]; then
+                # A warning is never hidden behind the cap.
+                _out="${_out}$(printf '\n   №%s%s' "$_i" "$_warn")"
+            fi
+        done <<EOF
+$_urls
+EOF
+        [ "$_cnt" -gt "$_max" ] && [ "$_max" -gt 0 ] && _out="${_out}$(printf '\n   <i>…ещё %s</i>' "$((_cnt - _max))")"
+    fi
+    _links=$(_report_section_links "$_s" | grep -v '^[[:space:]]*$')
+    if [ -n "$_links" ]; then
+        _cnt=$(printf '%s\n' "$_links" | grep -c .)
+        _out="${_out}$(printf '\n   🔗 ссылок: <code>%s</code>' "$_cnt")"
+        if [ "$_max" -gt 0 ]; then
+            _out="${_out}$(printf '%s\n' "$_links" | head -n "$_max" | while IFS= read -r _l; do
+                printf '\n   <code>%s</code>' "$(html_escape "$(_report_mask_proxy_link "$_l")")"
+            done)"
+            [ "$_cnt" -gt "$_max" ] && _out="${_out}$(printf '\n   <i>…ещё %s</i>' "$((_cnt - _max))")"
+        fi
+    fi
+    printf '%s' "$_out"
+}
+
+# _report_fit TEXT SECTIONS_BLOCK PROXIES_JSON ACTIVE_SECTION — sendMessage
+# rejects a text over 4096 characters outright, so when the report is too long
+# the sections block is swapped for its counts-only form.
+_report_fit() {
+    if [ -n "$2" ] && [ "$(_report_len "$1")" -gt 4000 ]; then
+        printf '%s%s%s' "${1%%"$2"*}" "$(_report_sections_block "$3" "$4" 0)" "${1#*"$2"}"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# _report_sections_block PROXIES_JSON ACTIVE_SECTION [MAX] — every section:
+# mode, local mixed-proxy address with Telegram latency through it (follower
+# probe), the outbound it is on now, and its subscriptions and links (see
+# _report_section_sources; MAX defaults to 3). Needs _load_transport_ctx.
 _report_sections_block() {
-    local _proxies="$1" _sec="$2" _out="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
+    local _proxies="$1" _sec="$2" _max="${3:-3}" _out="" _s _s_en _s_type _s_mode _s_me _s_mp _s_ip _s_lat _s_line _s_sel _s_now _s_leaf _s_delay
     for _s in $_t_all_secs; do
         _s_en=$(uci -q get "${PODKOP_UCI}.${_s}.enabled" 2>/dev/null); [ -z "$_s_en" ] && _s_en=1
         _s_type=$(get_section_type "$_s" 2>/dev/null || echo "?")
         _s_mode=$(section_mode_label "$_s_type")
         if [ "$_s_en" != "1" ]; then
-            _out="${_out}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")"
+            _out="${_out}$(printf '\n⚪ <code>%s</code> · %s · отключена' "$(html_escape "$_s")" "$(html_escape "$_s_mode")")$(_report_section_sources "$_s" "$_max")"
             continue
         fi
         _s_line=$(printf '\n%s <code>%s</code> · %s' "$( [ "$_s" = "$_sec" ] && echo "▶" || echo "🟢")" "$(html_escape "$_s")" "$(html_escape "$_s_mode")")
@@ -5400,7 +5535,7 @@ _report_sections_block() {
                 _s_line="${_s_line}$(printf '\n   прокси: <code>%s</code>%s' "$(html_escape "$(display_proxy_name "$_s_leaf" 2>/dev/null || echo "$_s_leaf")")" "${_s_delay:+ · ${_s_delay} мс}")"
             fi
         fi
-        _out="${_out}${_s_line}"
+        _out="${_out}${_s_line}$(_report_section_sources "$_s" "$_max")"
     done
     printf '%s' "$_out"
 }
@@ -5723,36 +5858,6 @@ send_weekly_report() {
         _traffic_note=" NODATA"
     fi
 
-    # ── Подписка Plus ─────────────────────────────────────────────────────────
-    local _sub_block=""
-    if _variant_is_plus_like && section_is_subscription "$_sec" 2>/dev/null; then
-        # Use _plus_sub_metadata (reads section-cache, no CLI spawn)
-        local _smj; _smj=$(_plus_sub_metadata "$_sec" 2>/dev/null)
-        local _sub_meta_str; _sub_meta_str=$(_plus_format_sub_meta "$_smj")
-        local _sub_warn=""
-        if [ -n "$_smj" ] && [ "$_smj" != "null" ]; then
-            # expire_days from epoch timestamp
-            local _exp_ts _sub_exp_days
-            _exp_ts=$(printf '%s' "$_smj" | jq -r '.[0].expire // 0' 2>/dev/null || echo 0)
-            if [ "${_exp_ts:-0}" -gt 0 ] 2>/dev/null; then
-                _sub_exp_days=$(( (_exp_ts - $(date +%s)) / 86400 ))
-                [ "$_sub_exp_days" -lt 7 ] 2>/dev/null && \
-                    _sub_warn=" ⚠️ <b>Истекает через ${_sub_exp_days} дн.</b>"
-            fi
-            # traffic_pct from used/total
-            local _tr_used _tr_total _sub_pct
-            _tr_used=$(printf '%s' "$_smj" | jq -r '.[0].traffic.used // 0' 2>/dev/null || echo 0)
-            _tr_total=$(printf '%s' "$_smj" | jq -r '.[0].traffic.total // 0' 2>/dev/null || echo 0)
-            if [ "${_tr_total:-0}" -gt 0 ] 2>/dev/null; then
-                _sub_pct=$(awk -v u="$_tr_used" -v t="$_tr_total" 'BEGIN{printf "%d", (u*100)/t}')
-                [ "${_sub_pct:-0}" -ge 80 ] 2>/dev/null && \
-                    _sub_warn="${_sub_warn} ⚠️ <b>Использовано ${_sub_pct}% трафика</b>"
-            fi
-        fi
-        [ -n "$_sub_meta_str" ] && _sub_block="$(printf '\n\n📡 <b>Подписка</b>\n📊 %s%s' \
-            "$_sub_meta_str" "${_sub_warn:-}")"
-    fi
-
     # ── Конфигурация бота snapshot ───────────────────────────────────────────────────
     local _hi _qh_en _qh_fr _qh_to _bc _ram_al _dr_en _cur_tier
     _hi=$(uci -q get podkop_bot.settings.health_interval || echo 60)
@@ -5830,8 +5935,6 @@ send_weekly_report() {
     local _w_secs; _load_transport_ctx; _w_secs=$(_report_sections_block "$_proxies" "$_sec")
     [ -n "$_w_secs" ] && _text="${_text}$(printf '\n\n🧩 <b>Секции</b>')${_w_secs}"
 
-    [ -n "$_sub_block" ] && _text="${_text}${_sub_block}"
-
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' "$(html_escape "$_cur_tier")")$(_report_channels_block)"
 
     _text="${_text}$(printf '\n\n⚙️ <b>Настройки бота</b>\nИнтервал проверки: <code>%s с</code>\nУведомления о связи: <code>%s</code> · Режим тишины: <code>%s</code>\nРассылка уведомлений: <code>%s</code> · Контроль памяти: <code>%s</code>\nЕжедневный отчёт: <code>%s</code>' \
@@ -5839,6 +5942,7 @@ send_weekly_report() {
         "$([ "$_bc" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_ram_al" = "1" ] && echo "вкл." || echo "выкл.")" \
         "$([ "$_dr_en" = "1" ] && echo "вкл." || echo "выкл.")")"
+    _text=$(_report_fit "$_text" "$_w_secs" "$_proxies" "$_sec")
 
     local _wr_kb _wr_delivered=0
     _wr_kb="{\"inline_keyboard\":[[{\"text\":\"📊 Статус\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
@@ -6110,31 +6214,6 @@ send_daily_report() {
     _tier_chain=$(_report_channels_block)
     _secs_block=$(_report_sections_block "$_proxies" "$_sec")
 
-    # ── Подписка Plus ─────────────────────────────────────────────────────────
-    local _sub_block=""
-    if _variant_is_plus_like && section_is_subscription "$_sec"; then
-        local _sub_urls _sub_url_disp=""
-        _sub_urls=$(get_subscription_urls "$_sec" 2>/dev/null | head -1)
-        if [ -n "$_sub_urls" ]; then
-            # Strip secret params and credentials
-            _sub_url_disp=$(printf '%s' "$_sub_urls" | \
-                sed 's/[?&]\(token\|key\|pass\|secret\|auth\|password\|access\)[^&]*/…/g' | \
-                sed 's/:[^:@]*@/:**@/')
-            _sub_url_disp=$(html_escape "$_sub_url_disp")
-        fi
-        # Use file-first metadata (no binary spawn), CLI fallback inside helper
-        local _sub_meta_str=""
-        if _variant_is_plus_like; then
-            local _smj; _smj=$(_plus_sub_metadata "$_sec" 2>/dev/null)
-            [ -n "$_smj" ] && _sub_meta_str=$(_plus_format_sub_meta "$_smj")
-        fi
-        if [ -n "$_sub_url_disp" ] || [ -n "$_sub_meta_str" ]; then
-            _sub_block="$(printf '\n\n📋 <b>Подписка</b>')"
-            [ -n "$_sub_url_disp" ] && _sub_block="${_sub_block}$(printf '\n<code>%s</code>' "$_sub_url_disp")"
-            [ -n "$_sub_meta_str" ] && _sub_block="${_sub_block}$(printf '\n📊 %s' "$_sub_meta_str")"
-        fi
-    fi
-
     # ── Сборка ───────────────────────────────────────────────────────────────
     local _header
     _header="$(html_escape "$_hn")"
@@ -6196,8 +6275,7 @@ send_daily_report() {
     _text="${_text}$(printf '\n\n🤖 <b>Подключение бота</b>\nСпособ подключения: <code>%s</code>' \
         "$(html_escape "$_cur_tier")")"
     [ -n "$_tier_chain" ] && _text="${_text}${_tier_chain}"
-
-    [ -n "$_sub_block" ] && _text="${_text}${_sub_block}"
+    _text=$(_report_fit "$_text" "$_secs_block" "$_proxies" "$_sec")
 
     local _dr_kb _dr_delivered=0
     _dr_kb="{\"inline_keyboard\":[[{\"text\":\"📊 Статус\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
