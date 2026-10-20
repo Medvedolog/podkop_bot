@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.19.23
+
+- **REPORTS (every section's subscriptions and links):** daily and weekly reports showed subscription data only for the working section. The 🧩 Sections block now lists under each section, disabled ones included, its subscription URLs (with Plus/Forkop traffic and expiry per URL, expiry < 7 days / traffic ≥ 80% warnings, "expired" instead of a negative day count) and its manual proxy links, up to three of each. Everything is masked: a subscription URL keeps the host and plain path words, tokens/ids and the query become "…"; a proxy link shows only scheme, server:port and #name. A report that would exceed the 4096-character sendMessage limit falls back to counts. The separate active-section-only subscription blocks are gone.
+- **REPORTS (style switch):** new setting `report_style` — Bot settings → Уведомления → «🎨 Вид отчётов», also in LuCI. "Classic" is the previous HTML message; "tables" sends the report via Bot API 10.1 `sendRichMessage`: headings, bordered tables, a sections table (section, mode, current proxy, mixed address) and a collapsible list of subscriptions and links (up to 10 per section). No Premium needed. When Telegram rejects the rich message or rich edit, the classic text is sent; an unanswered request is a failure, so a report is never sent twice.
+
+---
 ## v0.19.22
 
 - **WARP RESCUE (Telegram by real IP):** field test on RAX3000Me — through the WARP SOCKS, `socks5h://` and `socks5://` both timed out at 15 s, while `socks5://` with `--resolve api.telegram.org:<Telegram IP>` answered in 0.5 s: the router resolver is podkop's (fake-IP / tunnel-only answers for listed domains) and the WARP SOCKS does not resolve the name usefully either. Every Telegram request through WARP (POLL/FAST tiers, sticky path, sendDocument, follower probe, latency, manual channel check) now goes `socks5://` + `--resolve` to a real Bot API IP (`TG_EMERGENCY_IPS`, refreshed via DoH).
