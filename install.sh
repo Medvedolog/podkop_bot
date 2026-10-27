@@ -1077,20 +1077,11 @@ detect_podkop_variant() {
 
     # Package-name signal (works when opkg/apk metadata is present)
     local _pkg_name=""
-    case "$PKG_MANAGER" in
-        apk)
-            apk info 2>/dev/null | grep -qE '^forkop$'  && _pkg_name="forkop"
-            [ -z "$_pkg_name" ] && apk info 2>/dev/null | grep -qE '^podkop-plus$'  && _pkg_name="plus"
-            [ -z "$_pkg_name" ] && apk info 2>/dev/null | grep -qE '^podkop-evolution$' && _pkg_name="evolution"
-            [ -z "$_pkg_name" ] && apk info 2>/dev/null | grep -qE '^netshift$'  && _pkg_name="netshift"
-            ;;
-        opkg)
-            opkg list-installed 2>/dev/null | grep -qE '^forkop '  && _pkg_name="forkop"
-            [ -z "$_pkg_name" ] && opkg list-installed 2>/dev/null | grep -qE '^podkop-plus '  && _pkg_name="plus"
-            [ -z "$_pkg_name" ] && opkg list-installed 2>/dev/null | grep -qE '^podkop-evolution ' && _pkg_name="evolution"
-            [ -z "$_pkg_name" ] && opkg list-installed 2>/dev/null | grep -qE '^netshift '  && _pkg_name="netshift"
-            ;;
-    esac
+    if _pkg_has forkop; then _pkg_name="forkop"
+    elif _pkg_has podkop-plus; then _pkg_name="plus"
+    elif _pkg_has podkop-evolution; then _pkg_name="evolution"
+    elif _pkg_has netshift; then _pkg_name="netshift"
+    fi
     if [ -n "$_pkg_name" ]; then
         printf '%s' "$_pkg_name"
         return
@@ -1479,7 +1470,9 @@ _get_socks_endpoints() {
                 ""|0.0.0.0|::|"[::]") _lan_ip="" ;;
             esac
         fi
-        [ -z "$_lan_ip" ] && _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+        # OpenWrt 25.12 keeps ipaddr in CIDR form ("192.168.1.1/24"): drop the mask.
+        [ -z "$_lan_ip" ] && _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+        [ -z "$_lan_ip" ] && _lan_ip="192.168.1.1"
         _results="socks5h://${_lan_ip}:${_port}"
     fi
 
@@ -2091,6 +2084,33 @@ else
     unset _ver _major
 fi
 
+# The installed-package list is read once per run. Every `apk info NAME` /
+# `opkg list-installed` re-reads the whole package database (about a second on
+# a router), and variant + version detection used to run ten of them on every
+# LuCI page open (`--action status`). _PKG_DB holds "name version" lines.
+_PKG_DB=""
+case "$PKG_MANAGER" in
+    apk)  [ -r /lib/apk/db/installed ] && \
+              _PKG_DB=$(awk '/^P:/{p=substr($0,3)} /^V:/{print p, substr($0,3)}' /lib/apk/db/installed 2>/dev/null) ;;
+    opkg) _PKG_DB=$(opkg list-installed 2>/dev/null | awk '{print $1, $3}') ;;
+esac
+# _pkg_has NAME / _pkg_ver NAME. apk without a readable database asks apk.
+# Versions keep the old shape: X.Y.Z on apk, the full opkg version on opkg.
+_pkg_has() {
+    if [ -n "$_PKG_DB" ]; then printf '%s\n' "$_PKG_DB" | grep -q "^$1 "; return; fi
+    [ "$PKG_MANAGER" = apk ] && apk info -e "$1" >/dev/null 2>&1
+}
+_pkg_ver() {
+    _pv=""
+    if [ -n "$_PKG_DB" ]; then
+        _pv=$(printf '%s\n' "$_PKG_DB" | awk -v n="$1" '$1 == n {print $2; exit}' | sed 's/^v//')
+    elif [ "$PKG_MANAGER" = apk ]; then
+        _pv=$(apk info "$1" 2>/dev/null)
+    fi
+    [ "$PKG_MANAGER" = apk ] && _pv=$(printf '%s' "$_pv" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    printf '%s' "$_pv"
+}
+
 OWRT_VERSION=$(grep '^VERSION_ID=' "$OS_RELEASE_FILE" 2>/dev/null | cut -d'"' -f2)
 echo ""
 info "$(msg owrt_version): ${OWRT_VERSION:-unknown}"
@@ -2105,16 +2125,9 @@ if [ -f "/usr/bin/podkop" ] || [ -f "/usr/sbin/podkop" ] || [ -f "/usr/bin/podko
 fi
 # Also check via package manager (covers cases where binary lives elsewhere)
 if [ "$PODKOP_OK" = "0" ]; then
-    case "$PKG_MANAGER" in
-        apk)  apk info podkop >/dev/null 2>&1 && PODKOP_OK=1
-              apk info forkop >/dev/null 2>&1 && PODKOP_OK=1
-              apk info podkop-plus >/dev/null 2>&1 && PODKOP_OK=1
-              apk info netshift >/dev/null 2>&1 && PODKOP_OK=1 ;;
-        opkg) opkg list-installed 2>/dev/null | grep -qE "^podkop " && PODKOP_OK=1
-              opkg list-installed 2>/dev/null | grep -qE "^forkop " && PODKOP_OK=1
-              opkg list-installed 2>/dev/null | grep -qE "^podkop-plus " && PODKOP_OK=1
-              opkg list-installed 2>/dev/null | grep -qE "^netshift " && PODKOP_OK=1 ;;
-    esac
+    for _p in podkop podkop-exp forkop podkop-plus netshift; do
+        _pkg_has "$_p" && { PODKOP_OK=1; break; }
+    done
 fi
 # Check UCI config exists (covers both legacy "podkop" and Plus's "podkop-plus")
 if [ "$PODKOP_OK" = "0" ]; then
@@ -2165,25 +2178,13 @@ else
         netshift) _pkg_name="netshift" ;;
         *)        _pkg_name="podkop" ;;
     esac
-    case "$PKG_MANAGER" in
-        apk)
-            PODKOP_VER=$(apk info "$_pkg_name" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            # fallbacks in case variant detection and package naming disagree
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info forkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop-plus 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info netshift 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            SINGBOX_VER=$(apk info sing-box 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            ;;
-        opkg)
-            PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^${_pkg_name} " | awk '{print $3}' | sed 's/^v//')
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^forkop " | awk '{print $3}' | sed 's/^v//')
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}' | sed 's/^v//')
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop-plus " | awk '{print $3}' | sed 's/^v//')
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^netshift " | awk '{print $3}' | sed 's/^v//')
-            SINGBOX_VER=$(opkg list-installed 2>/dev/null | grep "^sing-box " | awk '{print $3}' | sed 's/^v//')
-            ;;
-    esac
+    # fallbacks in case variant detection and package naming disagree;
+    # podkop-exp (Podkop 0.8 experimental) keeps the "podkop" UCI and service.
+    for _p in "$_pkg_name" podkop-exp forkop podkop podkop-plus netshift; do
+        PODKOP_VER=$(_pkg_ver "$_p")
+        [ -n "$PODKOP_VER" ] && break
+    done
+    SINGBOX_VER=$(_pkg_ver sing-box)
     ok "$(msg podkop_found)${PODKOP_VER:+ (v${PODKOP_VER})} — $(msg variant_word): $(variant_label "$PODKOP_VARIANT")"
     [ -n "$SINGBOX_VER" ] && info "sing-box: v${SINGBOX_VER}"
 fi
@@ -2238,7 +2239,7 @@ if [ "$UNATTENDED" = "1" ] && { [ "$UA_ACTION" = "status" ] || [ "$UA_ACTION" = 
     # made both this installer and luci-app-podkop-bot report a running bot
     # when it was stopped. The bot runs as `/bin/sh /usr/bin/podkop_bot` (plus a
     # forked child); one live match suffices. Exclude the init wrapper/rc.common.
-    for _c in /proc/[0-9]*/cmdline; do
+    for _c in $(grep -l -s -F '/usr/bin/podkop_bot' /proc/[0-9]*/cmdline 2>/dev/null); do
         _cl=$(tr '\0' ' ' < "$_c" 2>/dev/null) || continue
         case "$_cl" in
             *"/etc/init.d/podkop_bot"*) continue ;;
