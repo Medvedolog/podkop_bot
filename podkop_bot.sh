@@ -620,10 +620,21 @@ UNAUTH_LOG="${BOT_DIR}/unauth_log" # ts|actor per attempt — daily report (last
 LAST_MENU_MSG_FILE="${BOT_DIR}/last_menu_msg"
 LAST_ALERT_MSG_FILE="${BOT_DIR}/last_alert_msg"
 
+# LAN IPv4 of the router for local SOCKS / Clash API addresses. OpenWrt 25.12
+# stores network.lan.ipaddr in CIDR form ("192.168.1.1/24", possibly a list), so
+# the raw value is not an address. Fails when there is none, so callers keep
+# their "|| echo default".
+lan_ipv4() {
+    local _ip
+    _ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+    [ -n "$_ip" ] || return 1
+    printf '%s\n' "$_ip"
+}
+
 # Dynamically resolve Clash API endpoint from sing-box config
 CLASH_API_ADDR=$(jq -r '.experimental.clash_api.external_controller // empty' ${SINGBOX_CONFIG_PATH} 2>/dev/null)
 if [ -z "$CLASH_API_ADDR" ]; then
-    ROUTER_IP=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
+    ROUTER_IP=$(lan_ipv4 || echo "127.0.0.1")
     CLASH_API_ADDR="${ROUTER_IP}:9090"
 fi
 CLASH_API="http://${CLASH_API_ADDR}"
@@ -1525,7 +1536,7 @@ _resolve_mixed_listen_ip_by_port() {
         ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
     fi
     case "$_ip" in
-        ""|0.0.0.0|::|"[::]") uci -q get network.lan.ipaddr 2>/dev/null || echo "127.0.0.1" ;;
+        ""|0.0.0.0|::|"[::]") lan_ipv4 || echo "127.0.0.1" ;;
         *) echo "$_ip" ;;
     esac
 }
@@ -1542,7 +1553,7 @@ get_proxy_ip() {
         ' "${SINGBOX_CONFIG_PATH}" 2>/dev/null)
         if [ -n "$sb_ip" ]; then
             if [ "$sb_ip" = "0.0.0.0" ] || [ "$sb_ip" = "::" ]; then
-                lan_ip=$(uci -q get network.lan.ipaddr)
+                lan_ip=$(lan_ipv4)
                 echo "${lan_ip:-127.0.0.1}"
             else
                 echo "$sb_ip"
@@ -1550,7 +1561,7 @@ get_proxy_ip() {
             return
         fi
     fi
-    lan_ip=$(uci -q get network.lan.ipaddr)
+    lan_ip=$(lan_ipv4)
     echo "${lan_ip:-127.0.0.1}"
 }
 
@@ -1738,7 +1749,7 @@ _load_transport_ctx() {
 
     _t_sec="$_primary_sec"
     _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
-    _t_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+    _t_ip=$(lan_ipv4 || echo "192.168.1.1")
     _t_auth=$(_mixed_proxy_auth "$_t_sec")
     # Resolve actual listen IP from config.json for tier1
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
@@ -6162,7 +6173,7 @@ send_daily_report() {
     _wan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
         | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
     [ -z "$_wan_ip" ] && _wan_ip=$(uci -q get network.wan.ipaddr 2>/dev/null || echo "?")
-    _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "?")
+    _lan_ip=$(lan_ipv4 || echo "?")
     _exit_ip=$(sed -n '2p' "$PUBIP_CACHE" 2>/dev/null || echo "?")
     _exit_cc=$(get_country_flag "$_exit_ip" 2>/dev/null || echo "")
     # TG статус из SOCKS_STATE_FILE — без новых curl-запросов
@@ -8735,7 +8746,7 @@ EOF
         "outbound_info")
             rm -f "$STATE_FILE"
             local luci_ip
-            luci_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+            luci_ip=$(lan_ipv4 || echo "192.168.1.1")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Режим JSON-прокси</b>\n\nЭтот режим требует редактирования исходного JSON sing-box.\nРедактирование JSON через Telegram небезопасно и не поддерживается ботом.\n\n<b>Используйте LuCI или консоль:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set ${PODKOP_UCI}.%s.outbound_json=...</code>\n\n<i>После изменения в LuCI или консоли нажмите в боте «Перезапустить Podkop».</i>' "$E_WARN" "$luci_ip" "$sec")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Перезапустить\",\"callback_data\":\"ask_reload_podkop\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
@@ -9183,7 +9194,7 @@ EOF
             case "$outbound_iface" in ''|auto) outbound_iface_disp="Автоматически"; outbound_iface_btn="авто" ;; *) outbound_iface_disp="$outbound_iface"; outbound_iface_btn="$outbound_iface" ;; esac
             case "$interval" in 1h) interval_disp="1 ч" ;; 6h) interval_disp="6 ч" ;; 12h) interval_disp="12 ч" ;; 1d) interval_disp="1 день" ;; 3d) interval_disp="3 дня" ;; *) interval_disp="$interval" ;; esac
             yacd_en=$(uci -q get ${PODKOP_UCI}.settings.enable_yacd || echo "0")
-            lan_ip=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
+            lan_ip=$(lan_ipv4 || echo "127.0.0.1")
 
             next_int="1h"
             [ "$interval" = "1h" ]  && next_int="6h"
@@ -15685,7 +15696,7 @@ EOF
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Роутер")
             os_ver=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "OpenWrt")
 
-            lan_ip=$(uci -q get network.lan.ipaddr || echo "Неизвестно")
+            lan_ip=$(lan_ipv4 || echo "Неизвестно")
             wan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
                 | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
             [ -z "$wan_ip" ] && wan_ip=$(uci -q get network.wan.ipaddr 2>/dev/null || echo "Неизвестно")
@@ -17704,7 +17715,7 @@ EOF
                 [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
             fi
             [ -z "$sb_ver" ] && sb_ver=$(get_singbox_version_display)
-            lan_ip=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
+            lan_ip=$(lan_ipv4 || echo "127.0.0.1")
             # Device model for Maintenance screen.
             # Prefer the FULL model string from /tmp/sysinfo/model (what Runtime
             # used to show), since the Plus CLI .device_model is often just the

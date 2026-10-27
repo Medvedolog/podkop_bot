@@ -1479,7 +1479,9 @@ _get_socks_endpoints() {
                 ""|0.0.0.0|::|"[::]") _lan_ip="" ;;
             esac
         fi
-        [ -z "$_lan_ip" ] && _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+        # OpenWrt 25.12 keeps ipaddr in CIDR form ("192.168.1.1/24"): drop the mask.
+        [ -z "$_lan_ip" ] && _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+        [ -z "$_lan_ip" ] && _lan_ip="192.168.1.1"
         _results="socks5h://${_lan_ip}:${_port}"
     fi
 
