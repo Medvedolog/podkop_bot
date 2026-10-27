@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.19.24
+
+- **FIXED (LAN address with a CIDR mask):** OpenWrt 25.12 stores `network.lan.ipaddr` as `192.168.1.1/24`. Where the sing-box config gave no listen address the bot used the raw value, so the mixed proxy became `socks5h://192.168.1.1/24:2080` and the Clash API fallback `192.168.1.1/24:9090`. Podkop 0.8 (podkop-exp) has sing-box built in and no `/etc/sing-box/config.json`, so it always hit this fallback. The LAN address is now the first `ipaddr` value without the mask.
+- **INSTALLER (`--action status`):** the installed-package list is read once per run instead of about ten `apk info` / `opkg list-installed` calls; podkop-exp is recognised for the Podkop version.
+
+---
 ## v0.19.23
 
 - **REPORTS (every section's subscriptions and links):** daily and weekly reports showed subscription data only for the working section. The 🧩 Sections block now lists under each section, disabled ones included, its subscription URLs (with Plus/Forkop traffic and expiry per URL, expiry < 7 days / traffic ≥ 80% warnings, "expired" instead of a negative day count) and its manual proxy links, up to three of each. Everything is masked: a subscription URL keeps the host and plain path words, tokens/ids and the query become "…"; a proxy link shows only scheme, server:port and #name. A report that would exceed the 4096-character sendMessage limit falls back to counts. The separate active-section-only subscription blocks are gone.
