@@ -986,6 +986,9 @@ links_add() {
         uci add_list "${PODKOP_UCI}.${_sec}.${_key}=${_link}"
         return
     fi
+    # Forkop 2 has one list: a URLTest takes the section's links, so a copy
+    # "into the URLTest list" would only duplicate them.
+    [ "$_key" = "selector_proxy_links" ] || return 1
     # Name: the decoded #fragment, else "Node #N"; no "/", unique among all the
     # section's children (links, URLTests, fallback groups, tunnels...).
     _name=$(get_proxy_human_name_from_link "$_link" 2>/dev/null | tr '/' '-' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -1010,6 +1013,7 @@ links_del() {
         uci del_list "${PODKOP_UCI}.${_sec}.${_key}=${_link}"
         return
     fi
+    [ "$_key" = "selector_proxy_links" ] || return 1
     _id=$(fk2_links "$_sec" | awk -F'|' -v u="$_link" '{ c = $1; sub(/^[^|]*\|[^|]*\|[^|]*\|/, "") } $0 == u { print c; exit }')
     [ -n "$_id" ] && uci delete "${PODKOP_UCI}.${_id}"
 }
