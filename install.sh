@@ -1414,6 +1414,33 @@ INITEOF
 # was always empty on any Plus install — first-time installs on Plus had
 # zero fallback transport if GitHub was blocked (fallback_socks doesn't
 # exist yet on a fresh install either).
+# Forkop 2.0 (forkop.settings.config_version 2.x) keeps a section's mixed proxy
+# as a `server` (protocol=mixed, routing_mode=section, routing_section=<section>,
+# listen_port, enabled) instead of the section's mixed_proxy_* options.
+_inst_fk2() {
+    [ "$1" = "forkop" ] || return 1
+    case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in 2.*|[3-9].*|[1-9][0-9].*) return 0 ;; esac
+    return 1
+}
+# _inst_mixed PKG SEC — "enabled|port" of the section's mixed proxy, either schema.
+_inst_mixed() {
+    if _inst_fk2 "$1"; then
+        uci -q show "$1" 2>/dev/null | awk -v p="$1." -v want="$2" '
+            { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+              sub("^" p, "", k); gsub(/\047/, "", v); dot = index(k, ".")
+              if (!dot) { if (v == "server") order[++n] = k; next }
+              opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v }
+            END { for (i = 1; i <= n; i++) { s = order[i]
+                if (opt[s SUBSEP "protocol"] != "mixed" || opt[s SUBSEP "routing_mode"] != "section" || opt[s SUBSEP "routing_section"] != want) continue
+                en = opt[s SUBSEP "enabled"]; if (en == "") en = "0"
+                line = en "|" opt[s SUBSEP "listen_port"]
+                if (en == "1") { print line; f = 1; exit } if (d == "") d = line }
+              if (!f) print (d != "" ? d : "0|") }'
+        return
+    fi
+    printf '%s|%s\n' "$(uci -q get "$1.$2.mixed_proxy_enabled" 2>/dev/null)" "$(uci -q get "$1.$2.mixed_proxy_port" 2>/dev/null)"
+}
+
 _get_socks_endpoints() {
     local _results=""
     local _pkg; _pkg=$(_podkop_uci_pkg)
@@ -1430,7 +1457,7 @@ _get_socks_endpoints() {
         | while IFS='=' read -r _k _v; do
             _s=$(printf '%s' "$_k" | cut -d. -f2)
             _ct=$(uci -q get "${_pkg}.${_s}.${_field_name}" 2>/dev/null)
-            _me=$(uci -q get "${_pkg}.${_s}.mixed_proxy_enabled" 2>/dev/null)
+            _me=$(_inst_mixed "$_pkg" "$_s" | cut -d'|' -f1)
             { [ "$_ct" = "proxy" ] || [ "$_ct" = "connection" ]; } && [ "$_me" = "1" ] && echo "$_s" && break
         done | head -1)
 
@@ -1445,13 +1472,13 @@ _get_socks_endpoints() {
             | while IFS='=' read -r _k _v; do
                 _s=$(printf '%s' "$_k" | cut -d. -f2)
                 _ct=$(uci -q get "${_pkg}.${_s}.${_other_field}" 2>/dev/null)
-                _me=$(uci -q get "${_pkg}.${_s}.mixed_proxy_enabled" 2>/dev/null)
+                _me=$(_inst_mixed "$_pkg" "$_s" | cut -d'|' -f1)
                 { [ "$_ct" = "proxy" ] || [ "$_ct" = "connection" ]; } && [ "$_me" = "1" ] && echo "$_s" && break
             done | head -1)
     fi
 
     if [ -n "$_primary_sec" ]; then
-        _port=$(uci -q get "${_pkg}.${_primary_sec}.mixed_proxy_port" 2>/dev/null || echo "2080")
+        _port=$(_inst_mixed "$_pkg" "$_primary_sec" | cut -d'|' -f2); [ -n "$_port" ] || _port="2080"
         # Resolve the actual listen address from sing-box's own config.json
         # (matches by listen_port) instead of trusting raw network.lan.ipaddr.
         # sing-box can be configured to listen on a different address via
@@ -3049,8 +3076,9 @@ _rec_mixed_sec=$(uci -q show "$_rec_pkg" 2>/dev/null \
 _rec_mixed_enabled=0
 _rec_mixed_port=""
 if [ -n "$_rec_mixed_sec" ]; then
-    [ "$(uci -q get "${_rec_pkg}.${_rec_mixed_sec}.mixed_proxy_enabled" 2>/dev/null)" = "1" ] && _rec_mixed_enabled=1
-    _rec_mixed_port=$(uci -q get "${_rec_pkg}.${_rec_mixed_sec}.mixed_proxy_port" 2>/dev/null)
+    _rec_mixed=$(_inst_mixed "$_rec_pkg" "$_rec_mixed_sec")
+    [ "${_rec_mixed%%|*}" = "1" ] && _rec_mixed_enabled=1
+    _rec_mixed_port="${_rec_mixed#*|}"
 fi
 
 _rec_yacd_enabled=0

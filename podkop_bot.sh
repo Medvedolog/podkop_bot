@@ -90,7 +90,10 @@ _forkop_display_name() {
     if [ -r /usr/share/forkop/mirror-migration.sh ]; then
         printf 'Forkop X'
     elif [ -r /usr/lib/forkop/singbox/servers.uc ] || uci -q show forkop 2>/dev/null | grep -q "\\.protocol='tailscale'$"; then
-        printf 'Forkop'
+        case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in
+            2.*|[3-9].*|[1-9][0-9].*) printf 'Forkop 2' ;;
+            *) printf 'Forkop' ;;
+        esac
     else
         printf 'Forkop X'
     fi
@@ -213,6 +216,32 @@ _plus_json() {
 _plus_sub_metadata() {
     local _sec="$1"
     _variant_is_plus_like || return 1
+    # Forkop 2 keeps no section cache and has no metadata command: each
+    # subscription is a sing-box provider "<section label>/<subscription tag>"
+    # whose subscriptionInfo the Clash API reports. One entry per subscription,
+    # in the order get_subscription_urls lists them; null where nothing is known.
+    if forkop_v2; then
+        local _tags _prov _c _u
+        _tags=$(for _c in $(forkop_subscription_children "$_sec"); do
+            _u=$(uci -q get "${PODKOP_UCI}.${_c}.url" 2>/dev/null); [ -n "$_u" ] || continue
+            uci -q get "${PODKOP_UCI}.${_c}.tag" 2>/dev/null || echo ""
+        done)
+        [ -n "$_tags" ] || return 1
+        _prov=$(clash_request "/providers/proxies" 2>/dev/null)
+        [ -n "$_prov" ] || return 1
+        printf '%s\n' "$_tags" | jq -Rn --arg l "$(section_clash_tag "$_sec")" --argjson p "$_prov" '
+            ($p.providers // $p) as $all
+            | [ inputs | ($all[$l + "/" + .] // null) as $pv
+                | if $pv == null then null else
+                    ($pv.subscriptionInfo // $pv.SubscriptionInfo // {}) as $i
+                    | (($i.upload // $i.Upload // 0) + ($i.download // $i.Download // 0)) as $used
+                    | ($i.total // $i.Total // 0) as $total
+                    | ($i.expire // $i.Expire // 0) as $exp
+                    | if ($used + $total + $exp) == 0 then null
+                      else { traffic: { used: $used, total: $total, isUnlimited: ($total <= 0) }, expire: $exp } end
+                  end ]' 2>/dev/null
+        return
+    fi
     local _cache_base="/var/run/podkop-plus"
     [ "$PODKOP_VARIANT" = "forkop" ] && _cache_base="/var/run/forkop"
     local _cache="${_cache_base}/section-cache/${_sec}.json"
@@ -270,7 +299,7 @@ _utf_postcheck_warn() {
     [ -z "$_proxies" ] && return 0
     # Resolve URLTest group OF THIS SECTION — not first selector globally.
     # Mirrors get_selector_tag: exact key → "<sec>-out" → startswith match.
-    _grp=$(printf '%s' "$_proxies" | jq -r --arg s "$_sec" '
+    _grp=$(printf '%s' "$_proxies" | jq -r --arg s "$(section_clash_tag "$_sec")" '
         (if .proxies[$s] then $s
          elif .proxies[$s + "-out"] then ($s + "-out")
          else (.proxies | to_entries
@@ -296,7 +325,7 @@ _utf_postcheck_warn() {
 # when multiple sections / URLTest groups are present in Clash API.
 _resolve_urltest_group_for_section() {
     local _sec="$1" _proxies="$2"
-    printf '%s' "$_proxies" | jq -r --arg s "$_sec" '
+    printf '%s' "$_proxies" | jq -r --arg s "$(section_clash_tag "$_sec")" '
       (if .proxies[$s] then $s
        elif .proxies[$s + "-out"] then ($s + "-out")
        else (.proxies | to_entries
@@ -323,7 +352,8 @@ set_section_action() {
         case "$_val" in
             proxy|outbound|vpn|connection) _val="connection" ;;
             direct|exclusion|bypass)       _val="bypass" ;;
-            block|zapret|zapret2|byedpi)   ;;  # as-is
+            block)                         ;;
+            zapret|zapret2|byedpi)         forkop_v2 && return 1 ;;  # gone in Forkop 2
             *) return 1 ;;
         esac
         uci set ${PODKOP_UCI}.${_sec}.action="$_val"
@@ -812,6 +842,214 @@ forkop_child_count() {
 forkop_subscription_children() { forkop_children_by_type_and_owner subscription_url "$1"; }
 forkop_urltest_children()      { forkop_children_by_type_and_owner urltest "$1"; }
 
+# ── Forkop 2 ─────────────────────────────────────────────────────────────────
+# Forkop 2.0 (forkop.settings.config_version 2.x) moved what the bot relies on:
+# - a section's mixed proxy is a `server` (protocol=mixed, routing_mode=section,
+#   routing_section=<section>, listen_port; accounts in `server_client`, server=
+#   <server>); the section options mixed_proxy_* are gone. A server is off unless
+#   enabled=1, and mixed_auth_enabled defaults to on;
+# - manual links are `connection_link` children (uri, name, order) instead of
+#   selector_proxy_links;
+# - Clash tags: a section's selector is its label (or its name), a link is
+#   "<label>/<name>", a subscription provider "<label>/<tag>".
+# Forkop 1.x, Forkop X and the other variants keep their own code paths.
+forkop_v2() {
+    [ "$PODKOP_VARIANT" = "forkop" ] || return 1
+    case "$(uci -q get "${PODKOP_UCI}.settings.config_version" 2>/dev/null)" in
+        2.*|[3-9].*|[1-9][0-9].*) return 0 ;;
+    esac
+    return 1
+}
+
+# section_clash_tag SECTION — the name the section's group has in the Clash API:
+# its label on Forkop 2 (else its name), the section name everywhere else.
+section_clash_tag() {
+    local _l
+    if forkop_v2; then
+        _l=$(uci -q get "${PODKOP_UCI}.$1.label" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$_l" ] && { printf '%s\n' "$_l"; return 0; }
+    fi
+    printf '%s\n' "$1"
+}
+
+# One UCI dump → "name|enabled|port|routing_mode|routing_section|auth|listen" per mixed server.
+fk2_mixed_servers() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+          sub("^" p, "", k); gsub(/\047/, "", v); dot = index(k, ".")
+          if (!dot) { if (v == "server") order[++n] = k; next }
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v }
+        END { for (i = 1; i <= n; i++) { s = order[i]
+            if (opt[s SUBSEP "protocol"] != "mixed") continue
+            en = opt[s SUBSEP "enabled"]; if (en == "") en = "0"
+            m = opt[s SUBSEP "routing_mode"]; if (m == "") m = "rules"
+            a = opt[s SUBSEP "mixed_auth_enabled"]; if (a == "") a = "1"
+            printf "%s|%s|%s|%s|%s|%s|%s\n", s, en, opt[s SUBSEP "listen_port"], m, opt[s SUBSEP "routing_section"], a, opt[s SUBSEP "listen"] } }'
+}
+
+# fk2_section_mixed SECTION — the mixed server routed to SECTION, an enabled one first.
+fk2_section_mixed() {
+    fk2_mixed_servers | awk -F'|' -v s="$1" '$4 == "section" && $5 == s { if ($2 == "1") { print; f = 1; exit } if (!d) d = $0 }
+        END { if (!f && d != "") print d }'
+}
+
+# Mixed proxy of a section, for every variant. sec_mixed_enabled prints 1/0 (Forkop 2) or
+# the raw option and fails when it is unset, so callers keep their "|| echo default".
+sec_mixed_enabled() {
+    if forkop_v2; then
+        case "$(fk2_section_mixed "$1" | cut -d'|' -f2)" in 1) echo 1 ;; *) echo 0 ;; esac
+        return 0
+    fi
+    uci -q get "${PODKOP_UCI}.$1.mixed_proxy_enabled" 2>/dev/null
+}
+sec_mixed_port() {
+    local _p
+    if forkop_v2; then
+        _p=$(fk2_section_mixed "$1" | cut -d'|' -f3)
+        [ -n "$_p" ] || return 1
+        echo "$_p"; return 0
+    fi
+    uci -q get "${PODKOP_UCI}.$1.mixed_proxy_port" 2>/dev/null
+}
+# Every mixed proxy port in use, one per line.
+mixed_used_ports() {
+    if forkop_v2; then
+        fk2_mixed_servers | cut -d'|' -f3 | grep -E '^[0-9]+$'
+        return 0
+    fi
+    uci -q show "${PODKOP_UCI}" 2>/dev/null | grep '\.mixed_proxy_port=' \
+        | sed "s/.*mixed_proxy_port='//;s/'$//" | grep -E '^[0-9]+$'
+}
+mixed_free_port() {
+    local _used _c=2080
+    _used=$(mixed_used_ports)
+    while printf '%s\n' "$_used" | grep -qx "$_c"; do _c=$((_c + 1)); done
+    echo "$_c"
+}
+# fk2_mixed_server_ensure SECTION — name of the section's mixed server, created
+# (disabled, no account) when it has none. Named and labelled as Forkop's own
+# migration names a section's mixed proxy.
+fk2_mixed_server_ensure() {
+    local _sec="$1" _srv _label
+    _srv=$(fk2_section_mixed "$_sec" | cut -d'|' -f1)
+    if [ -z "$_srv" ]; then
+        _srv="server_$(printf '%s' "$_sec" | tr -c 'A-Za-z0-9_\n' '_')_mixed"
+        _label=$(uci -q get "${PODKOP_UCI}.${_sec}.label" 2>/dev/null); [ -n "$_label" ] || _label="$_sec"
+        uci set "${PODKOP_UCI}.${_srv}=server" || return 1
+        uci set "${PODKOP_UCI}.${_srv}.label=${_label} - Mixed proxy"
+        uci set "${PODKOP_UCI}.${_srv}.enabled=0"
+        uci set "${PODKOP_UCI}.${_srv}.protocol=mixed"
+        uci set "${PODKOP_UCI}.${_srv}.listen=::"
+        uci set "${PODKOP_UCI}.${_srv}.open_firewall=0"
+        uci set "${PODKOP_UCI}.${_srv}.routing_mode=section"
+        uci set "${PODKOP_UCI}.${_srv}.routing_section=${_sec}"
+        uci set "${PODKOP_UCI}.${_srv}.mixed_auth_enabled=0"
+    fi
+    echo "$_srv"
+}
+# Forkop 2 manual links: "cfg|order|name|uri" per connection_link of SECTION,
+# in Forkop's order (option order, then section name).
+fk2_links() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." -v want="$1" '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+          sub("^" p, "", k); sub(/^\047/, "", v); sub(/\047$/, "", v); gsub(/\047\\\047\047/, "\047", v)
+          dot = index(k, ".")
+          if (!dot) { if (v == "connection_link") order[++n] = k; next }
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v }
+        END { for (i = 1; i <= n; i++) { c = order[i]
+            if (opt[c SUBSEP "section"] != want) continue
+            o = opt[c SUBSEP "order"]; if (o !~ /^-?[0-9]+$/) o = 0
+            nm = opt[c SUBSEP "name"]; gsub(/\|/, " ", nm)
+            printf "%s|%s|%s|%s\n", c, o, nm, opt[c SUBSEP "uri"] } }' \
+        | sort -t'|' -k2,2n -k1,1
+}
+
+# links_uci_show SECTION KEY — the section's manual link list as `uci show` prints
+# a list ("pkg.sec.key='a' 'b'"), so every reader (uci_list_clean + eval set --)
+# works unchanged on Forkop 2, where the links are connection_link children. A
+# Forkop 2 section has no urltest_proxy_links: URLTest takes the section's links.
+links_uci_show() {
+    if forkop_v2; then
+        [ "$2" = "selector_proxy_links" ] || return 1
+        fk2_links "$1" | cut -d'|' -f4- | awk -v k="${PODKOP_UCI}.$1.$2" '
+            NF { gsub(/\047/, "\047\\\047\047"); out = out (out == "" ? "" : " ") "\047" $0 "\047" }
+            END { if (out == "") exit 1; print k "=" out }'
+        return
+    fi
+    uci -q show "${PODKOP_UCI}.$1.$2" 2>/dev/null
+}
+
+# links_add SECTION KEY LINK / links_del SECTION KEY LINK — stage (no commit).
+links_add() {
+    local _sec="$1" _key="$2" _link="$3" _name _base _n=2 _order _id _taken
+    if ! forkop_v2; then
+        uci add_list "${PODKOP_UCI}.${_sec}.${_key}=${_link}"
+        return
+    fi
+    # Name: the decoded #fragment, else "Node #N"; no "/", unique among all the
+    # section's children (links, URLTests, fallback groups, tunnels...).
+    _name=$(get_proxy_human_name_from_link "$_link" 2>/dev/null | tr '/' '-' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$_name" ] || _name="Node #$(( $(fk2_links "$_sec" | grep -c .) + 1 ))"
+    _taken=$(uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." -v want="$_sec" '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1); sub("^" p, "", k)
+          sub(/^\047/, "", v); sub(/\047$/, "", v); dot = index(k, "."); if (!dot) next
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v; secs[substr(k, 1, dot - 1)] = 1 }
+        END { for (c in secs) if (opt[c SUBSEP "section"] == want && opt[c SUBSEP "name"] != "") print opt[c SUBSEP "name"] }')
+    _base="$_name"
+    while printf '%s\n' "$_taken" | grep -qxF "$_name"; do _name="${_base} ${_n}"; _n=$((_n + 1)); done
+    _order=$(fk2_links "$_sec" | awk -F'|' 'BEGIN { m = -1 } $2 > m { m = $2 } END { print m + 1 }')
+    _id=$(uci add "$PODKOP_UCI" connection_link) || return 1
+    uci set "${PODKOP_UCI}.${_id}.section=${_sec}"
+    uci set "${PODKOP_UCI}.${_id}.name=${_name}"
+    uci set "${PODKOP_UCI}.${_id}.uri=${_link}"
+    uci set "${PODKOP_UCI}.${_id}.order=${_order}"
+}
+links_del() {
+    local _sec="$1" _key="$2" _link="$3" _id
+    if ! forkop_v2; then
+        uci del_list "${PODKOP_UCI}.${_sec}.${_key}=${_link}"
+        return
+    fi
+    _id=$(fk2_links "$_sec" | awk -F'|' -v u="$_link" '{ c = $1; sub(/^[^|]*\|[^|]*\|[^|]*\|/, "") } $0 == u { print c; exit }')
+    [ -n "$_id" ] && uci delete "${PODKOP_UCI}.${_id}"
+}
+
+# sec_mixed_set_port SECTION PORT — stage the port (no commit).
+sec_mixed_set_port() {
+    local _srv
+    if forkop_v2; then
+        _srv=$(fk2_mixed_server_ensure "$1") || return 1
+        uci set "${PODKOP_UCI}.${_srv}.listen_port=$2"
+        return
+    fi
+    uci set "${PODKOP_UCI}.$1.mixed_proxy_port=$2"
+}
+# sec_mixed_toggle SECTION — switch the mixed proxy on (with a free port when it
+# has none) or off. Staged only; the caller commits through safe_reload_podkop.
+sec_mixed_toggle() {
+    local _sec="$1" _srv _port
+    if [ "$(sec_mixed_enabled "$_sec" || echo 0)" = "1" ]; then
+        if forkop_v2; then
+            _srv=$(fk2_section_mixed "$_sec" | cut -d'|' -f1)
+            [ -n "$_srv" ] && uci set "${PODKOP_UCI}.${_srv}.enabled=0"
+        else
+            uci set "${PODKOP_UCI}.${_sec}.mixed_proxy_enabled=0"
+        fi
+        return 0
+    fi
+    if [ -z "$(sec_mixed_port "$_sec")" ]; then
+        _port=$(mixed_free_port)
+        sec_mixed_set_port "$_sec" "$_port" || return 1
+        logger -t podkop-bot "[Config] Auto-set mixed proxy port ${_port} for section ${_sec}"
+    fi
+    if forkop_v2; then
+        _srv=$(fk2_mixed_server_ensure "$_sec") || return 1
+        uci set "${PODKOP_UCI}.${_srv}.enabled=1"
+    else
+        uci set "${PODKOP_UCI}.${_sec}.mixed_proxy_enabled=1"
+    fi
+}
+
 # section_urltest_enabled: variant-aware "is this section in URLTest mode?".
 # Forkop stores URLTest as a child section (config urltest), not a parent flag,
 # so a direct urltest_enabled read would wrongly show Selector on Forkop.
@@ -1119,6 +1357,8 @@ section_display_kind() {
 
 # section_has_links: true when proxy links are manually managed (not subscription)
 section_has_links() {
+    # Forkop 2 runs links and subscriptions side by side in one section.
+    forkop_v2 && { section_is_proxy "$1"; return; }
     section_is_subscription "$1" && return 1
     section_is_proxy "$1"
 }
@@ -1544,7 +1784,7 @@ _resolve_mixed_listen_ip_by_port() {
 get_proxy_ip() {
     local m_port sb_ip lan_ip sec
     sec=$(get_active_section)
-    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
+    m_port=$(sec_mixed_port "${sec}" || echo "2080")
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
         sb_ip=$(jq -r --arg p "$m_port" '
             [.inbounds[]? | select(.listen_port==($p|tonumber))] as $m
@@ -1686,7 +1926,7 @@ _resolve_primary_section() {
         _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
         [ -z "$_en" ] && _en=1
         [ "$_en" = "1" ] || continue
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
+        _me=$(sec_mixed_enabled "${_s}" || echo "1")
         if [ "$_me" = "1" ]; then
             _sec="$_s"
             break
@@ -1748,9 +1988,23 @@ _load_transport_ctx() {
     local _primary_sec; _primary_sec=$(_resolve_primary_section "$_t_all_secs")
 
     _t_sec="$_primary_sec"
-    _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
+    _t_port=$(sec_mixed_port "${_t_sec}" || echo "2080")
     _t_ip=$(lan_ipv4 || echo "192.168.1.1")
     _t_auth=$(_mixed_proxy_auth "$_t_sec")
+    # Forkop 2 without a mixed server of the section: a mixed server routed by the
+    # rules (routing_mode=rules, the default) reaches Telegram the way LAN clients do.
+    if forkop_v2 && [ -z "$(fk2_section_mixed "$_t_sec")" ]; then
+        local _rl _ra
+        _rl=$(fk2_mixed_servers | awk -F'|' '$2 == "1" && $4 == "rules" && $3 != "" { print; exit }')
+        if [ -n "$_rl" ]; then
+            _t_port=$(printf '%s' "$_rl" | cut -d'|' -f3)
+            _t_auth=""
+            if [ "$(printf '%s' "$_rl" | cut -d'|' -f6)" = "1" ]; then
+                _ra=$(fk2_server_account "${_rl%%|*}")
+                [ -n "$_ra" ] && _t_auth="$(_url_encode_cred "${_ra%%|*}"):$(_url_encode_cred "${_ra#*|}")@"
+            fi
+        fi
+    fi
     # Resolve actual listen IP from config.json for tier1
     if [ -f "${SINGBOX_CONFIG_PATH}" ]; then
         local _sb_ip
@@ -1786,8 +2040,8 @@ _load_transport_ctx() {
     for _s in $_t_all_secs; do
         [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
         local _me _mp _ct
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
+        _me=$(sec_mixed_enabled "${_s}" || echo "0")
+        _mp=$(sec_mixed_port "${_s}" || echo "")
         [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
         local _fb_ip; _fb_ip=$(_resolve_mixed_listen_ip_by_port "$_mp")
         local _fb_auth; _fb_auth=$(_mixed_proxy_auth "$_s")
@@ -1825,9 +2079,31 @@ _url_encode_cred() {
         else printf "%%%02X", ord[c] } }'
 }
 
+# fk2_server_account SERVER — "name|password" of the first account of a Forkop 2 server.
+fk2_server_account() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." -v want="$1" '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+          sub("^" p, "", k); gsub(/\047/, "", v); dot = index(k, ".")
+          if (!dot) { if (v == "server_client") order[++n] = k; next }
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v }
+        END { for (i = 1; i <= n; i++) { c = order[i]
+            if (opt[c SUBSEP "server"] != want) continue
+            nm = opt[c SUBSEP "name"]; if (nm == "") nm = c
+            printf "%s|%s\n", nm, opt[c SUBSEP "password"]; exit } }'
+}
+
 _mixed_proxy_auth() {
-    local _sec="$1" _en _u _p
+    local _sec="$1" _en _u _p _line _acc
     [ -n "$_sec" ] || return 0
+    if forkop_v2; then
+        # mixed_auth_enabled defaults to on; a server without accounts takes none.
+        _line=$(fk2_section_mixed "$_sec")
+        [ -n "$_line" ] && [ "$(printf '%s' "$_line" | cut -d'|' -f6)" = "1" ] || return 0
+        _acc=$(fk2_server_account "${_line%%|*}")
+        [ -n "$_acc" ] || return 0
+        printf '%s:%s@' "$(_url_encode_cred "${_acc%%|*}")" "$(_url_encode_cred "${_acc#*|}")"
+        return 0
+    fi
     _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
     [ "$_en" = "1" ] || return 0
     _u=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_username" 2>/dev/null)
@@ -3454,7 +3730,23 @@ delete_message() {
 clash_request() {
     # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.
     local endpoint="$1" method="${2:-GET}" data="$3"
-    local secret tmp_body
+    local secret tmp_body _seg _rest
+    # The group in /proxies/<group>[/...] goes into the URL as is from most
+    # callers. On Forkop 2 a group is the section's label, which may hold spaces
+    # or Cyrillic: percent-encode that segment. Already encoded names (only
+    # unreserved characters and %XX) pass through unchanged.
+    case "$endpoint" in
+        /proxies/?*)
+            _seg="${endpoint#/proxies/}"; _seg="${_seg%%[/?]*}"
+            _rest="${endpoint#/proxies/"$_seg"}"
+            case "$_seg" in *[!A-Za-z0-9._~%-]*)
+                _seg=$(LC_ALL=C printf '%s' "$_seg" | LC_ALL=C awk '
+                    BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+                    { for (i = 1; i <= length($0); i++) { c = substr($0, i, 1)
+                        if (c ~ /[A-Za-z0-9._~%-]/) printf "%s", c; else printf "%%%02X", ord[c] } }')
+                endpoint="/proxies/${_seg}${_rest}" ;;
+            esac ;;
+    esac
     secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
@@ -3698,8 +3990,11 @@ is_list_enabled() {
 # Build tag->URI cache from sing-box config.json outbounds (fallback when UCI link missing)
 build_tag_uri_cache() {
     local tmp; tmp=$(mktemp /tmp/podkop_tag_uri.XXXXXX)
-    jq -r '.outbounds[]? | select(.server != null and .server != "") |
+    # Forkop 2 hands manual links to sing-box as they are: a "parser" outbound
+    # carries the link itself.
+    jq -r '.outbounds[]? | select((.type == "parser" and (.link // "") != "") or (.server != null and .server != "")) |
         .tag + "=" + (
+          if .type == "parser" then .link else (
             if .type == "hysteria2"     then "hy2://"    + (.password//"-") + "@" + (.server//"-") + ":" + (.server_port|tostring)
             elif .type == "vless"       then "vless://"  + (.uuid//"-")     + "@" + (.server//"-") + ":" + (.server_port|tostring)
             elif .type == "shadowsocks" then "ss://"     + (.server//"-")   + ":" + (.server_port|tostring)
@@ -3707,6 +4002,7 @@ build_tag_uri_cache() {
             elif .type == "tuic"        then "tuic://"   + (.uuid//"-")     + ":" + (.password//"-") + "@" + (.server//"-") + ":" + (.server_port|tostring)
             else (.server//"-") + ":" + (.server_port|tostring)
             end
+          ) end
         )
     ' ${SINGBOX_CONFIG_PATH} 2>/dev/null > "$tmp"
     mv "$tmp" "$TAG_URI_CACHE"
@@ -3731,8 +4027,10 @@ build_uci_links_cache() {
         proxy:urltest) _key="urltest_proxy_links" ;;
         *)             _key="selector_proxy_links" ;;
     esac
+    # Forkop 2: a URLTest takes the section's own links; there is no second list.
+    forkop_v2 && _key="selector_proxy_links"
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
-    raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
+    raw_list=$(links_uci_show "${sec}" "${_key}" | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
         { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
@@ -3752,7 +4050,7 @@ build_tag_name_cache() {
     tmp=$(mktemp /tmp/podkop_tag_name.XXXXXX)
     # url mode uses proxy_string (plain option, one URL per line) — handle separately
     for uci_key in selector_proxy_links urltest_proxy_links; do
-        raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
+        raw_list=$(links_uci_show "${sec}" "${uci_key}" | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
         { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do
@@ -3812,7 +4110,7 @@ get_url_proxy_links() {
 
 get_urltest_proxy_links() {
     local sec="$1" raw_list
-    raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+    raw_list=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-)
     [ -z "$raw_list" ] && return 0
     { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
     for link in "$@"; do printf '%s\n' "$link"; done
@@ -3871,7 +4169,7 @@ resolve_manual_uci_link_for_tag() {
     # Search only in UCI manual link lists — not in sing-box config
     local _uci_key
     for _uci_key in selector_proxy_links urltest_proxy_links; do
-        _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.${_uci_key} 2>/dev/null | cut -d= -f2-)
+        _raw_uci=$(links_uci_show "${_sec}" "${_uci_key}" | cut -d= -f2-)
         [ -n "$_raw_uci" ] || continue
         { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
         for _link in "$@"; do
@@ -3981,7 +4279,7 @@ get_selector_tag() {
 _section_selector_tag() {
     local sec="$1" proxies="$2" tag
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
-    tag=$(printf '%s' "$proxies" | jq -r --arg s "$sec" \
+    tag=$(printf '%s' "$proxies" | jq -r --arg s "$(section_clash_tag "$sec")" \
         'if .proxies[$s] then $s
          elif .proxies[$s + "-out"] then ($s + "-out")
          else (.proxies | to_entries
@@ -4208,6 +4506,10 @@ get_proxy_human_name_by_tag() {
 display_proxy_name() {
     local tag="$1" human cached_uri srv_port type_str
     [ -z "$tag" ] && { echo "Unknown"; return 0; }
+    # Forkop 2 names every link, provider and group "<section label>/<name>".
+    if forkop_v2; then
+        case "$tag" in */*) printf '%s\n' "${tag#*/}"; return 0 ;; esac
+    fi
     # 1. Try human name from selector_proxy_links index (fast, works for selector mode)
     human=$(get_proxy_human_name_by_tag "$tag")
     [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
@@ -4410,7 +4712,7 @@ podkop_dns_check() {
 probe_geo() {
     local m_ip m_port sec resp
     sec=$(get_active_section)
-    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(sec_mixed_port "${sec}" || echo "2080")
     m_ip=$(get_proxy_ip)
 
     # Primary: ipapi.co — IP, country, ASN/org
@@ -4474,7 +4776,7 @@ probe_geo() {
 probe_google() {
     local m_ip m_port sec resp
     sec=$(get_active_section)
-    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(sec_mixed_port "${sec}" || echo "2080")
     m_ip=$(get_proxy_ip)
 
     resp=$(curl -s -k \
@@ -4495,7 +4797,7 @@ probe_google() {
 probe_services() {
     local m_ip m_port sec _proxy _svc_dir _pids _deadline _expected _slot _f _line
     sec=$(get_active_section)
-    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(sec_mixed_port "${sec}" || echo "2080")
     m_ip=$(get_proxy_ip)
     _proxy="socks5h://${m_ip}:${m_port}"
     PROBE_SVC_RESULTS=""
@@ -4660,7 +4962,7 @@ probe_services() {
 probe_throughput() {
     local m_ip m_port sec raw speed_bps size_bytes time_secs
     sec=$(get_active_section)
-    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(sec_mixed_port "${sec}" || echo "2080")
     m_ip=$(get_proxy_ip)
 
     # Stage 1: 32 KB — detect 16 KB block quickly (РКН pattern: drops after ~16 KB)
@@ -5476,7 +5778,7 @@ _report_section_links() {
     case "$(get_section_type "$_s" 2>/dev/null)" in
         proxy:url) get_url_proxy_links "$_s" 2>/dev/null; return 0 ;;
         proxy:selector_text|proxy:urltest_text) get_text_proxy_links "$_s" 2>/dev/null; return 0 ;;
-        proxy:urltest) _key=urltest_proxy_links ;;
+        proxy:urltest) if forkop_v2; then _key=selector_proxy_links; else _key=urltest_proxy_links; fi ;;
         proxy:*) _key=selector_proxy_links ;;
         *) return 0 ;;
     esac
@@ -5577,8 +5879,8 @@ _report_sections_block() {
             _s_mark="⚪"
         else
             if [ "$_s" = "$_sec" ]; then _s_mark="▶"; else _s_mark="🟢"; fi
-            _s_me=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_enabled" 2>/dev/null || echo "0")
-            _s_mp=$(uci -q get "${PODKOP_UCI}.${_s}.mixed_proxy_port" 2>/dev/null || echo "")
+            _s_me=$(sec_mixed_enabled "${_s}" || echo "0")
+            _s_mp=$(sec_mixed_port "${_s}" || echo "")
             if [ "$_s_me" = "1" ] && [ -n "$_s_mp" ]; then
                 _s_ip=$(_resolve_mixed_listen_ip_by_port "$_s_mp")
                 if [ "$_s" = "$_t_sec" ]; then
@@ -7562,11 +7864,11 @@ SUBURLS
             elif ! echo "$safe_link" | grep -qE '^(vless|vmess|ss|trojan|hy2|hysteria2|socks|socks4|socks4a|socks5)://'; then
                 send_message "$(printf '%s <b>Неподдерживаемый протокол.</b>\nПоддерживаются VLESS, VMess, Shadowsocks, Trojan, Hysteria2 и SOCKS.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"proxy_menu\"}]]}"
-            elif uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -qF "${_links_key}='$safe_link'"; then
+            elif links_uci_show "${sec}" "${_links_key}" | grep -qF "'$safe_link'"; then
                 send_message "$(printf '%s Такая ссылка уже добавлена.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"proxy_menu\"}]]}"
             else
-                uci add_list ${PODKOP_UCI}.${sec}.${_links_key}="$safe_link"
+                links_add "${sec}" "${_links_key}" "$safe_link"
                 uci_commit_safe ${PODKOP_UCI}
                 send_message "$(printf '%s <b>Применяем изменения…</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
@@ -8126,7 +8428,7 @@ EOF
                         "$UCI_LINKS_CACHE" 2>/dev/null)
                     if [ -z "$raw_link" ]; then
                         local _raw_uci
-                        _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                        _raw_uci=$(links_uci_show "${_sec}" selector_proxy_links | cut -d= -f2-)
                         if [ -n "$_raw_uci" ]; then
                             { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                             for _link in "$@"; do
@@ -8183,8 +8485,8 @@ EOF
                             local _raw_uci _pmode
                             _pmode=$(get_section_type "${_sec}")
                             [ "$_pmode" = "proxy:urltest" ] && \
-                                _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-) || \
-                                _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                                _raw_uci=$(links_uci_show "${_sec}" urltest_proxy_links | cut -d= -f2-) || \
+                                _raw_uci=$(links_uci_show "${_sec}" selector_proxy_links | cut -d= -f2-)
                             if [ -n "$_raw_uci" ]; then
                                 { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                                 for _link in "$@"; do
@@ -8202,7 +8504,7 @@ EOF
             # Also check urltest_proxy_links if selector search failed
             if [ -z "$raw_link" ]; then
                 local _raw_uci_ut
-                _raw_uci_ut=$(uci -q show ${PODKOP_UCI}.${_sec:-$(get_active_section)}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                _raw_uci_ut=$(links_uci_show "${_sec:-$(get_active_section)}" urltest_proxy_links | cut -d= -f2-)
                 if [ -n "$_raw_uci_ut" ]; then
                     { _ucl=$(uci_list_clean "$_raw_uci_ut"); eval "set -- $_ucl"; }
                     for _link in "$@"; do
@@ -8235,7 +8537,7 @@ EOF
             else
                 _del_key="selector_proxy_links"
             fi
-            uci del_list ${PODKOP_UCI}.${_del_sec}.${_del_key}="$raw_link"
+            links_del "${_del_sec}" "${_del_key}" "$raw_link"
             uci_commit_safe ${PODKOP_UCI}
             send_or_edit "$mid" "$(printf '%s <b>Применяем изменения…</b>' "$E_RST")" ""
             safe_reload_podkop "force"; sleep 1
@@ -8560,7 +8862,7 @@ _handle_url_links() {
                 # the native urltest child tag, and subscription source URLs.
                 local _cur_links _fk_ut _fk_sub
                 _fk_ut=$(forkop_urltest_children "$sec" 2>/dev/null)
-                _cur_links=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -E '\.(selector_proxy_links|urltest_proxy_links)=' | cut -d= -f2- | tr -d "'")
+                _cur_links=$({ links_uci_show "${sec}" selector_proxy_links; links_uci_show "${sec}" urltest_proxy_links; } 2>/dev/null | cut -d= -f2- | tr -d "'")
                 _fk_sub=$(get_subscription_urls "$sec" 2>/dev/null)
                 [ -n "$_fk_ut" ] && _cur_links="URLTest child: ${_fk_ut}${_cur_links:+
 ${_cur_links}}"
@@ -9001,8 +9303,8 @@ EOF
             conn_type=$(get_section_type "$sec" | cut -d: -f1)
             conn_type_disp=$(connection_type_label "$conn_type")
             proxy_mode_disp=$(section_mode_label "$proxy_mode")
-            mixed_en=$(get_uci_bool_emoji "${PODKOP_UCI}.${sec}" "mixed_proxy_enabled")
-            mixed_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
+            if [ "$(sec_mixed_enabled "$sec" || echo 0)" = "1" ]; then mixed_en="$E_ON"; else mixed_en="$E_OFF"; fi
+            mixed_port=$(sec_mixed_port "${sec}" || echo "2080")
             # Section enabled/frozen state (universal `enabled` flag, default on).
             local _sec_en; _sec_en=$(uci -q get ${PODKOP_UCI}.${sec}.enabled 2>/dev/null); [ -z "$_sec_en" ] && _sec_en="1"
             local _sec_en_icon _sec_en_lbl _sec_en_cb _fk_label="" _fk_sort="0" _fk_action=""
@@ -9146,7 +9448,7 @@ EOF
             # (the resolved PRIMARY proxy section with mixed_proxy, NOT necessarily the
             # UI-active section) would drop the tunnel AND cut the bot off from Telegram.
             local _me _transport_sec
-            _me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            _me=$(sec_mixed_enabled "${sec}" || echo "0")
             _transport_sec=$(_resolve_primary_section)
             if [ "$sec" = "$_transport_sec" ] && [ "$_me" = "1" ]; then
                 send_or_edit "$mid" "$(printf '%s <b>Основная секция подключения</b>\n\nСекция <code>%s</code> активна и обслуживает Mixed-прокси бота (SOCKS). Её отключение может разорвать туннель и отключить бота от Telegram; для восстановления может потребоваться SSH или LuCI.\n\nВсё равно отключить секцию?' "$E_WARN" "$sec")" \
@@ -9296,7 +9598,7 @@ EOF
                         warn_txt=$(printf '%s <b>Переключиться в режим URLTest?</b>\n\nURLTest: sing-box автоматически выбирает самый быстрый прокси из подписки.\n<b>Ручной выбор прокси будет отключён.</b>\nПрокси из подписки: <b>%s</b>.\n\nСекция: <code>%s</code>' "$E_WARN" "${_sub_count:-0}" "$sec")
                     else
                         local _utl_count
-                        _utl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
+                        _utl_raw=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
                         if [ "${_utl_count:-0}" -eq 0 ]; then
                             warn_txt=$(printf '%s <b>Переключиться в режим URLTest?</b>\n\n%s <b>Список ссылок URLTest пуст.</b>\nПосле переключения Podkop не сможет запуститься.\n\n<b>Сначала добавьте ссылки:</b> Настройки секции → Параметры URLTest → Список прокси\n\nСекция: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                         else
@@ -9311,8 +9613,8 @@ EOF
                         warn_txt=$(printf '%s <b>Переключиться в режим Selector?</b>\n\nSelector: активный прокси из подписки выбирается вручную.\nПрокси из подписки: <b>%s</b>.\n\nСекция: <code>%s</code>' "$E_WARN" "${_sub_count2:-0}" "$sec")
                     else
                         local _sel_count _utl_count_back
-                        _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; _sel_count=$#; }
-                        _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count_back=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; _utl_count_back=$#; }
+                        _sel_lraw=$(links_uci_show "${sec}" selector_proxy_links | cut -d= -f2-); _sel_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; _sel_count=$#; }
+                        _utl_lraw=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-); _utl_count_back=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; _utl_count_back=$#; }
                         if [ "${_sel_count:-0}" -eq 0 ] && [ "${_utl_count_back:-0}" -gt 0 ]; then
                             warn_txt=$(printf '%s <b>Переключиться в режим Selector?</b>\n\nSelector: активный прокси выбирается вручную.\n\n%s <b>Список ссылок Selector пуст.</b>\nПрокси для URLTest: <b>%s</b>; их можно скопировать.\n\nСекция: <code>%s</code>' \
                                 "$E_WARN" "$E_WARN" "$_utl_count_back" "$sec")
@@ -9337,7 +9639,7 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_raw2=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { { _ucl=$(uci_list_clean "$_utl_raw2"); eval "set -- $_ucl"; }; _utl_c=$#; }
+                _utl_raw2=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { { _ucl=$(uci_list_clean "$_utl_raw2"); eval "set -- $_ucl"; }; _utl_c=$#; }
                 # Use Clash API count — captures ALL proxies, not just those added via bot
                 _sel_c=$(clash_request "/proxies" 2>/dev/null | \
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
@@ -9348,8 +9650,8 @@ EOF
             # For selector: add clone button when urltest has links but selector is empty
             if [ "$target_mode" = "selector" ]; then
                 local _sel_c2 _utl_c2
-                _sel_lraw2=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_c2=0; [ -n "$_sel_lraw2" ] && { { _ucl=$(uci_list_clean "$_sel_lraw2"); eval "set -- $_ucl"; }; _sel_c2=$#; }
-                _utl_lraw2=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c2=0; [ -n "$_utl_lraw2" ] && { { _ucl=$(uci_list_clean "$_utl_lraw2"); eval "set -- $_ucl"; }; _utl_c2=$#; }
+                _sel_lraw2=$(links_uci_show "${sec}" selector_proxy_links | cut -d= -f2-); _sel_c2=0; [ -n "$_sel_lraw2" ] && { { _ucl=$(uci_list_clean "$_sel_lraw2"); eval "set -- $_ucl"; }; _sel_c2=$#; }
+                _utl_lraw2=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-); _utl_c2=0; [ -n "$_utl_lraw2" ] && { { _ucl=$(uci_list_clean "$_utl_lraw2"); eval "set -- $_ucl"; }; _utl_c2=$#; }
                 if [ "${_sel_c2:-0}" -eq 0 ] && [ "${_utl_c2:-0}" -gt 0 ]; then
                     _kb_extra="[{\"text\":\"${E_RST} URLTest → Selector (${_utl_c2})\",\"callback_data\":\"cmd_clone_utl_to_sel\"}],"
                 fi
@@ -9400,7 +9702,7 @@ EOF
                     # Plus: servers from subscription, no urltest_proxy_links to check
                     if [ "$PODKOP_VARIANT" != "plus" ]; then
                         local _utl_raw _utl_c=0
-                        _utl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                        _utl_raw=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-)
                         [ -n "$_utl_raw" ] && { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; _utl_c=$#; }
                         if [ "$_utl_c" -eq 0 ]; then
                             send_or_edit "$mid" \
@@ -9414,7 +9716,7 @@ EOF
                     # Plus: servers from subscription, no selector_proxy_links to check
                     if [ "$PODKOP_VARIANT" != "plus" ]; then
                         local _sel_raw _sel_c=0
-                        _sel_raw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                        _sel_raw=$(links_uci_show "${sec}" selector_proxy_links | cut -d= -f2-)
                         [ -n "$_sel_raw" ] && { _ucl=$(uci_list_clean "$_sel_raw"); eval "set -- $_ucl"; _sel_c=$#; }
                         if [ "$_sel_c" -eq 0 ]; then
                             send_or_edit "$mid" \
@@ -9477,19 +9779,12 @@ EOF
             send_or_edit "$mid" "$(printf '%s %s обход туннеля для NTP?' "$E_WARN" "$_act_ntp")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Да\",\"callback_data\":\"do_toggle_ntp\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"global_settings\"}]]}"
             ;;
         "ask_toggle_mixed")
-            local _mp; _mp=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null)
-            local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            local _mp; _mp=$(sec_mixed_port "${sec}")
+            local _cur_me; _cur_me=$(sec_mixed_enabled "${sec}" || echo "0")
             local _note=""
             if [ "$_cur_me" != "1" ] && [ -z "$_mp" ]; then
                 # Calculate what port would be auto-assigned
-                local _used _candidate=2080
-                _used=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-                    | grep '\.mixed_proxy_port=' \
-                    | sed "s/.*mixed_proxy_port='//;s/'$//" \
-                    | grep -E '^[0-9]+$')
-                while echo "$_used" | grep -qx "$_candidate"; do
-                    _candidate=$((_candidate + 1))
-                done
+                local _candidate; _candidate=$(mixed_free_port)
                 _mp="$_candidate"
                 _note="\n\n<i>Порт не задан — будет выбран автоматически: ${_candidate}.</i>"
             fi
@@ -9503,9 +9798,9 @@ EOF
             local curr_ct
             if [ "$PODKOP_VARIANT" = "forkop" ]; then
                 curr_ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null || echo "connection")
-                local ct_txt; ct_txt=$(printf '%s <b>Действие секции</b> [<code>%s</code>]\n\nТекущее действие: <code>%s</code>\n\n<b>connection</b> (Туннелировать) — направлять трафик секции через настроенный туннель\n<b>bypass</b> — направлять трафик в обход туннеля\n<b>block</b> — блокировать трафик\n<b>zapret / zapret2 / byedpi</b> — обрабатывать трафик средствами Forkop' "$E_SET" "$sec" "$curr_ct")
+                local ct_txt; ct_txt=$(printf '%s <b>Действие секции</b> [<code>%s</code>]\n\nТекущее действие: <code>%s</code>\n\n<b>connection</b> (Туннелировать) — направлять трафик секции через настроенный туннель\n<b>bypass</b> — направлять трафик в обход туннеля\n<b>block</b> — блокировать трафик%s' "$E_SET" "$sec" "$curr_ct" "$(forkop_v2 || printf '\n<b>zapret / zapret2 / byedpi</b> — обрабатывать трафик средствами Forkop')")
                 send_or_edit "$mid" "$ct_txt" \
-                    "{\"inline_keyboard\":[[{\"text\":\"Туннелировать\",\"callback_data\":\"do_set_conn_connection\"},{\"text\":\"В обход\",\"callback_data\":\"do_set_conn_bypass\"},{\"text\":\"Блокировка\",\"callback_data\":\"do_set_conn_block\"}],[{\"text\":\"Zapret\",\"callback_data\":\"do_set_conn_zapret\"},{\"text\":\"Zapret2\",\"callback_data\":\"do_set_conn_zapret2\"},{\"text\":\"ByeDPI\",\"callback_data\":\"do_set_conn_byedpi\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"Туннелировать\",\"callback_data\":\"do_set_conn_connection\"},{\"text\":\"В обход\",\"callback_data\":\"do_set_conn_bypass\"},{\"text\":\"Блокировка\",\"callback_data\":\"do_set_conn_block\"}],$(forkop_v2 || printf '[{"text":"Zapret","callback_data":"do_set_conn_zapret"},{"text":"Zapret2","callback_data":"do_set_conn_zapret2"},{"text":"ByeDPI","callback_data":"do_set_conn_byedpi"}],')[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
                 return
             elif [ "$PODKOP_VARIANT" = "plus" ]; then
                 curr_ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null || echo "proxy")
@@ -9567,25 +9862,10 @@ EOF
         "do_toggle_wan")  toggle_uci_bool "${PODKOP_UCI}.settings" "enable_badwan_interface_monitoring";   safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
         "do_toggle_ntp")  toggle_uci_bool "${PODKOP_UCI}.settings" "exclude_ntp";                         safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
         "do_toggle_mixed")
-            local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
-            # When enabling mixed proxy — ensure required parameters are set
-            if [ "$_cur_me" != "1" ]; then
-                [ -z "$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null)" ] && {
-                    # Find a free port — collect all ports already used by other sections
-                    local _used_ports _candidate=2080
-                    _used_ports=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
-                        | grep '\.mixed_proxy_port=' \
-                        | sed "s/.*mixed_proxy_port='//;s/'$//" \
-                        | grep -E '^[0-9]+$')
-                    # Increment until we find an unused port
-                    while echo "$_used_ports" | grep -qx "$_candidate"; do
-                        _candidate=$((_candidate + 1))
-                    done
-                    uci set ${PODKOP_UCI}.${sec}.mixed_proxy_port="${_candidate}"
-                    logger -t podkop-bot "[Config] Auto-set mixed_proxy_port=${_candidate} for section ${sec}"
-                }
-            fi
-            toggle_uci_bool "${PODKOP_UCI}.${sec}" "mixed_proxy_enabled"
+            # Off, or on with a free port when none is set; on Forkop 2 the mixed
+            # proxy is a server routed to the section (see sec_mixed_toggle).
+            sec_mixed_toggle "$sec"
+            uci_commit_safe "${PODKOP_UCI}"
             if safe_reload_podkop; then
                 _handle_settings "section_settings" "$mid" "" ""
             else
@@ -9831,7 +10111,7 @@ _handle_section_extras() {
                     send_message "$(printf '%s Некорректный порт. Допустимый диапазон: <code>1024–65535</code>.' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
                 else
-                    uci set ${PODKOP_UCI}.${sec}.mixed_proxy_port="$val"
+                    sec_mixed_set_port "$sec" "$val"
                     uci_commit_safe ${PODKOP_UCI}
                     send_message "$(printf '%s Порт сохранён: %s. Перезапускаем Podkop…' "$E_OK" "$val")" ""
                     safe_reload_podkop "force"; sleep 1
@@ -9877,7 +10157,7 @@ _handle_section_extras() {
                     send_message "$(printf '%s Такая ссылка уже добавлена.' "$E_WARN")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"urltest_links_menu\"}]]}"
                 else
-                    uci add_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$safe_link"
+                    links_add "${sec}" urltest_proxy_links "$safe_link"
                     uci_commit_safe ${PODKOP_UCI}
                     send_message "$(printf '%s <b>Применяем изменения…</b>' "$E_RST")" ""
                     safe_reload_podkop "force"; sleep 1
@@ -10426,8 +10706,8 @@ EOF
                 # the "empty list — won't start" warning applies here.
                 _links_line="<b>Прокси:</b> из подписки ($(get_subscription_server_count "$sec" 2>/dev/null || echo "?"))"
             else
-                _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
-                _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
+                _utl_lraw=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
+                _sel_lraw=$(links_uci_show "${sec}" selector_proxy_links | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
                 if [ "${sel_links_count:-0}" -eq 0 ]; then
                     # Fallback: check Clash API for proxy count even if UCI is empty
                     sel_links_count=$(clash_request "/proxies" 2>/dev/null | \
@@ -10577,7 +10857,7 @@ EOF
             echo "wait_mixed_port" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Задать порт Mixed-прокси</b>\n\nТекущее значение: <code>%s</code>\n\nВведите номер порта от 1024 до 65535.\nПо умолчанию: 2080\n\n%s После изменения порта Podkop будет перезапущен. Убедитесь, что порт не занят другой службой.' \
-                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")" "$E_WARN")" \
+                    "$E_EDIT" "$(sec_mixed_port "${sec}" || echo "2080")" "$E_WARN")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
@@ -10673,7 +10953,7 @@ EOF
                 if [ -z "$_full_link" ]; then
                     # Fallback: try live uci show
                     local _raw_uci
-                    _raw_uci=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                    _raw_uci=$(links_uci_show "${sec}" selector_proxy_links | cut -d= -f2-)
                     if [ -n "$_raw_uci" ]; then
                         { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                         for _l in "$@"; do
@@ -10687,10 +10967,10 @@ EOF
                     _not_found=$((_not_found + 1)); continue
                 fi
                 # Skip duplicates already in urltest_proxy_links
-                if uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | grep -qF "'${_full_link}'"; then
+                if links_uci_show "${sec}" urltest_proxy_links | grep -qF "'${_full_link}'"; then
                     _skipped=$((_skipped + 1))
                 else
-                    uci add_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$_full_link"
+                    links_add "${sec}" urltest_proxy_links "$_full_link"
                     _added=$((_added + 1))
                 fi
             done < "$proxy_names_file"
@@ -10712,7 +10992,7 @@ EOF
             # Symmetric counterpart of cmd_clone_sel_to_utl.
             local _added=0 _skipped=0
             local _utl_raw_c _item_c
-            _utl_raw_c=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+            _utl_raw_c=$(links_uci_show "${sec}" urltest_proxy_links | cut -d= -f2-)
             if [ -z "$_utl_raw_c" ]; then
                 send_or_edit "$mid" "$(printf '%s Список ссылок URLTest пуст — копировать нечего.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"proxy_mode_menu\"}]]}"
@@ -10721,10 +11001,10 @@ EOF
             { _ucl=$(uci_list_clean "$_utl_raw_c"); eval "set -- $_ucl"; }
             for _item_c in "$@"; do
                 [ -z "$_item_c" ] && continue
-                if uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | grep -qF "'${_item_c}'"; then
+                if links_uci_show "${sec}" selector_proxy_links | grep -qF "'${_item_c}'"; then
                     _skipped=$((_skipped + 1))
                 else
-                    uci add_list ${PODKOP_UCI}.${sec}.selector_proxy_links="$_item_c"
+                    links_add "${sec}" selector_proxy_links "$_item_c"
                     _added=$((_added + 1))
                 fi
             done
@@ -10779,7 +11059,7 @@ EOF
 $(get_urltest_proxy_links "$sec")
 EOF
             [ -n "$link_to_del" ] && {
-                uci del_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$link_to_del"
+                links_del "${sec}" urltest_proxy_links "$link_to_del"
                 uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             }
             _handle_section_extras "urltest_links_menu" "$mid" "" ""
@@ -12244,22 +12524,38 @@ _forkop_section_label() {
     [ -n "$_v" ] && printf '%s' "$_v" || printf '%s' "$_sec"
 }
 
+# Forkop 2 renamed priority_group/priority_level to fallback_group/fallback_level:
+# a group keeps name, health_check_url and interrupt_exist_connections, a level
+# filters by server_filter_mode (all/include/exclude/direct) with include_regex,
+# and countries are matched by their flag in the server name.
+_fk_pg_type() { if forkop_v2; then printf 'fallback_group'; else printf 'priority_group'; fi; }
+_fk_pl_type() { if forkop_v2; then printf 'fallback_level'; else printf 'priority_level'; fi; }
+
+# _country_flag CC — the flag emoji of a two-letter country code.
+_country_flag() {
+    local _c="$1" _o _i
+    for _i in 1 2; do
+        _o=$(printf '%d' "'$(printf '%s' "$_c" | cut -c$_i)")
+        printf "\\360\\237\\207\\$(printf '%o' $((166 + _o - 65)))"
+    done
+}
+
 _forkop_priority_groups() {
-    forkop_children_by_type_and_owner priority_group "$1"
+    forkop_children_by_type_and_owner "$(_fk_pg_type)" "$1"
 }
 
 _forkop_priority_group_owned() {
     local _g="$1" _parent="$2"
-    [ "$(_fk_child_type "$_g")" = "priority_group" ] || return 1
+    [ "$(_fk_child_type "$_g")" = "$(_fk_pg_type)" ] || return 1
     [ "$(uci -q get "${PODKOP_UCI}.${_g}.section" 2>/dev/null)" = "$_parent" ]
 }
 
 _forkop_priority_levels() {
     local _g="$1" _l _owner
-    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." '
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v t="$(_fk_pl_type)" '
         {
             v=$2; gsub(/\047/, "", v)
-            if (v == "priority_level") { k=$1; sub("^" p, "", k); print k }
+            if (v == t) { k=$1; sub("^" p, "", k); print k }
         }
     ' | while IFS= read -r _l; do
         [ -n "$_l" ] || continue
@@ -12279,7 +12575,7 @@ _forkop_priority_levels_sorted() {
 _forkop_priority_level_owned() {
     local _l="$1" _g="$2" _parent="$3"
     _forkop_priority_group_owned "$_g" "$_parent" || return 1
-    [ "$(_fk_child_type "$_l")" = "priority_level" ] || return 1
+    [ "$(_fk_child_type "$_l")" = "$(_fk_pl_type)" ] || return 1
     [ "$(uci -q get "${PODKOP_UCI}.${_l}.group" 2>/dev/null)" = "$_g" ]
 }
 
@@ -12324,11 +12620,24 @@ _fk_priority_add_level_common() {
     local _g="$1" _name="$2" _mode="$3" _direct="$4" _countries="$5" _l _n _c
     _forkop_priority_group_owned "$_g" "$(get_active_section)" || return 1
     _n=$(_forkop_priority_levels "$_g" 2>/dev/null | grep -c .); case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
-    _l=$(uci add "$PODKOP_UCI" priority_level 2>/dev/null) || return 1
+    _l=$(uci add "$PODKOP_UCI" "$(_fk_pl_type)" 2>/dev/null) || return 1
     [ -n "$_l" ] || return 1
     _fk_stage_set "${PODKOP_UCI}.${_l}.group" "$_g" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_l}.name" "$_name" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_l}.order" "$_n" || return 1
+    if forkop_v2; then
+        local _re=""
+        if [ "$_direct" = "1" ]; then _mode=direct
+        elif [ -n "$_countries" ]; then
+            _mode=include
+            for _c in $_countries; do _re="${_re}${_re:+|}(?:$(_country_flag "$_c"))"; done
+            _fk_stage_set "${PODKOP_UCI}.${_l}.include_regex" "$_re" || return 1
+        else _mode=all
+        fi
+        _fk_stage_set "${PODKOP_UCI}.${_l}.server_filter_mode" "$_mode" || return 1
+        _fk_txn_commit_reload
+        return
+    fi
     _fk_stage_set "${PODKOP_UCI}.${_l}.direct" "$_direct" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_l}.filter_mode" "$_mode" || return 1
     _fk_stage_set "${PODKOP_UCI}.${_l}.detect_server_country" "flag_emoji" || return 1
@@ -12407,9 +12716,13 @@ _handle_forkop_0198() {
                 [ -n "$_name" ] || { send_message "${E_WARN} Имя группы не может быть пустым." ""; return; }
                 [ "${#_name}" -le 64 ] || { send_message "${E_WARN} Имя группы слишком длинное (до 64 символов)." ""; return; }
                 [ "$(uci -q get "${PODKOP_UCI}.${sec}.action" 2>/dev/null)" = "connection" ] || { send_message "${E_WARN} Priority Group доступна только connection-секции Forkop." ""; return; }
-                _g=$(uci add "$PODKOP_UCI" priority_group 2>/dev/null) || { send_message "${E_ERR} Не удалось создать группу." ""; return; }
+                _g=$(uci add "$PODKOP_UCI" "$(_fk_pg_type)" 2>/dev/null) || { send_message "${E_ERR} Не удалось создать группу." ""; return; }
                 _fk_stage_set "${PODKOP_UCI}.${_g}.section" "$sec" || return
                 _fk_stage_set "${PODKOP_UCI}.${_g}.name" "$_name" || return
+                if forkop_v2; then
+                    _fk_stage_set "${PODKOP_UCI}.${_g}.health_check_url" "https://www.gstatic.com/generate_204" || return
+                    _fk_stage_set "${PODKOP_UCI}.${_g}.interrupt_exist_connections" "1" || return
+                else
                 _fk_stage_set "${PODKOP_UCI}.${_g}.health_url" "https://www.gstatic.com/generate_204" || return
                 _fk_stage_set "${PODKOP_UCI}.${_g}.active_check_interval" "5s" || return
                 _fk_stage_set "${PODKOP_UCI}.${_g}.check_timeout" "2s" || return
@@ -12419,6 +12732,7 @@ _handle_forkop_0198() {
                 _fk_stage_set "${PODKOP_UCI}.${_g}.fastest_check_interval" "3m" || return
                 _fk_stage_set "${PODKOP_UCI}.${_g}.interrupt_exist_connections" "1" || return
                 _fk_stage_set "${PODKOP_UCI}.${_g}.pin_dashboard" "1" || return
+                fi
                 _rc=0; _fk_txn_commit_reload || _rc=$?
                 _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
                 if [ "$_rc" -eq 0 ]; then _handle_forkop_0198 "fkpg_${_g}" "$_return_mid" "" "" ""; else send_message "$(_fk_txn_fail_msg "$_rc")" ""; fi
@@ -12464,13 +12778,15 @@ _handle_forkop_0198() {
             _act=$(uci -q get "${PODKOP_UCI}.${sec}.action" 2>/dev/null)
             [ "$_act" = "dns" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
             _type=$(uci -q get "${PODKOP_UCI}.${sec}.dns_type" 2>/dev/null); [ -n "$_type" ] || _type="udp"
+            # Forkop 2 has no dns_type: the scheme of the server address says it.
+            forkop_v2 && _type="в адресе"
             _srv=$(uci -q get "${PODKOP_UCI}.${sec}.dns_server" 2>/dev/null); [ -n "$_srv" ] || _srv="не задан"
             _de=$(uci -q get "${PODKOP_UCI}.${sec}.dns_detour_enabled" 2>/dev/null); [ -n "$_de" ] || _de=0
             _ds=$(uci -q get "${PODKOP_UCI}.${sec}.dns_detour_section" 2>/dev/null)
             _en=$(uci -q get "${PODKOP_UCI}.${sec}.enabled" 2>/dev/null); [ -n "$_en" ] || _en=1
             if [ "$_de" = "1" ]; then _detour_line="включён → ${_ds:-не задано} (редактирование в LuCI)"; else _detour_line="выключен"; fi
             send_or_edit "$mid" "$(printf '%s <b>DNS-действие</b> [<code>%s</code>]\n\n<b>Метка:</b> %s\n<b>Протокол:</b> <code>%s</code>\n<b>DNS-сервер:</b> <code>%s</code>\n<b>Detour:</b> %s\n<b>Секция:</b> %s\n\n<i>Сложный DNS detour редактируется в LuCI; условия секции доступны здесь.</i>' "$E_NET" "$sec" "$(html_escape "$(_forkop_section_label "$sec")")" "$_type" "$(html_escape "$_srv")" "$(html_escape "$_detour_line")" "$( [ "$_en" = 1 ] && echo "${E_OK} включена" || echo "${E_OFF} выключена" )")" \
-                "{\"inline_keyboard\":[[{\"text\":\"Протокол: ${_type}\",\"callback_data\":\"fkdns_proto\"},{\"text\":\"${E_EDIT} Сервер\",\"callback_data\":\"fkdns_server\"}],[{\"text\":\"${E_TGT} Условия\",\"callback_data\":\"fk_conds\"}],[{\"text\":\"${E_EDIT} Метка\",\"callback_data\":\"fk_label\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
+                "{\"inline_keyboard\":[[$(forkop_v2 || printf '{"text":"Протокол: %s","callback_data":"fkdns_proto"},' "$_type"){\"text\":\"${E_EDIT} Сервер\",\"callback_data\":\"fkdns_server\"}],[{\"text\":\"${E_TGT} Условия\",\"callback_data\":\"fk_conds\"}],[{\"text\":\"${E_EDIT} Метка\",\"callback_data\":\"fk_label\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
             ;;
         fkdns_proto)
             send_or_edit "$mid" "${E_TGT} <b>Протокол DNS-действия</b>" \
@@ -12486,7 +12802,7 @@ _handle_forkop_0198() {
         fkdns_server)
             printf '%s\n' "wait_fkdns_server" > "$STATE_FILE"
             local _cur; _cur=$(uci -q get "${PODKOP_UCI}.${sec}.dns_server" 2>/dev/null)
-            send_or_edit "$mid" "$(printf '%s <b>DNS-сервер действия</b>\n\nСейчас: <code>%s</code>\n\nОтправьте новый адрес/имя DNS.' "$E_EDIT" "$(html_escape "${_cur:-не задан}")")" \
+            send_or_edit "$mid" "$(printf '%s <b>DNS-сервер действия</b>\n\nСейчас: <code>%s</code>\n\nОтправьте новый адрес/имя DNS.%s' "$E_EDIT" "$(html_escape "${_cur:-не задан}")" "$(forkop_v2 && printf '\n\n<i>Forkop 2: протокол задаётся адресом — <code>1.1.1.1</code> (UDP), <code>tls://1.1.1.1</code> (DoT), <code>https://dns.google/dns-query</code> (DoH).</i>')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_dns_menu\"}]]}"
             ;;
 
@@ -12524,6 +12840,7 @@ _handle_forkop_0198() {
             local _rest="${cmd#fkpg_t_}" _field _g _cur _nv _rc
             _field="${_rest%%_*}"; _g="${_rest#*_}"
             case "$_field" in pf) _field="pick_fastest" ;; sf) _field="switch_to_faster_same_priority" ;; ic) _field="interrupt_exist_connections" ;; *) return ;; esac
+            forkop_v2 && [ "$_field" != "interrupt_exist_connections" ] && return
             _forkop_priority_group_owned "$_g" "$sec" || return
             _cur=$(uci -q get "${PODKOP_UCI}.${_g}.${_field}" 2>/dev/null); [ -n "$_cur" ] || { [ "$_field" = interrupt_exist_connections ] && _cur=1 || _cur=0; }
             [ "$_cur" = 1 ] && _nv=0 || _nv=1
@@ -12556,8 +12873,14 @@ _handle_forkop_0198() {
                 _n=$((_n + 1)); _ln=$(uci -q get "${PODKOP_UCI}.${_l}.name" 2>/dev/null); [ -n "$_ln" ] || _ln="$_l"
                 _rows="${_rows}[{\"text\":\"$(json_escape "${_n}. ${_ln}")\",\"callback_data\":\"fkpl_$(json_escape "$_l")\"}],"
             done
-            send_or_edit "$mid" "$(printf '🪜 <b>%s</b>\n\nУровней: <b>%s</b>\nСамый верхний имеет высший приоритет.\n\nБыстрейший внутри уровня: %s\nВозврат на более быстрый: %s\nРазрывать соединения при переключении: %s' "$(html_escape "$_name")" "$_n" "$( [ "$_pf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_sf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_ic" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )")" \
-                "{\"inline_keyboard\":[${_rows}[{\"text\":\"🌍 + Страны\",\"callback_data\":\"fkpg_c_$(json_escape "$_g")\"},{\"text\":\"➡️ + Direct\",\"callback_data\":\"fkpg_d_$(json_escape "$_g")\"}],[{\"text\":\"🛟 + Остальные (fallback)\",\"callback_data\":\"fkpg_r_$(json_escape "$_g")\"}],[{\"text\":\"$( [ "$_pf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" ) Быстрейший\",\"callback_data\":\"fkpg_t_pf_$(json_escape "$_g")\"},{\"text\":\"$( [ "$_sf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" ) Возврат\",\"callback_data\":\"fkpg_t_sf_$(json_escape "$_g")\"}],[{\"text\":\"$( [ "$_ic" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkpg_t_ic_$(json_escape "$_g")\"}],[{\"text\":\"${E_DEL} Удалить группу\",\"callback_data\":\"fkpg_del_$(json_escape "$_g")\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_pg_menu\"}]]}"
+            local _pg_opts
+            if forkop_v2; then
+                _pg_opts=$(printf 'Первый рабочий сервер уровня, по порядку.\nРазрывать соединения при переключении: %s' "$( [ "$_ic" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )")
+            else
+                _pg_opts=$(printf 'Быстрейший внутри уровня: %s\nВозврат на более быстрый: %s\nРазрывать соединения при переключении: %s' "$( [ "$_pf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_sf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_ic" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )")
+            fi
+            send_or_edit "$mid" "$(printf '🪜 <b>%s</b>\n\nУровней: <b>%s</b>\nСамый верхний имеет высший приоритет.\n\n%s' "$(html_escape "$_name")" "$_n" "$_pg_opts")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"🌍 + Страны\",\"callback_data\":\"fkpg_c_$(json_escape "$_g")\"},{\"text\":\"➡️ + Direct\",\"callback_data\":\"fkpg_d_$(json_escape "$_g")\"}],[{\"text\":\"🛟 + Остальные (fallback)\",\"callback_data\":\"fkpg_r_$(json_escape "$_g")\"}],$(forkop_v2 || printf '[{"text":"%s Быстрейший","callback_data":"fkpg_t_pf_%s"},{"text":"%s Возврат","callback_data":"fkpg_t_sf_%s"}],' "$( [ "$_pf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$(json_escape "$_g")" "$( [ "$_sf" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" )" "$(json_escape "$_g")")[{\"text\":\"$( [ "$_ic" = 1 ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkpg_t_ic_$(json_escape "$_g")\"}],[{\"text\":\"${E_DEL} Удалить группу\",\"callback_data\":\"fkpg_del_$(json_escape "$_g")\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_pg_menu\"}]]}"
             ;;
 
         fkpl_up_*|fkpl_dn_*)
@@ -12584,6 +12907,14 @@ _handle_forkop_0198() {
             _direct=$(uci -q get "${PODKOP_UCI}.${_l}.direct" 2>/dev/null); [ -n "$_direct" ] || _direct=0
             _countries=$(_fk_list_read_any "${PODKOP_UCI}.${_l}.country" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
             if [ "$_direct" = 1 ]; then _desc="Direct"; elif [ "$_mode" = disabled ]; then _desc="Все оставшиеся прокси"; else _desc="Страны: ${_countries:-—}"; fi
+            if forkop_v2; then
+                case "$(uci -q get "${PODKOP_UCI}.${_l}.server_filter_mode" 2>/dev/null)" in
+                    direct) _desc="Direct" ;;
+                    all|"") _desc="Все оставшиеся прокси" ;;
+                    exclude) _desc="Кроме: $(uci -q get "${PODKOP_UCI}.${_l}.exclude_regex" 2>/dev/null)" ;;
+                    *) _desc="Фильтр: $(uci -q get "${PODKOP_UCI}.${_l}.include_regex" 2>/dev/null)" ;;
+                esac
+            fi
             send_or_edit "$mid" "$(printf '🪜 <b>Уровень</b>\n\n<b>%s</b>\n%s' "$(html_escape "$_name")" "$(html_escape "$_desc")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"⬆️ Выше\",\"callback_data\":\"fkpl_up_$(json_escape "$_l")\"},{\"text\":\"⬇️ Ниже\",\"callback_data\":\"fkpl_dn_$(json_escape "$_l")\"}],[{\"text\":\"${E_DEL} Удалить уровень\",\"callback_data\":\"fkpl_del_$(json_escape "$_l")\"}],[{\"text\":\"${E_BACK} К группе\",\"callback_data\":\"fkpg_$(json_escape "$_g")\"}]]}"
             ;;
@@ -12624,12 +12955,13 @@ _handle_dns_0198() {
             rm -f "$STATE_FILE"
             local _p _dnsn _bootn _first _bfirst
             _p=$(uci -q get "${PODKOP_UCI}.settings.dns_type" 2>/dev/null); [ -n "$_p" ] || _p=udp
+            forkop_v2 && _p="в адресе"
             _dnsn=$(_fk_list_read_any "${PODKOP_UCI}.settings.dns_server" 2>/dev/null | grep -c .)
             _bootn=$(_fk_list_read_any "${PODKOP_UCI}.settings.bootstrap_dns_server" 2>/dev/null | grep -c .)
             _first=$(_fk_list_read_any "${PODKOP_UCI}.settings.dns_server" 2>/dev/null | head -1); [ -n "$_first" ] || _first="не задан"
             _bfirst=$(_fk_list_read_any "${PODKOP_UCI}.settings.bootstrap_dns_server" 2>/dev/null | head -1); [ -n "$_bfirst" ] || _bfirst="не задан"
             send_or_edit "$mid" "$(printf '%s <b>Глобальный DNS Forkop</b>\n\n<b>Протокол:</b> <code>%s</code>\n<b>DNS:</b> %s шт. · основной <code>%s</code>\n<b>Bootstrap DNS:</b> %s шт. · первый <code>%s</code>\n\n<i>Forkop использует список по порядку: последующие серверы — резервные.</i>' "$E_NET" "$_p" "${_dnsn:-0}" "$(html_escape "$_first")" "${_bootn:-0}" "$(html_escape "$_bfirst")")" \
-                "{\"inline_keyboard\":[[{\"text\":\"Протокол: ${_p}\",\"callback_data\":\"dns_proto_menu\"}],[{\"text\":\"🌐 DNS (${_dnsn:-0})\",\"callback_data\":\"gdn_dns\"},{\"text\":\"🧭 Bootstrap (${_bootn:-0})\",\"callback_data\":\"gdn_boot\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+                "{\"inline_keyboard\":[$(forkop_v2 || printf '[{"text":"Протокол: %s","callback_data":"dns_proto_menu"}],' "$_p")[{\"text\":\"🌐 DNS (${_dnsn:-0})\",\"callback_data\":\"gdn_dns\"},{\"text\":\"🧭 Bootstrap (${_bootn:-0})\",\"callback_data\":\"gdn_boot\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
             ;;
         gdn_dns|gdn_boot)
             local _which="${cmd#gdn_}" _field _title _lines _rows="" _v _i=0 _total
@@ -12648,7 +12980,7 @@ EOF
         gdn_a_*)
             local _which="${cmd#gdn_a_}"
             case "$_which" in dns) printf '%s\n' wait_gdns_add_dns > "$STATE_FILE" ;; boot) printf '%s\n' wait_gdns_add_boot > "$STATE_FILE" ;; *) return ;; esac
-            send_or_edit "$mid" "$(printf '%s <b>Добавить DNS</b>\n\nОтправьте адрес/имя сервера. Новый элемент станет последним резервным.' "$E_EDIT")" \
+            send_or_edit "$mid" "$(printf '%s <b>Добавить DNS</b>\n\nОтправьте адрес/имя сервера. Новый элемент станет последним резервным.%s' "$E_EDIT" "$(forkop_v2 && printf '\n\n<i>Forkop 2: протокол задаётся адресом — <code>1.1.1.1</code> (UDP), <code>tls://1.1.1.1</code> (DoT), <code>https://dns.google/dns-query</code> (DoH).</i>')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"gdn_${_which}\"}]]}"
             ;;
         gdn_u_*|gdn_d_*|gdn_x_*)
@@ -12979,11 +13311,19 @@ EOF
                     send_message "$(printf '%s Источник не принадлежит текущей секции — откройте список заново.' "$E_WARN")" ""
                     return
                 fi
+                if forkop_v2; then
+                    # Forkop 2 prepends override_prefix as is; Forkop's migration
+                    # writes "<prefix> ", so does the bot.
+                    if [ -n "$_v" ]; then _fk_stage_set "${PODKOP_UCI}.${_ch}.override_prefix" "$_v " || { send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return; }
+                    else _fk_stage_delete "${PODKOP_UCI}.${_ch}.override_prefix" || { send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return; }
+                    fi
+                else
                 if ! _fk_stage_set "${PODKOP_UCI}.${_ch}.node_prefix" "$_v"; then
                     send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return
                 fi
                 if ! _fk_stage_set "${PODKOP_UCI}.${_ch}.prefix_nodes" "$([ -n "$_v" ] && echo 1 || echo 0)"; then
                     send_message "$(printf '%s Ошибка записи.' "$E_ERR")" ""; return
+                fi
                 fi
                 send_or_edit "$_return_mid" "$(printf '%s <b>Forkop...</b>' "$E_RST")" "{\"inline_keyboard\":[[{\"text\":\"...\",\"callback_data\":\"noop\"}]]}"
                 _fk_txn_commit_reload; _rc=$?
@@ -13225,6 +13565,11 @@ ${_ip}"; fi
             _md=$(uci -q get "${PODKOP_UCI}.${_ch}.show_dashboard_metadata" 2>/dev/null); [ -z "$_md" ] && _md=1
             _pf=$(uci -q get "${PODKOP_UCI}.${_ch}.prefix_nodes" 2>/dev/null); [ -z "$_pf" ] && _pf=0
             _px=$(uci -q get "${PODKOP_UCI}.${_ch}.node_prefix" 2>/dev/null)
+            # Forkop 2: the prefix is override_prefix (with its trailing space).
+            if forkop_v2; then
+                _px=$(uci -q get "${PODKOP_UCI}.${_ch}.override_prefix" 2>/dev/null | sed 's/[[:space:]]*$//')
+                [ -n "$_px" ] && _pf=1 || _pf=0
+            fi
             send_or_edit "$mid" "$(printf '%s <b>Настройки источника</b> [<code>%s</code>]\n<code>%s</code>\n\nАвтообновление: %s · Интервал: <code>%s</code>\nЧерез прокси: %s <code>%s</code> · Метаданные: %s\nПрефикс узлов: %s <code>%s</code>' "$E_SET" "$_ch" "$(html_escape "$_url")" "$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_int:-по умолчанию}" "$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_vps:-—}" "$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$(html_escape "${_px:-—}")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Автообновление\",\"callback_data\":\"fkss_u_${_ch}_$( [ "$_upd" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkss_i_${_ch}\"}],[{\"text\":\"$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Через прокси\",\"callback_data\":\"fkss_v_${_ch}_$( [ "$_vp" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Метаданные\",\"callback_data\":\"fkss_m_${_ch}_$( [ "$_md" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Префикс узлов\",\"callback_data\":\"fkss_p_${_ch}_$( [ "$_pf" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Текст префикса\",\"callback_data\":\"fkss_px_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_proxy_menu\"}]]}"
             ;;
@@ -13237,6 +13582,18 @@ ${_ip}"; fi
                 fkss_p_*) _rest="${cmd#fkss_p_}"; _key="prefix_nodes" ;;
             esac
             _ch="${_rest%_[01]}"; _nv="${_rest##*_}"
+            if forkop_v2; then
+                case "$_key" in
+                    show_dashboard_metadata) CB_ANSWER_TEXT="В Forkop 2 метаданные показываются всегда"; return ;;
+                    prefix_nodes)
+                        if [ "$_nv" = "1" ]; then _handle_forkop_ext "fkss_px_${_ch}" "$mid" "" ""; return; fi
+                        _fk_child_owned "$_ch" "subscription_url" "$sec" || return
+                        _fk_stage_delete "${PODKOP_UCI}.${_ch}.override_prefix" || return
+                        _rc=0; _fk_txn_commit_reload || _rc=$?
+                        if [ "$_rc" -eq 0 ]; then _handle_forkop_ext "fk_sub_set_${_ch}" "$mid" "" ""; else _fk_txn_report "$_rc" "$mid" "fk_sub_set_${_ch}"; fi
+                        return ;;
+                esac
+            fi
             # Enabling via-proxy without a transport section is meaningless (LuCI
             # forces the pick) — route to the picker; both fields land in one txn.
             if [ "$_key" = "download_via_proxy_enabled" ] && [ "$_nv" = "1" ] &&                [ -z "$(uci -q get "${PODKOP_UCI}.${_ch}.download_via_proxy_section" 2>/dev/null)" ]; then
@@ -13550,6 +13907,20 @@ ${_ip}"; fi
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
                 return
             fi
+            if forkop_v2; then
+                # Forkop 2 filters servers by name: lists of names and a regular
+                # expression (countries are their flags), plus excluded types.
+                # Shown here; edited in LuCI.
+                local _fm _ir _er _io _eo
+                _fm=$(uci -q get "${PODKOP_UCI}.${_ch}.server_filter_mode" 2>/dev/null); [ -n "$_fm" ] || _fm="all"
+                _ir=$(uci -q get "${PODKOP_UCI}.${_ch}.include_regex" 2>/dev/null)
+                _er=$(uci -q get "${PODKOP_UCI}.${_ch}.exclude_regex" 2>/dev/null)
+                _io=$(_fk_child_list_read "$_ch" "urltest" "$sec" "include_outbounds" | grep -c .)
+                _eo=$(_fk_child_list_read "$_ch" "urltest" "$sec" "exclude_outbounds" | grep -c .)
+                send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Режим:</b> <code>%s</code>\n<b>Включить по выражению:</b> <code>%s</code>\n<b>Включить вручную:</b> %s\n<b>Исключить по выражению:</b> <code>%s</code>\n<b>Исключить вручную:</b> %s\n\n<i>В Forkop 2 серверы отбираются по имени, страна — это флаг в имени. Фильтры редактируются в LuCI.</i>' "$E_TGT" "$sec" "$_ch" "$_fm" "$(html_escape "${_ir:-—}")" "${_io:-0}" "$(html_escape "${_er:-—}")" "${_eo:-0}")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
+                return
+            fi
             _mode=$(_fk_urltest_filter_mode "$_ch")
             _dc=$(uci -q get "${PODKOP_UCI}.${_ch}.detect_server_country" 2>/dev/null); [ -z "$_dc" ] && _dc="flag_emoji"
             _exc_c=$(_fk_child_list_read "$_ch" "urltest" "$sec" "exclude_countries" | grep -c .)
@@ -13580,6 +13951,7 @@ ${_ip}"; fi
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"fkut_e_${_ch}_${_nv}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
             ;;
         "fkufa_"*)
+            forkop_v2 && { CB_ANSWER_TEXT="В Forkop 2 фильтры URLTest меняются в LuCI"; return; }
             local _rest="${cmd#fkufa_}" _ch _nv _q
             _ch="${_rest%_*}"; _nv="${_rest##*_}"
             case "$_nv" in disabled|exclude) ;; *) CB_ANSWER_TEXT="Недопустимый режим"; return ;; esac
@@ -13593,6 +13965,7 @@ ${_ip}"; fi
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Применить\",\"callback_data\":\"fkufm_${_ch}_${_nv}\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fkutf_${_ch}\"}]]}"
             ;;
         "fkufm_"*)
+            forkop_v2 && { CB_ANSWER_TEXT="В Forkop 2 фильтры URLTest меняются в LuCI"; return; }
             local _rest="${cmd#fkufm_}" _ch _nv _rc
             _ch="${_rest%_*}"; _nv="${_rest##*_}"
             case "$_nv" in disabled|exclude) ;; *) CB_ANSWER_TEXT="Недопустимый режим"; return ;; esac
@@ -13606,6 +13979,7 @@ ${_ip}"; fi
             ;;
 
         "fkuc_"*)
+            forkop_v2 && { CB_ANSWER_TEXT="В Forkop 2 фильтры URLTest меняются в LuCI"; return; }
             local _rest="${cmd#fkuc_}" _token _code="" _ch _dc _mode _rows="" _line _flag _cnt _idx=0 _icon _cb
             local _base _sel _saved=0 _selected=0 _dirty_text _apply_text
             case "$_rest" in *_*) _token="${_rest%%_*}"; _code="${_rest#*_}" ;; *) _token="$_rest" ;; esac
@@ -13708,6 +14082,7 @@ ${_ip}"; fi
             ;;
 
         "fkuo_"*)
+            forkop_v2 && { CB_ANSWER_TEXT="В Forkop 2 фильтры URLTest меняются в LuCI"; return; }
             local _rest _token _page _ch _mode _names_file _total _per=10 _start _end _i=0 _name _rows="" _icon _short _map_file
             local _draft_file _base_file _selected=0 _saved=0 _left=0 _preview="" _preview_n=0 _dirty=0 _apply_cb _apply_text _dirty_text
             # Navigation may need cache/JSON work. Acknowledge the Telegram callback
@@ -16608,9 +16983,9 @@ EOF
                     local _s_sel _s_now _s_leaf _s_delay _s_icon _s_name _s_tg _s_tg_icon
                     # Get selector tag for this section
                     _s_sel=$(printf '%s' "$th_proxies" | jq -r \
-                        --arg s "$_s" \
+                        --arg s "$_s" --arg t "$(section_clash_tag "$_s")" \
                         '[ .proxies | to_entries[] |
-                           select(.key == ($s + "-out") or (.key | startswith($s + "-"))) |
+                           select(.key == $t or .key == ($s + "-out") or (.key | startswith($s + "-"))) |
                            select(.value.type == "Selector" or .value.type == "URLTest") ]
                          | sort_by((.value.all // []) | length) | last | .key // empty' 2>/dev/null)
                     # Get delay — from selector or direct outbound
@@ -16789,7 +17164,7 @@ EOF
             [ "$hi" = "300" ] && next_hi="60"
 
             sec=$(get_active_section)
-            m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
+            m_port=$(sec_mixed_port "${sec}" || echo "2080")
             m_ip=$(get_proxy_ip)
 
             # Build fallback route chain with active tier highlighted in bold.
@@ -17242,7 +17617,7 @@ EOF
 
             # Check mixed_proxy is enabled — probe uses it as SOCKS5 endpoint
             local _mixed_enabled
-            _mixed_enabled=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "1")
+            _mixed_enabled=$(sec_mixed_enabled "${sec}" || echo "1")
             if [ "$_mixed_enabled" = "0" ]; then
                 send_or_edit "$mid" "$(printf '%s <b>Проверка сейчас недоступна</b>\n\nMixed-прокси отключён для секции <code>%s</code>.\n\nПроверка использует локальный SOCKS5-порт Mixed-прокси и без него не работает.\n\n<i>Включите Mixed-прокси в настройках, затем перезапустите Podkop.</i>' \
                     "$E_WARN" "$sec")" \
@@ -17468,8 +17843,21 @@ EOF
         "cmd_run_podkop_tests")
             local tf="/tmp/podkop_global_check.txt"
             send_or_edit "$mid" "$(printf '%s Запускаем проверку Podkop…' "$E_TIME")" ""
+            if forkop_v2; then
+                # Forkop 2 split global_check into separate JSON checks.
+                : > "$tf"
+                local _chk _out
+                for _chk in check_service check_dns check_traffic check_servers; do
+                    printf '=== %s ===\n' "$_chk" >> "$tf"
+                    _out=$(${PODKOP_BIN} "$_chk" 2>&1) || _out="${_out}
+ОШИБКА: $_chk завершился неудачно"
+                    { printf '%s\n' "$_out" | jq . 2>/dev/null || printf '%s\n' "$_out"; } >> "$tf"
+                    echo >> "$tf"
+                done
+            else
             ${PODKOP_BIN} global_check | sed "s/$(printf '\033')\\[[0-9;]*[a-zA-Z]//g" > "$tf" 2>&1 || \
                 echo "ОШИБКА: global_check завершился неудачно" >> "$tf"
+            fi
             api_document "$tf" "Результаты проверки Podkop"
             rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_diagnostics" "" "" ""
             ;;
