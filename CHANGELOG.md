@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.20.0
+
+- **FORKOP 2.0:** support for Forkop 2.0 (`forkop.settings.config_version` 2.x), shown as "Forkop 2". Forkop 1.x, Forkop X and the other variants are unchanged.
+  - **Mixed proxy** is now a server (`server`, `protocol=mixed`, `routing_mode=section`, `routing_section=<section>`, `listen_port`, `enabled`; accounts in `server_client`). The bot connection (primary SOCKS and reserve mixed proxies of other sections), its credentials, the section's Mixed toggle and port read and write that server; the bot creates one (named as Forkop's migration names it) when you turn Mixed on. Without a section-bound server the primary channel uses an enabled rules-mode mixed server.
+  - **Links** are `connection_link` children (`uri`, `name`, `order`) instead of `selector_proxy_links`: list, add, delete and the link of the active server work on them; an added link gets a unique name without `/`.
+  - **Clash API:** a section's group is its label, links and providers `<label>/<name>`; names are shown without the prefix, the tag→link map comes from the `parser` outbounds, and group names in `/proxies/<group>` paths are percent-encoded (labels may hold spaces or Cyrillic).
+  - **Subscriptions:** traffic and expiry from `subscriptionInfo` in `/providers/proxies` (Forkop 2 has no section cache or metadata command); the node prefix is `override_prefix`.
+  - **Priority groups** → `fallback_group` / `fallback_level`: levels by `server_filter_mode`, countries as flag patterns in `include_regex`; the "fastest" options are gone in Forkop 2 and hidden. URLTest filters are shown read-only (edited in LuCI).
+  - **DNS:** the protocol is part of the server address (`tls://`, `https://`); the protocol switch is hidden. Zapret / Zapret2 / ByeDPI are not offered; Podkop checks run `check_service`, `check_dns`, `check_traffic`, `check_servers` instead of `global_check`.
+- **INSTALLER:** reads the Forkop 2 mixed server for the bot's SOCKS endpoint and the final summary.
+
+---
 ## v0.19.24
 
 - **FIXED (LAN address with a CIDR mask):** OpenWrt 25.12 stores `network.lan.ipaddr` as `192.168.1.1/24`. Where the sing-box config gave no listen address the bot used the raw value, so the mixed proxy became `socks5h://192.168.1.1/24:2080` and the Clash API fallback `192.168.1.1/24:9090`. Podkop 0.8 (podkop-exp) has sing-box built in and no `/etc/sing-box/config.json`, so it always hit this fallback. The LAN address is now the first `ipaddr` value without the mask.

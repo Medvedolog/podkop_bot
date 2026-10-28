@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.24
+# 🤖 podkop_bot 0.20.0
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.24-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.20.0-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -74,7 +74,7 @@
 ```text
 🖥️ Управление Podkop
 Устройство: AX6000
-Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
+Podkop: 0.7.14-r1 (Podkop) | Бот: v0.20.0
 Секция: main
 Активный прокси: 🇳🇱 NL-vless-reality (main-1-out)
 Подключение бота: Podkop (SOCKS5:192.168.2.1:2080)
@@ -249,6 +249,8 @@ Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
 | NetShift: несколько URL подписки списком | ❌ | ✅ | ❌ | ❌ |
 
 
+> **Forkop 2.0** (`config_version` 2.x) поддерживается с бота 0.20.0. Mixed-прокси секции в нём — отдельный «Сервер» (`server`, `protocol=mixed`, маршрут в секцию): бот берёт оттуда порт и учётную запись и сам создаёт такой сервер, когда вы включаете Mixed-прокси в боте. Ручные ссылки — дочерние `connection_link`, приоритетные группы — `fallback_group`, данные подписок (трафик, срок) бот берёт из Clash API. DNS указывается адресом (`tls://`, `https://`), Zapret и ByeDPI в Forkop 2 нет, фильтры URLTest меняются в LuCI. Forkop 1.x работает как раньше.
+
 > **Forkop.** Мониторинг и диагностика — наравне с Plus. Подписки бот правит нативно, через дочерние секции (`config subscription_url`), действие секции пишет в `action`. Значок 👁 означает, что операция требует создать или удалить дочернюю секцию либо правило Forkop: такие вещи бот показывает как есть и отправляет в LuCI. Записывать в поля, которые backend проигнорирует, — значит соврать об успехе, поэтому бот так не делает.
 
 > **NetShift.** Базовое управление поддерживается целиком. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, режимы `selector_text`/`urltest_text`) показываются только на чтение — править их нужно в LuCI. При обновлении с podkop-evolution на NetShift бот переключает runtime сам, вмешиваться не нужно.
@@ -334,7 +336,7 @@ ash install.sh --unattended --action update-luci
 ## 📋 Требования
 
 * OpenWrt 24.x / 25.x или ImmortalWrt
-* Установленный и настроенный podkop (original, netshift/evolution, plus или forkop) 0.7.x с включённым Mixed Proxy Port
+* Установленный и настроенный podkop (original, netshift/evolution, plus, forkop 1.x или Forkop 2) с включённым Mixed Proxy (в Forkop 2 — сервер `mixed`, направленный в секцию)
 * Пакеты: `curl`, `jq` (устанавливаются автоматически)
 * Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
 * TG User ID администратора(-ов) — например через [@Getmyid_Work_Bot](https://t.me/Getmyid_Work_Bot)
