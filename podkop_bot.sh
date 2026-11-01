@@ -7423,6 +7423,9 @@ start_health_daemon() {
 # ------------------------------------------------------------------------------
 _handle_sections() {
     local cmd="$1" mid="$2"
+    if _forkop_v2; then
+        case "$cmd" in sections_menu|set_sec_*) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
+    fi
     local sec=$(get_active_section)
 
     case "$cmd" in
@@ -7506,6 +7509,12 @@ EOF
 # ------------------------------------------------------------------------------
 _handle_proxy() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    if _forkop_v2; then
+        case "$cmd" in
+            proxy_menu|proxy_menu_p_*|px_view_*|test_px_*|cmd_all_delay_test) ;;
+            *) _forkop_v2_ui_guard "$mid" && return ;;
+        esac
+    fi
     local sec=$(get_active_section)
     local per_page=10
 
@@ -8623,6 +8632,9 @@ ESUURLS
 # ------------------------------------------------------------------------------
 _handle_url_links() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    if _forkop_v2; then
+        case "$cmd" in url_links_menu|url_links_p_*|outbound_info) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
+    fi
     local sec=$(get_active_section)
     local per_page=8
 
@@ -8848,6 +8860,9 @@ EOF
 # ------------------------------------------------------------------------------
 _handle_text_links() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    if _forkop_v2; then
+        case "$cmd" in text_links_menu|text_links_p_*) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
+    fi
     local sec=$(get_active_section)
 
     if [ "$PODKOP_VARIANT" = "forkop" ]; then
@@ -9028,7 +9043,7 @@ _handle_settings() {
         # The legacy Forkop editor assumes several fields that 2.0 removed.
         # Read/status cards remain available, but all mutations fail closed.
         case "$cmd" in
-            do_*|STATE_INPUT|ask_toggle_*|ask_sec_toggle_*)
+            do_*|STATE_INPUT|ask_toggle_*|ask_sec_toggle_*|set_log_*|set_update_int_*)
                 _forkop_v2_ui_guard "$mid" && return ;;
         esac
     fi
@@ -9715,6 +9730,7 @@ EOF
 # ------------------------------------------------------------------------------
 _handle_section_extras() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
+    _forkop_v2_ui_guard "$mid" && return
     local sec
     sec=$(get_active_section)
 
@@ -12692,6 +12708,7 @@ _handle_forkop_0198() {
 # than replacing all backup servers with one value.
 _handle_dns_0198() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    _forkop_v2_ui_guard "$mid" && return
     [ "$PODKOP_VARIANT" = "forkop" ] || { _handle_dns "$cmd" "$mid" "$text" "$state"; return; }
 
     if [ "$cmd" = "STATE_INPUT" ]; then
@@ -12776,6 +12793,7 @@ EOF
 
 _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
+    _forkop_v2_ui_guard "$mid" && return
     local sec=$(get_active_section)
     if [ "$PODKOP_VARIANT" != "forkop" ]; then
         case "$cmd" in ts_*|STATE_INPUT) ;; *) _handle_settings "section_settings" "$mid" "" ""; return ;; esac
@@ -14041,6 +14059,7 @@ EOF
 
 _handle_dns() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    _forkop_v2_ui_guard "$mid" && return
 
     if [ "$cmd" = "STATE_INPUT" ]; then
         rm -f "$STATE_FILE"
@@ -14188,6 +14207,9 @@ EOF
 # ------------------------------------------------------------------------------
 _handle_lists() {
     local cmd="$1" mid="$2" text="$3" state="$4"
+    if _forkop_v2; then
+        case "$cmd" in community_lists|lists_menu) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
+    fi
     local sec=$(get_active_section)
 
     if [ "$cmd" = "STATE_INPUT" ]; then
