@@ -7436,7 +7436,7 @@ start_health_daemon() {
 _handle_sections() {
     local cmd="$1" mid="$2"
     if _forkop_v2; then
-        case "$cmd" in sections_menu|set_sec_*) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
+        case "$cmd" in sections_menu|set_sec_*|do_set_sec_*) ;; *) _forkop_v2_ui_guard "$mid" && return ;; esac
     fi
     local sec=$(get_active_section)
 
@@ -7769,11 +7769,11 @@ SUBURLS
                 fi
             fi
 
-            total=$(echo "$proxies" | jq -r --arg sel "$selector" '
+            total=$(echo "$proxies" | jq -r --arg sel "$selector" --argjson groups "$(_forkop_v2 && echo true || echo false)" '
                 . as $root |
                 [$root.proxies[$sel].all[]? |
-                  select(($root.proxies[.].type // "") |
-                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance"))
+                  select($groups or (($root.proxies[.].type // "") |
+                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance")))
                 ] | length // 0' 2>/dev/null)
 
             total_pages=$(( (total + per_page - 1) / per_page ))
@@ -7788,22 +7788,23 @@ SUBURLS
             # Resolves leaf proxy for type/delay (follows Selector->URLTest chains).
             # This replaces 4 jq forks per proxy with a single call — ~10x faster on MIPS.
             # depth counter prevents infinite recursion on cyclic A->B->A proxy references.
-            # Group nodes (URLTest/Selector/Fallback/LoadBalance) are filtered out —
-            # they are internal sing-box routing nodes, not real outbounds to display.
-            # orig_idx is the position in .all[] — used for px_view_N / ask_del_px_N callbacks.
+            # Forkop 2 groups are first-class user-visible objects, especially
+            # when a section only has URLTest/Fallback child groups. Keep their
+            # original indexes for px_view_N while showing the group's members
+            # read-only in its detail card. Older providers retain leaf-only UX.
+            # orig_idx is the position in .all[] — used for px_view_N callbacks.
             page_tsv=$(echo "$proxies" | jq -r \
                 --arg sel "$selector" \
                 --argjson s 0 \
                 --argjson e 9999 \
+                --argjson groups "$(_forkop_v2 && echo true || echo false)" \
                 '
                 . as $root |
-                $root.proxies[$sel].all | to_entries[$s:$e][] |
+                ($root.proxies[$sel].all // []) | to_entries[$s:$e][] |
                 .key as $orig_idx | .value as $name |
-                # Skip internal group nodes — not real proxies
-                select(
-                    ($root.proxies[$name].type // "") |
-                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance")
-                ) |
+                # Forkop 2 presents nested groups; older providers keep leaf-only.
+                select($groups or (($root.proxies[$name].type // "") |
+                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance"))) |
                 # Walk chain with depth limit (max 5 hops) to guard against cycles
                 def leaf(n; depth):
                     if depth <= 0 then n
@@ -7818,7 +7819,8 @@ SUBURLS
                 [
                     ($orig_idx | tostring),
                     $name,
-                    ($root.proxies[$lf].type // $root.proxies[$lf].adapterType // "Unknown"),
+                    (if $groups then ($root.proxies[$name].type // $root.proxies[$lf].type // "Unknown")
+                     else ($root.proxies[$lf].type // $root.proxies[$lf].adapterType // "Unknown") end),
                     (($root.proxies[$name].history[-1].delay //
                       $root.proxies[$lf].history[-1].delay // 0) | tostring)
                 ] | @tsv
@@ -8061,8 +8063,11 @@ EOF
 
             p_display_name=$(html_escape "$(display_proxy_name "$p_name")")
             leaf_name=$(_resolve_leaf "$p_name" "$proxies"); [ -z "$leaf_name" ] && leaf_name="$p_name"
-            p_type=$(echo "$proxies" | jq -r --arg n "$leaf_name" \
-                '.proxies[$n].type // .proxies[$n].adapterType // "Неизвестно"' 2>/dev/null)
+            if _forkop_v2; then
+                p_type=$(echo "$proxies" | jq -r --arg n "$p_name" '.proxies[$n].type // .proxies[$n].adapterType // "Неизвестно"' 2>/dev/null)
+            else
+                p_type=$(echo "$proxies" | jq -r --arg n "$leaf_name" '.proxies[$n].type // .proxies[$n].adapterType // "Неизвестно"' 2>/dev/null)
+            fi
 
             tag_idx=$(get_proxy_index_by_tag "$p_name")
             [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
@@ -8105,6 +8110,24 @@ ${E_GLOB} <b>Карточка прокси</b> [<code>${sec}</code>]
 EOF
 )
             [ "$leaf_name" != "$p_name" ] && text=$(printf '%s\n<b>Конечный прокси:</b> <code>%s</code>' "$text" "$leaf_name_esc")
+            if _forkop_v2; then
+                local _group_members _group_current _group_count
+                _group_members=$(printf '%s' "$proxies" | jq -r --arg n "$p_name" '
+                    .proxies[$n].all // [] | .[:12][]?' 2>/dev/null)
+                _group_count=$(printf '%s' "$proxies" | jq -r --arg n "$p_name" '(.proxies[$n].all // []) | length' 2>/dev/null)
+                _group_current=$(printf '%s' "$proxies" | jq -r --arg n "$p_name" '.proxies[$n].now // empty' 2>/dev/null)
+                if [ -n "$_group_members" ]; then
+                    text=$(printf '%s\n\n<b>Участники группы (%s):</b>' "$text" "${_group_count:-0}")
+                    while IFS= read -r _group_member; do
+                        [ -n "$_group_member" ] || continue
+                        text=$(printf '%s\n • <code>%s</code>' "$text" "$(html_escape "$_group_member")")
+                    done <<FORKOP_GROUP_MEMBERS
+$_group_members
+FORKOP_GROUP_MEMBERS
+                    [ -z "$_group_current" ] || text=$(printf '%s\n<b>Выбран:</b> <code>%s</code>' "$text" "$(html_escape "$_group_current")")
+                    [ "${_group_count:-0}" -le 12 ] 2>/dev/null || text=$(printf '%s\n<i>Показаны первые 12 участников; полный список доступен в Forkop LuCI.</i>' "$text")
+                fi
+            fi
             text=$(printf '%s\n<code>────────────────────</code>\n<b>Ссылка для подключения:</b>\n<code>%s</code>' "$text" "$(html_escape "$share_uri")")
             [ "$_pview_mode" = "proxy:urltest" ] && \
                 text=$(printf '%s\n\n<i>«Выбрать прокси» временно отключит автоматический выбор URLTest.</i>' "$text")
@@ -8141,6 +8164,11 @@ EOF
                     [{"text":$menu,"callback_data":"/menu"}]
                 ] | map(select(length > 0))
                 }')
+            if _forkop_v2; then
+                # The Forkop 2 schema is read-only here. Never offer buttons
+                # that only open an incompatible legacy mutation handler.
+                kb=$(jq -nc --arg i "$p_idx" --arg p "$ret_page" --arg test "$E_BOLT Проверить задержку" --arg back "$E_BACK Назад" --arg menu "🏠 Меню" '{inline_keyboard:[[{"text":$test,"callback_data":("test_px_"+$i)}],[{"text":$back,"callback_data":("proxy_menu_p_"+$p)}],[{"text":$menu,"callback_data":"/menu"}]]}')
+            fi
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
