@@ -17,6 +17,8 @@
 
 ---
 
+> **Тестовая ветка совместимости (не стабильный релиз):** Forkop 2.0 и Podkop Experimental 0.8.x распознаются отдельно. Чтение маршрутов и диагностика адаптированы частично; запись устаревших UCI-полей ограничена. Новые операции с Tailscale и подписками пока требуют штатного LuCI, а обновление Podkop Experimental — интерактивного запуска по SSH. [Состояние и ограничения](COMPAT_FORKOP2_PODKOP_EXP.md).
+
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
 Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`, а также его форк **[Forkop X](https://github.com/slayer326/forkop)** (slayer326). Forkop и Forkop X бот различает сам: проверка версии, ссылки на releases и обновление идут в репозиторий именно того форка, который установлен.
