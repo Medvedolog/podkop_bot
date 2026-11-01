@@ -58,6 +58,14 @@ BOT_VERSION="0.19.24"
 #   get_subscription_server_count, _plus_sub_metadata, and the proxy_mode_menu handler.
 # ==============================================================================
 _detect_podkop_variant() {
+    # Podkop Experimental 0.8 shares Podkop's UCI namespace and binary.
+    # Detect by installed package before any old binary/UCI fingerprint.
+    if command -v apk >/dev/null 2>&1 && apk info -e podkop-exp >/dev/null 2>&1; then
+        echo "podkop-exp"; return
+    fi
+    if command -v opkg >/dev/null 2>&1 && opkg status podkop-exp 2>/dev/null | grep -q '^Status: .* installed$'; then
+        echo "podkop-exp"; return
+    fi
     # forkop = renamed/migrated Podkop Plus (new package/service/UCI namespace:
     # podkop-plus → forkop). MUST be checked BEFORE plus: after a Plus→Forkop
     # migration some stale podkop-plus files may linger, but if forkop is present
@@ -85,6 +93,16 @@ _detect_podkop_variant() {
 }
 
 _forkop_display_name() {
+    # Version 2 is authoritative even if legacy files remain.
+    case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in
+        2.*) printf 'Forkop'; return ;;
+    esac
+    if command -v apk >/dev/null 2>&1 && apk info -e sing-box-forkop >/dev/null 2>&1; then
+        printf 'Forkop'; return
+    fi
+    if command -v opkg >/dev/null 2>&1 && opkg status sing-box-forkop 2>/dev/null | grep -q '^Status: .* installed$'; then
+        printf 'Forkop'; return
+    fi
     # Forkop X carries a dedicated migration helper; prefer this positive marker
     # over absence-based guessing so updater/release links never cross forks.
     if [ -r /usr/share/forkop/mirror-migration.sh ]; then
@@ -101,6 +119,14 @@ _forkop_display_name() {
 # podkop-evolution → NetShift migration in the same session.
 _apply_variant_env() {
     case "$PODKOP_VARIANT" in
+        podkop-exp)
+            PODKOP_UCI="podkop"
+            PODKOP_BIN="/usr/bin/podkop"
+            PODKOP_PKG="podkop-exp"
+            PODKOP_DISPLAY_NAME="Podkop Experimental"
+            PODKOP_GITHUB_REPO="podkop-net/podkop-experimental"
+            PODKOP_INIT="/etc/init.d/podkop"
+            ;;
         forkop)
             PODKOP_UCI="forkop"
             PODKOP_BIN="/usr/bin/forkop"
@@ -1178,6 +1204,11 @@ SB_RESTART_LOG="${BOT_DIR}/sb_restart_log"
 # an upstream DNS-failover storm no longer reads as sing-box dying repeatedly.
 SB_RELOAD_LOG="${BOT_DIR}/sb_reload_log"
 get_singbox_version_display() {
+    # There is no external sing-box core on the experimental Go backend.
+    if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+        printf 'встроен в Podkop Experimental'
+        return 0
+    fi
     # Cache key is the sing-box binary's inode:mtime:size (same signature style
     # as tsnet_capable() in tsnet-provider.sh) so a package replace/downgrade —
     # e.g. Forkop switching the installed build from -extended to standard —
@@ -17851,6 +17882,16 @@ EOF
             ;;
 
         "do_update_podkop")
+            # An installer that can remove packages needs interactive SSH approval.
+            # Never convert a Telegram callback to unattended migration.
+            if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+                send_or_edit "$mid" "$E_WARN <b>Podkop Experimental: обновление через SSH.</b>
+
+Установщик проверяет конфликты и запрашивает согласие на удаление пакетов. Автоматическое обновление в Telegram отключено.
+
+https://github.com/podkop-net/podkop-experimental" '{"inline_keyboard":[[{"text":"Назад","callback_data":"cmd_maintenance"}]]}'
+                return
+            fi
             local _upd_tmp="/tmp/podkop_update.sh"
             local _upd_log="/tmp/podkop_update.log"
             local _upd_url="https://raw.githubusercontent.com/${PODKOP_GITHUB_REPO}/refs/heads/main/install.sh"
