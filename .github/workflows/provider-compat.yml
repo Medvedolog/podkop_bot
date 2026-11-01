@@ -16,3 +16,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate shell syntax and provider guards
         run: sh tools/check-provider-compat.sh
+      - name: Stage bot shell script for testing
+        run: |
+          mkdir -p dist-bot
+          cp podkop_bot.sh dist-bot/podkop_bot.sh
+          cp COMPAT_FORKOP2_PODKOP_EXP.md dist-bot/README-TEST.md
+          (cd dist-bot && sha256sum podkop_bot.sh > SHA256SUMS)
+      - name: Upload ZIP with bot script
+        uses: actions/upload-artifact@v4
+        with:
+          name: podkop_bot-forkop2-podkop-exp-test
+          path: dist-bot/
+          if-no-files-found: error
+          retention-days: 30
