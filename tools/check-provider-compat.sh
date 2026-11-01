@@ -11,4 +11,6 @@ for needle in '_forkop_v2()' '_forkop_mixed_server()' '_mixed_port_for_section()
     grep -Fq "$needle" podkop_bot.sh || { echo "Missing bot contract: $needle" >&2; exit 1; }
 done
 sh tools/check-forkop2-render.sh
+sh tools/test-dev4-modern-ui.sh
+sh tools/test-forkop2-native-clash.sh
 printf '%s\n' 'Podkop Experimental / Forkop 2 static compatibility guards OK'
