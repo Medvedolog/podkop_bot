@@ -16311,7 +16311,15 @@ EOF
             _ts_standalone_present && _ts_standalone_present_flag=1
             [ "$_ts_standalone_present_flag" = 1 ] && _ts_standalone_running && _ts_standalone_running_flag=1
 
-            local _si_total=$((_si_count + _ts_managed_present + _ts_standalone_present_flag))
+            # Forkop 2 moved native tunnels (including Tailscale) to
+            # config tunnel children, which are not inbound servers.
+            local _si_tunnels="" _si_tun_count=0
+            if _forkop_v2; then
+                _si_tunnels=$(uci -q show "$PODKOP_UCI" 2>/dev/null |
+                    sed -n "s/^$PODKOP_UCI\.\([^.=]*\)=tunnel$/\1/p")
+                for _t in $_si_tunnels; do _si_tun_count=$((_si_tun_count + 1)); done
+            fi
+            local _si_total=$((_si_count + _si_tun_count + _ts_managed_present + _ts_standalone_present_flag))
             if [ "$_si_total" -eq 0 ]; then
                 local _ts_empty_add=''
                 # Podkop Plus is intentionally observer-only: it is orphaned and
@@ -16457,6 +16465,23 @@ EOF
                     [ "$_ts_managed_enabled" = true ] && _tm_en_lbl="${E_ON} Узел включён" || _tm_en_lbl="${E_OFF} Узел выключен"
                     _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_tm_en_lbl")\",\"callback_data\":\"ts_e_podkop-bot-tailscale_$([ "$_ts_managed_enabled" = true ] && echo 0 || echo 1)\"}],"
                 fi
+            fi
+
+            # Read-only tunnel inventory. Never infer connectivity from UCI
+            # and never print auth tokens, server passwords or private keys.
+            if _forkop_v2; then
+                local _tun _tun_kind _tun_owner _tun_name _tun_en _tun_icon
+                for _tun in $_si_tunnels; do
+                    _tun_kind=$(uci -q get "$PODKOP_UCI.$_tun.kind" 2>/dev/null)
+                    _tun_owner=$(uci -q get "$PODKOP_UCI.$_tun.section" 2>/dev/null)
+                    _tun_name=$(uci -q get "$PODKOP_UCI.$_tun.name" 2>/dev/null)
+                    _tun_en=$(uci -q get "$PODKOP_UCI.$_tun.enabled" 2>/dev/null)
+                    _tun_icon="$E_YLW"
+                    [ "$_tun_en" = 0 ] && _tun_icon="$E_OFF"
+                    _text=$(printf '%s\n\n%s <b>Туннель %s</b> · <code>%s</code>\n    Секция: <code>%s</code> · %s\n    Состояние подключения: не проверено (UCI)' \
+                        "$_text" "$_tun_icon" "$(html_escape "$_tun_kind")" \
+                        "$(html_escape "$_tun")" "$(html_escape "$_tun_owner")" "$(html_escape "$_tun_name")")
+                done
             fi
 
             for _s in $_si_sections; do
