@@ -8146,12 +8146,20 @@ EOF
                 p_type=$(echo "$proxies" | jq -r --arg n "$leaf_name" '.proxies[$n].type // .proxies[$n].adapterType // "Неизвестно"' 2>/dev/null)
             fi
 
-            tag_idx=$(get_proxy_index_by_tag "$p_name")
-            [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
-            [ -z "$raw_link" ] && raw_link=$(get_uri_by_tag "$p_name")
-            if [ -n "$raw_link" ]; then
-                share_uri="$raw_link"; p_svr_port=$(extract_server_port_from_uri "${raw_link%%#*}")
-            else share_uri="Нет данных"; p_svr_port="Нет данных"; fi
+            if _forkop_v2; then
+                # Forkop 2 keeps manual links in connection_link children.
+                # An obsolete positional list cache can point to another
+                # server and leak incorrect credential-bearing URIs.
+                share_uri="Ссылка не извлекается автоматически; см. Forkop 2 LuCI"
+                p_svr_port="Не определён по тегу"
+            else
+                tag_idx=$(get_proxy_index_by_tag "$p_name")
+                [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
+                [ -z "$raw_link" ] && raw_link=$(get_uri_by_tag "$p_name")
+                if [ -n "$raw_link" ]; then
+                    share_uri="$raw_link"; p_svr_port=$(extract_server_port_from_uri "${raw_link%%#*}")
+                else share_uri="Нет данных"; p_svr_port="Нет данных"; fi
+            fi
             p_svr_port_esc=$(html_escape "$p_svr_port")
 
             p_delay_raw=$(echo "$proxies" | jq -r --arg n "$p_name" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
@@ -8206,7 +8214,7 @@ FORKOP_GROUP_MEMBERS
                 fi
             fi
             text=$(printf '%s\n<code>────────────────────</code>\n<b>Ссылка для подключения:</b>\n<code>%s</code>' "$text" "$(html_escape "$share_uri")")
-            [ "$_pview_mode" = "proxy:urltest" ] && \
+            [ "$_pview_mode" = "proxy:urltest" ] && ! _forkop_v2 && \
                 text=$(printf '%s\n\n<i>«Выбрать прокси» временно отключит автоматический выбор URLTest.</i>' "$text")
             # can_delete: only show Delete if tag has a real manual UCI link.
             # resolve_manual_uci_link_for_tag searches only selector/urltest_proxy_links
