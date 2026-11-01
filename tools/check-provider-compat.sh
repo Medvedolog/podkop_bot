@@ -10,4 +10,5 @@ done
 for needle in '_forkop_v2()' '_forkop_mixed_server()' '_mixed_port_for_section()' 'podkop-net/podkop-experimental' '_forkop_v2_ui_guard' 'Podkop Experimental: обновление через SSH'; do
     grep -Fq "$needle" podkop_bot.sh || { echo "Missing bot contract: $needle" >&2; exit 1; }
 done
+sh tools/check-forkop2-render.sh
 printf '%s\n' 'Podkop Experimental / Forkop 2 static compatibility guards OK'
