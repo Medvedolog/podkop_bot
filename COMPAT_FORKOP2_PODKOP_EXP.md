@@ -24,3 +24,8 @@ sh tools/check-provider-compat.sh
 ```
 
 This is **not** a general-purpose upgrade script. Back up UCI before switching upstream cores.
+
+## Подробное исследование API и UCI
+
+См. [FORKOP2_PODKOP_EXP_API_RESEARCH.md](FORKOP2_PODKOP_EXP_API_RESEARCH.md): ubus, Clash API, схема Forkop 2.0 и Podkop Experimental 0.8.x, полевые результаты AX6000, UI прокси, безопасность и план регрессионных тестов.
+
