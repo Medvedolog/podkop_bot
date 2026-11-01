@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.25-dev2
+# Podkop Telegram Bot v0.19.25-dev3
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.25-dev2"
+BOT_VERSION="0.19.25-dev3"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -799,18 +799,27 @@ lan_ipv4() {
     printf '%s\n' "$_ip"
 }
 
-# Dynamically resolve Clash API endpoint from sing-box config
-CLASH_API_ADDR=$(jq -r '.experimental.clash_api.external_controller // empty' ${SINGBOX_CONFIG_PATH} 2>/dev/null)
-if [ -z "$CLASH_API_ADDR" ]; then
-    if _podkop_exp_v2; then
-        # Embedded Go backend keeps its Clash controller on loopback even
-        # when enable_yacd=0; /etc/sing-box/config.json is not generated.
-        CLASH_API_ADDR="127.0.0.1:9090"
-    else
+# Resolve Clash controller from the actual engine. Forkop 2 has its own
+# config_path; a leftover /etc/sing-box/config.json from Forkop 1 or Podkop
+# may point to a stale server and must not override the current controller.
+CLASH_API_ADDR=""
+if _forkop_v2; then
+    _fk_conf=$(uci -q get forkop.settings.config_path 2>/dev/null)
+    [ -n "$_fk_conf" ] && CLASH_API_ADDR=$(jq -r '.experimental.clash_api.external_controller // empty' "$_fk_conf" 2>/dev/null)
+    [ -n "$CLASH_API_ADDR" ] || CLASH_API_ADDR="127.0.0.1:9090"
+elif _podkop_exp_v2; then
+    # Go backend embeds the controller and doesn't generate the old JSON.
+    CLASH_API_ADDR="127.0.0.1:9090"
+else
+    CLASH_API_ADDR=$(jq -r '.experimental.clash_api.external_controller // empty' "$SINGBOX_CONFIG_PATH" 2>/dev/null)
+    if [ -z "$CLASH_API_ADDR" ]; then
         ROUTER_IP=$(lan_ipv4 || echo "127.0.0.1")
         CLASH_API_ADDR="${ROUTER_IP}:9090"
     fi
 fi
+case "$CLASH_API_ADDR" in
+    '0.0.0.0:9090'|'[::]:9090') CLASH_API_ADDR="127.0.0.1:9090" ;;
+esac
 CLASH_API="http://${CLASH_API_ADDR}"
 
 # SSH/locale-safe emoji constants (hex-encoded UTF-8)
@@ -3723,30 +3732,68 @@ delete_message() {
 # connect-timeout 3 alone only covers the TCP handshake, not the full transfer.
 clash_request() {
     # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.
-    local endpoint="$1" method="${2:-GET}" data="$3"
-    local secret tmp_body
+    local endpoint="$1" method="${2:-GET}" data="${3:-}"
+    local secret tmp_body base="$CLASH_API" fallback="" _ip _probe_ok=0 _rc
     secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
+    # Forkop 2 may bind the API to LAN when YACD is enabled, but localhost
+    # when disabled. A config.json may not exist in the newer Go/ucode engines.
+    # Only attempt this local LAN fallback if the configured endpoint is the
+    # modern default. Do not forward controller secrets to arbitrary hosts.
+    if { _forkop_v2 || _podkop_exp_v2; } && [ "$base" = "http://127.0.0.1:9090" ]; then
+        _ip=$(lan_ipv4 2>/dev/null)
+        case "$_ip" in
+            ''|*[!0-9.]*) : ;;
+            127.*) : ;;
+            *) fallback="http://${_ip}:9090" ;;
+        esac
+    fi
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
-            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${base}${endpoint}" && return 0
+            [ -n "$fallback" ] || return 1
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${fallback}${endpoint}"
         else
-            curl -q --noproxy '*' -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 "${base}${endpoint}" && return 0
+            [ -n "$fallback" ] || return 1
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 "${fallback}${endpoint}"
         fi
     else
-        local rc
+        # A mutating request must be delivered at most once: preflight the
+        # endpoint with GET first rather than retrying a possibly applied PUT.
+        if [ -n "$fallback" ]; then
+            if [ -n "$secret" ]; then
+                curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                    -H "Authorization: Bearer ${secret}" "${base}/proxies" >/dev/null 2>&1 && _probe_ok=1
+            else
+                curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                    "${base}/proxies" >/dev/null 2>&1 && _probe_ok=1
+            fi
+            if [ "$_probe_ok" != 1 ]; then
+                base="$fallback"
+                # No WAN routes or third-party proxies; validate local API.
+                if [ -n "$secret" ]; then
+                    curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                        -H "Authorization: Bearer ${secret}" "${base}/proxies" >/dev/null 2>&1 || return 1
+                else
+                    curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                        "${base}/proxies" >/dev/null 2>&1 || return 1
+                fi
+            fi
+        fi
         tmp_body=$(mktemp /tmp/podkop_clash.XXXXXX) || return 1
         printf '%s' "$data" > "$tmp_body"
         if [ -n "$secret" ]; then
-            curl -fsS --connect-timeout 3 --max-time 10 -X "$method" -H "Authorization: Bearer ${secret}" \
-                -H "Content-Type: application/json" -d @"$tmp_body" "${CLASH_API}${endpoint}"
-            rc=$?
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -X "$method" \
+                -H "Authorization: Bearer ${secret}" -H "Content-Type: application/json" \
+                -d @"$tmp_body" "${base}${endpoint}"
+            _rc=$?
         else
-            curl -fsS --connect-timeout 3 --max-time 10 -X "$method" \
-                -H "Content-Type: application/json" -d @"$tmp_body" "${CLASH_API}${endpoint}"
-            rc=$?
+            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -X "$method" \
+                -H "Content-Type: application/json" -d @"$tmp_body" "${base}${endpoint}"
+            _rc=$?
         fi
         rm -f "$tmp_body"
-        return "$rc"
+        return "$_rc"
     fi
 }
 
@@ -4242,33 +4289,83 @@ uci_commit_safe() {
 # SECTION 6: Proxy Resolution Helpers
 # ==============================================================================
 
+# Read the human section label without changing the stable UCI identifier.
+# Forkop 2 uses the LABEL verbatim as its Clash outbound tag (generator.uc),
+# and the frontend also displays it; the old '-out' UCI name is NOT a tag.
+# Podkop Experimental v2 also has independent section labels.
+section_display_label() {
+    local _id="$1" _label=""
+    case "$PODKOP_VARIANT" in
+        forkop|podkop-exp) _label=$(uci -q get "${PODKOP_UCI}.${_id}.label" 2>/dev/null) ;;
+    esac
+    printf '%s' "${_label:-$_id}"
+}
+
 get_selector_tag() {
     _section_selector_tag "$(get_active_section)" "$1"
 }
 
-# _section_selector_tag SECTION [PROXIES_JSON] — Clash selector/urltest tag of
-# any section (get_selector_tag is this for the active section).
+# _section_selector_tag SECTION [PROXIES_JSON]
+# Forkop 2: generator.uc uses section_display_name() as the root outbound
+# tag, which is `label` when nonempty, otherwise UCI ID. Keep older match
+# rules as fallback only. On missing JSON don't return an invented tag for
+# modern providers, as that produced 'section_123-out · 0 proxies'.
 _section_selector_tag() {
-    local sec="$1" proxies="$2" tag
+    local sec="$1" proxies="$2" tag label fallback
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
-    tag=$(printf '%s' "$proxies" | jq -r --arg s "$sec" \
-        'if .proxies[$s] then $s
+    label=$(section_display_label "$sec")
+    tag=$(printf '%s' "$proxies" | jq -r --arg s "$sec" --arg label "$label" \
+        'if (.proxies | type) != "object" then empty
+         elif .proxies[$label] then $label
+         elif .proxies[$s] then $s
          elif .proxies[$s + "-out"] then ($s + "-out")
+         elif .proxies[$label + "-out"] then ($label + "-out")
          else (.proxies | to_entries
                | map(select(
-                   (.value.type == "Selector" or .value.type == "URLTest")
-                   and (.key | startswith($s))
+                   (.value.type == "Selector" or .value.type == "URLTest" or .value.type == "Fallback")
+                   and ((.key | startswith($label + "/")) or (.key | startswith($s + "-")))
                  ))
-               | sort_by((.value.all // []) | length) | last | .key // ($s + "-out"))
+               | sort_by((.value.all // []) | length) | last | .key // empty)
          end' 2>/dev/null)
-    echo "${tag:-${sec}-out}"
+    if [ -n "$tag" ]; then
+        printf '%s\n' "$tag"
+    elif _forkop_v2 || _podkop_exp_v2; then
+        # Missing selector is genuinely unknown; never fabricate one.
+        return 1
+    else
+        printf '%s\n' "${sec}-out"
+    fi
+}
+
+# Count distinct actual leaf nodes reachable through nested Clash groups.
+# Forkop 2 can have a root Selector whose .all lists only URLTest/Fallback
+# groups. Counting only root .all falsely reports 1-2 'proxies' for 30 nodes.
+# Bound recursion and detect cycles to keep malformed group graphs harmless.
+_clash_section_leaf_count() {
+    local _payload="$1" _sec="$2" _sel
+    _sel=$(_section_selector_tag "$_sec" "$_payload") || { printf '0\n'; return 0; }
+    printf '%s' "$_payload" | jq -r --arg sel "$_sel" '
+        . as $root |
+        def leaves($n; $visited; $depth):
+            if $depth > 8 or ($visited | index($n)) != null then empty
+            else ($root.proxies[$n] // {}) as $p |
+                if (($p.type // "") | IN("Selector","URLTest","Fallback","LoadBalance")) then
+                    ($p.all // [])[]? | leaves(.; $visited + [$n]; $depth + 1)
+                elif ($p.type // "") == "" or ($n | IN("direct","direct-out","block","block-out","dns-out","GLOBAL")) then
+                    empty
+                else $n end
+            end;
+        [leaves($sel; []; 0)] | unique | length
+    ' 2>/dev/null
 }
 
 get_active_proxy_name() {
     local proxies="$1" sel now sel_type
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
     sel=$(get_selector_tag "$proxies")
+    [ -n "$sel" ] || { printf 'Не определён\n'; return 0; }
     sel_type=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].type // empty' 2>/dev/null)
+    [ -n "$sel_type" ] || { printf 'Не определён\n'; return 0; }
     case "$sel_type" in
         Selector|URLTest|Fallback|LoadBalance)
             now=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].now // empty' 2>/dev/null)
@@ -4293,6 +4390,12 @@ get_active_proxy_display() {
     tag=$(get_active_proxy_name "$proxies")
     _sec=$(get_active_section)
     _stype=$(get_section_type "$_sec")
+    if _forkop_v2 || _podkop_exp_v2; then
+        if ! _section_selector_tag "$_sec" "$proxies" >/dev/null 2>&1; then
+            printf 'не определён · Clash API не отдал секцию'
+            return 0
+        fi
+    fi
     # Plus and Forkop can combine subscription sources with a Selector/URLTest
     # mode. Show the selected leaf instead of collapsing the screen to the word
     # "subscription"; this makes a manual Clash API selection visible immediately.
@@ -4350,6 +4453,12 @@ get_subscription_server_count() {
     local proxies sel
     proxies=$(clash_request "/proxies" 2>/dev/null)
     if [ -n "$proxies" ] && [ "$proxies" != "null" ]; then
+        if _forkop_v2 || _podkop_exp_v2; then
+            cnt=$(_clash_section_leaf_count "$proxies" "$sec")
+            case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+            printf '%s\n' "$cnt"
+            return 0
+        fi
         sel=$(get_selector_tag "$proxies")
         if [ -n "$sel" ]; then
             cnt=$(echo "$proxies" | jq -r --arg s "$sel" '
@@ -7665,8 +7774,8 @@ _handle_sections() {
                     done <<EXP_SECTION_SOURCES
 $(_exp_v2_section_sources "$_es")
 EXP_SECTION_SOURCES
-                    _e_txt=$(printf '%s\n<code>%s</code> · %s · подписки %s · ссылки %s' \
-                       "$_e_txt" "$(html_escape "$_es")" "$(html_escape "$(_exp_v2_section_kind "$_es")")" "$_e_sn" "$_e_link")
+                    _e_txt=$(printf '%s\n<b>%s</b> <code>%s</code> · %s · подписки %s · ссылки %s' \
+                       "$_e_txt" "$(html_escape "$(section_display_label "$_es")")" "$(html_escape "$_es")" "$(html_escape "$(_exp_v2_section_kind "$_es")")" "$_e_sn" "$_e_link")
                 done
                 [ "$_e_n" -le 8 ] || _e_txt=$(printf '%s\n<i>Остальные секции: LuCI.</i>' "$_e_txt")
                 [ -z "$_e_txt" ] || _v2_catalog=$(printf '%s' "$_e_txt")
@@ -7690,8 +7799,7 @@ FORKOP_V2_SECTIONS
             for s in $sections; do
                 _sec_count=$((_sec_count + 1))
                 # Only inactive sections get a button (Variant C: no spinning active button)
-                _sdisp="$s"
-                [ "$PODKOP_VARIANT" = "forkop" ] && _sdisp=$(_forkop_section_label "$s")
+                _sdisp=$(section_display_label "$s")
                 [ "$s" != "$sec" ] && rows="${rows}[{\"text\":\"$(json_escape "$_sdisp")\",\"callback_data\":\"set_sec_${s}\"}],"
             done
             if [ "$_sec_count" -eq 0 ]; then
@@ -7710,7 +7818,7 @@ EOF
                 text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Рабочая секция бота:</b> <code>${sec}</code>
+<b>Рабочая секция бота:</b> $(html_escape "$(section_display_label "$sec")")
 
 <i>Это единственная секция — переключаться не на что. При необходимости создайте дополнительные секции в LuCI.</i>
 EOF
@@ -7723,7 +7831,7 @@ EOF
             text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Рабочая секция бота:</b> <code>${sec}</code>
+<b>Рабочая секция бота:</b> $(html_escape "$(section_display_label "$sec")")
 
 <i>Выберите секцию — меню бота (прокси, списки, настройки) будет работать с ней. Сам Podkop не перезапускается: у него работают все включённые секции.</i>
 EOF
@@ -7747,7 +7855,7 @@ EOF
         "set_sec_"*)
             local new_sec="${cmd#set_sec_}"
             send_or_edit "$mid" \
-                "$(printf '%s Переключить меню бота на секцию <code>%s</code>?\n\nМеняется только рабочая секция бота — Podkop не перезапускается.' "$E_CLIP" "$new_sec")" \
+                "$(printf '%s Переключить меню бота на секцию <b>%s</b>?\n\nМеняется только рабочая секция бота — Podkop не перезапускается.' "$E_CLIP" "$(html_escape "$(section_display_label "$new_sec")")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Да\",\"callback_data\":\"do_set_sec_${new_sec}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"sections_menu\"}]]}"
             ;;
     esac
@@ -7955,6 +8063,11 @@ SUBURLS
                 sleep 2
                 proxies=$(clash_request "/proxies")
             fi
+            # A valid JSON error from HTTP (or unrelated API) is NOT a
+            # /proxies payload. Without this check the UI silently says 0.
+            if ! printf '%s' "$proxies" | jq -e '.proxies | type == "object"' >/dev/null 2>&1; then
+                proxies=""
+            fi
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
                 if _podkop_exp_v2; then
                     _exp_v2_readonly_card "$mid" "$sec"
@@ -7971,13 +8084,25 @@ SUBURLS
                 if ! _forkop_v2 && ! _podkop_exp_v2 && { [ "$PODKOP_VARIANT" = "plus" ] || [ "$PODKOP_VARIANT" = "forkop" ] || ! section_is_subscription "$sec"; }; then
                     _dn_kb="${_dn_kb}[{\"text\":\"${E_ADD} Прокси\",\"callback_data\":\"cmd_proxy_add\"}],"
                 fi
-                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>sing-box перезапускается или не смог запуститься с текущей конфигурацией.</i>%b' "$E_ERR" "$_dn_hint")" \
+                local _clash_hint=""
+                if _forkop_v2; then
+                    _clash_hint=$(printf '\n\n<i>Forkop 2: проверьте локальный Clash API 127.0.0.1:9090 и секрет YACD; секция %s.</i>' "$(html_escape "$(section_display_label "$sec")")")
+                fi
+                send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>Прокси нельзя прочитать: API не ответил корректным списком. Это не означает, что подписка пуста.</i>%b%b' "$E_ERR" "$_dn_hint" "$_clash_hint")" \
                     "{\"inline_keyboard\":[${_dn_kb}[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
             selector=$(get_selector_tag "$proxies")
             current_proxy=$(get_active_proxy_name "$proxies")
+            if [ -z "$selector" ] && { _forkop_v2 || _podkop_exp_v2; }; then
+                local _missing_tag _source_hint
+                _missing_tag=$(section_display_label "$sec")
+                _source_hint="В UCI источники присутствуют, но соответствующий Selector отсутствует в ответе Clash API. Возможно, Forkop ещё применяет подписку или использует другую конфигурацию."
+                send_or_edit "$mid" "$(printf '%s <b>Секция:</b> %s\n\n%s\n\n<i>Ожидаемый тег Clash:</i> <code>%s</code>' "$E_WARN" "$(html_escape "$_missing_tag")" "$_source_hint" "$(html_escape "$_missing_tag")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"proxy_menu\"}],[{\"text\":\"${E_TEST} Диагностика\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"main_menu\"}]]}"
+                return
+            fi
             current_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$current_proxy")")
 
             # Detect URLTest mode and whether auto or manual is active
@@ -8247,10 +8372,16 @@ PMURLEOF
                     *)                   _card_title="${E_GLOB} <b>Прокси · Selector</b>" ;;
                 esac
             fi
-            if _forkop_v2; then
-                _card_title="$E_GLOB <b>Прокси и группы Forkop 2.0</b> · $total"
-            elif _podkop_exp_v2; then
-                _card_title="$E_GLOB <b>Источники и серверы Podkop Experimental</b> · $total"
+            if _forkop_v2 || _podkop_exp_v2; then
+                local _nodes _groups_desc
+                _nodes=$(_clash_section_leaf_count "$proxies" "$sec")
+                case "$_nodes" in ''|*[!0-9]*) _nodes="?" ;; esac
+                _groups_desc="${total} элементов · ${_nodes} серверов"
+                if _forkop_v2; then
+                    _card_title="$E_GLOB <b>Прокси и группы Forkop 2.0</b> · ${_groups_desc}"
+                else
+                    _card_title="$E_GLOB <b>Источники и серверы Podkop Experimental</b> · ${_groups_desc}"
+                fi
             fi
             # NetShift selector_text/urltest_text: links live in a multiline
             # scalar (not a UCI list) — full add/delete editor in _handle_text_links.
@@ -8261,7 +8392,7 @@ PMURLEOF
                     ;;
             esac
             text=$(cat <<EOF
-${_card_title} [<code>${sec}</code>]
+${_card_title} [$(html_escape "$(section_display_label "$sec")")]
 <b>Активный прокси:</b> <code>${current_proxy_display}</code>${auto_hint}${_sub_url_line}
 
 ${list_text}
@@ -8379,7 +8510,7 @@ EOF
             esac
 
             text=$(cat <<EOF
-${E_GLOB} <b>Карточка прокси</b> [<code>${sec}</code>]
+${E_GLOB} <b>Карточка прокси</b> [$(html_escape "$(section_display_label "$sec")")]
 <code>────────────────────</code>
 <b>${p_display_name}</b>
 <b>Тип:</b> ${p_type_esc}
@@ -16092,7 +16223,7 @@ _handle_bot() {
 
             # Show section name always when >1 section, on its own line before Active Route
             sec_str=""
-            [ "$sec_count" -gt 1 ] && sec_str="<b>Секция:</b> <code>${sec}</code>"
+            [ "$sec_count" -gt 1 ] && sec_str="<b>Секция:</b> $(html_escape "$(section_display_label "$sec")")"
 
             # Subscription metadata for Plus (traffic/expiry) — show in main menu
             # Traffic/expiry shown in proxy view, not main menu
@@ -17225,7 +17356,7 @@ EOF
             _poll_route_disp=$(_route_key_disp "$LAST_ROUTE_POLL")
             _fast_route_disp=$(_route_key_disp "$LAST_ROUTE_FAST")
             text=$(cat <<EOF
-${E_HEALTH} <b>Состояние туннеля</b> [<code>${sec}</code>]
+${E_HEALTH} <b>Состояние туннеля</b> [$(html_escape "$(section_display_label "$sec")")]
 <code>────────────────────</code>
 ${E_PRX} <b>sing-box:</b> ${sb_state}
 ${E_RAM} <b>PID:</b> <code>${sb_pid}</code> | <b>ОЗУ:</b> ${sb_ram} МБ
