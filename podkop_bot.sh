@@ -871,6 +871,47 @@ forkop_child_counts() {
     '
 }
 
+# Forkop 2: catalog child sources without reading out secret values.
+forkop_v2_section_catalog() {
+    _forkop_v2 || return 1
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="$PODKOP_UCI." '
+        {
+            k=$1
+            sub("^" p, "", k)
+            v=$2
+            for (z=3;z<=NF;z++) v=v "=" $z
+            gsub(/\047/,"",v)
+            dot=index(k,".")
+            if (dot==0) {order[++n]=k;typ[k]=v}
+            else {
+                sec=substr(k,1,dot-1); opt=substr(k,dot+1)
+                if (opt=="section") owner[sec]=v
+                if (opt=="action") act[sec]=v
+                if (opt=="enabled") en[sec]=v
+                if (opt=="label") lbl[sec]=v
+            }
+        }
+        END {
+            for (i=1;i<=n;i++) {
+                sec=order[i]
+                if (typ[sec]!="section") continue
+                subn=ln=utn=fbn=tn=ifn=0
+                for (j=1;j<=n;j++) {
+                    ch=order[j]
+                    if (owner[ch]!=sec) continue
+                    if (typ[ch]=="subscription_url") subn++
+                    else if (typ[ch]=="connection_link") ln++
+                    else if (typ[ch]=="urltest") utn++
+                    else if (typ[ch]=="fallback_group") fbn++
+                    else if (typ[ch]=="tunnel") tn++
+                    else if (typ[ch]=="section_interface") ifn++
+                }
+                name=lbl[sec]; gsub(/[|\r\n]/," ",name)
+                printf "%s|%s|%s|%s|%d|%d|%d|%d|%d|%d\n",sec,name,act[sec],en[sec],subn,ln,utn,fbn,tn,ifn
+            }
+        }'
+}
+
 forkop_child_count() {
     local _count
     _count=$(forkop_children_by_type_and_owner "$1" "$2" 2>/dev/null | awk 'NF { n++ } END { print n+0 }')
@@ -7452,6 +7493,23 @@ _handle_sections() {
                 | grep -v '_routing$')
             rows=""
             local _sec_count=0
+            local _v2_catalog="" _v2_count=0
+            if _forkop_v2; then
+                while IFS='|' read -r _cn _cl _ca _ce _cs _ck _cu _cf _ct _ci; do
+                    [ -n "$_cn" ] || continue
+                    _v2_count=$((_v2_count + 1))
+                    [ "$_v2_count" -le 8 ] || continue
+                    _ico="$E_ON"
+                    [ "$_ce" = 0 ] && _ico="$E_OFF"
+                    [ -n "$_cl" ] || _cl="$_cn"
+                    _v2_catalog=$(printf '%s\n%s <b>%s</b> <code>%s</code> · %s\n    Подписки %s · ссылки %s · URLTest %s · Fallback %s · туннели %s · интерфейсы %s' \
+                        "$_v2_catalog" "$_ico" "$(html_escape "$_cl")" "$(html_escape "$_cn")" \
+                        "$(html_escape "$_ca")" "$_cs" "$_ck" "$_cu" "$_cf" "$_ct" "$_ci")
+                done <<FORKOP_V2_SECTIONS
+$(forkop_v2_section_catalog)
+FORKOP_V2_SECTIONS
+                [ "$_v2_count" -le 8 ] || _v2_catalog=$(printf '%s\n<i>Остальные секции доступны в LuCI.</i>' "$_v2_catalog")
+            fi
             for s in $sections; do
                 _sec_count=$((_sec_count + 1))
                 # Only inactive sections get a button (Variant C: no spinning active button)
@@ -7467,7 +7525,8 @@ ${E_WARN} <i>Секции не найдены. Конфигурация Podkop �
 EOF
 )
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
-                send_or_edit "$mid" "$text" "$kb"
+                [ -z "$_v2_catalog" ] || text=$(printf '%s\n\n<b>Состав Forkop 2.0:</b>%s' "$text" "$_v2_catalog")
+            send_or_edit "$mid" "$text" "$kb"
                 return
             elif [ "$_sec_count" -eq 1 ]; then
                 # Only one section — nothing to switch to. Avoid showing an empty picker.
@@ -7480,7 +7539,8 @@ ${E_CLIP} <b>Управление секциями</b>
 EOF
 )
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
-                send_or_edit "$mid" "$text" "$kb"
+                [ -z "$_v2_catalog" ] || text=$(printf '%s\n\n<b>Состав Forkop 2.0:</b>%s' "$text" "$_v2_catalog")
+            send_or_edit "$mid" "$text" "$kb"
                 return
             fi
             text=$(cat <<EOF
@@ -7492,6 +7552,7 @@ ${E_CLIP} <b>Управление секциями</b>
 EOF
 )
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+            [ -z "$_v2_catalog" ] || text=$(printf '%s\n\n<b>Состав Forkop 2.0:</b>%s' "$text" "$_v2_catalog")
             send_or_edit "$mid" "$text" "$kb"
             ;;
         "do_set_sec_"*)
