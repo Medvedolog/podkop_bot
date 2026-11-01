@@ -117,6 +117,48 @@ _forkop_display_name() {
 # _apply_variant_env: re-applies all variant-dependent variables after
 # _detect_podkop_variant() runs. Called after do_update_podkop to handle
 # podkop-evolution → NetShift migration in the same session.
+# Forkop 2.0 represents Mixed Proxy as a standalone routed server.
+_forkop_v2() {
+    [ "$PODKOP_VARIANT" = forkop ] || return 1
+    case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in 2.*) return 0 ;; esac
+    [ -r /usr/share/sing-box-forkop/variant ]
+}
+_forkop_mixed_server() {
+    local _owner="$1" _id
+    for _id in $(uci -q show forkop 2>/dev/null | sed -n 's/^forkop\.\([^.=]*\)=server$/\1/p'); do
+        [ "$(uci -q get "forkop.$_id.protocol" 2>/dev/null)" = mixed ] || continue
+        [ "$(uci -q get "forkop.$_id.routing_mode" 2>/dev/null)" = section ] || continue
+        [ "$(uci -q get "forkop.$_id.routing_section" 2>/dev/null)" = "$_owner" ] || continue
+        printf '%s\n' "$_id"
+        return 0
+    done
+    return 1
+}
+_mixed_port_for_section() {
+    local _section="$1" _server=""
+    if _forkop_v2; then
+        _server=$(_forkop_mixed_server "$_section") || return 1
+        [ "$(uci -q get "forkop.$_server.enabled" 2>/dev/null)" != 0 ] || return 1
+        uci -q get "forkop.$_server.listen_port" 2>/dev/null
+    else
+        uci -q get "$PODKOP_UCI.$_section.mixed_proxy_port" 2>/dev/null
+    fi
+}
+_mixed_enabled_for_section() {
+    local _section="$1" _server=""
+    if _forkop_v2; then
+        _server=$(_forkop_mixed_server "$_section") || return 1
+        [ "$(uci -q get "forkop.$_server.enabled" 2>/dev/null)" != 0 ]
+    else
+        [ "$(uci -q get "$PODKOP_UCI.$_section.mixed_proxy_enabled" 2>/dev/null)" = 1 ]
+    fi
+}
+_forkop_v2_ui_guard() {
+    _forkop_v2 || return 1
+    forkop_readonly_notice "$1" "section_settings" "Несовместимое поле Forkop 1.x" "Для настройки используйте LuCI Forkop 2.0"
+    return 0
+}
+
 _apply_variant_env() {
     case "$PODKOP_VARIANT" in
         podkop-exp)
@@ -1717,8 +1759,7 @@ _resolve_primary_section() {
         _en=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
         [ -z "$_en" ] && _en=1
         [ "$_en" = "1" ] || continue
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
-        if [ "$_me" = "1" ]; then
+        if _mixed_enabled_for_section "$_s"; then
             _sec="$_s"
             break
         fi
@@ -1779,7 +1820,12 @@ _load_transport_ctx() {
     local _primary_sec; _primary_sec=$(_resolve_primary_section "$_t_all_secs")
 
     _t_sec="$_primary_sec"
-    _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
+    _t_port=$(_mixed_port_for_section "$_t_sec")
+    if _forkop_v2; then
+        case "$_t_port" in ''|*[!0-9]*) _t_port="" ;; esac
+    else
+        [ -n "$_t_port" ] || _t_port=2080
+    fi
     _t_ip=$(lan_ipv4 || echo "192.168.1.1")
     _t_auth=$(_mixed_proxy_auth "$_t_sec")
     # Resolve actual listen IP from config.json for tier1
@@ -1817,9 +1863,9 @@ _load_transport_ctx() {
     for _s in $_t_all_secs; do
         [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
         local _me _mp _ct
-        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
-        [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
+        _mixed_enabled_for_section "$_s" || continue
+        _mp=$(_mixed_port_for_section "$_s")
+        [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
         local _fb_ip; _fb_ip=$(_resolve_mixed_listen_ip_by_port "$_mp")
         local _fb_auth; _fb_auth=$(_mixed_proxy_auth "$_s")
         local _auto_fb="socks5h://${_fb_auth}${_fb_ip}:${_mp}"
@@ -1859,6 +1905,9 @@ _url_encode_cred() {
 _mixed_proxy_auth() {
     local _sec="$1" _en _u _p
     [ -n "$_sec" ] || return 0
+    # No per-section auth in Forkop2. An authenticated server is tried and
+    # rejected by curl, then regular transport failover handles the condition.
+    _forkop_v2 && return 0
     _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
     [ "$_en" = "1" ] || return 0
     _u=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_username" 2>/dev/null)
@@ -4380,6 +4429,11 @@ safe_reload_podkop() {
         [ "$rc" = "124" ] && logger -t podkop-bot "[Reload] Timed out after 120s"
     else
         ${PODKOP_INIT} reload; rc=$?
+    fi
+    # Experimental Podkop embeds its core and has no generated sing-box JSON.
+    if [ "$PODKOP_VARIANT" = podkop-exp ] && [ "$rc" -eq 0 ]; then
+        logger -t podkop-bot "[Reload] embedded experimental core applied settings"
+        return 0
     fi
     # Wait for sing-box config.json to be written and valid before building caches.
     # podkop reload is semi-async: returns before sing-box fully restarts.
@@ -9508,6 +9562,7 @@ EOF
             send_or_edit "$mid" "$(printf '%s %s обход туннеля для NTP?' "$E_WARN" "$_act_ntp")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Да\",\"callback_data\":\"do_toggle_ntp\"}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"global_settings\"}]]}"
             ;;
         "ask_toggle_mixed")
+            _forkop_v2_ui_guard "$mid" && return
             local _mp; _mp=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null)
             local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
             local _note=""
@@ -9550,6 +9605,7 @@ EOF
                 "{\"inline_keyboard\":[[{\"text\":\"Прокси\",\"callback_data\":\"do_set_conn_proxy\"},{\"text\":\"VPN\",\"callback_data\":\"do_set_conn_vpn\"},{\"text\":\"Блокировка\",\"callback_data\":\"do_set_conn_block\"}${_excl_btn}],[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"section_settings\"}]]}"
             ;;
         "do_set_conn_"*)
+            _forkop_v2_ui_guard "$mid" && return
             local new_ct="${cmd#do_set_conn_}"
             if [ "$PODKOP_VARIANT" = "forkop" ]; then
                 case "$new_ct" in
@@ -9598,6 +9654,7 @@ EOF
         "do_toggle_wan")  toggle_uci_bool "${PODKOP_UCI}.settings" "enable_badwan_interface_monitoring";   safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
         "do_toggle_ntp")  toggle_uci_bool "${PODKOP_UCI}.settings" "exclude_ntp";                         safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
         "do_toggle_mixed")
+            _forkop_v2_ui_guard "$mid" && return
             local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
             # When enabling mixed proxy — ensure required parameters are set
             if [ "$_cur_me" != "1" ]; then
@@ -12399,6 +12456,8 @@ EOF
 # Dedicated compact handler for 0.19.8 Forkop additions.
 _handle_forkop_0198() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
+    # Do not mutate a migrated Forkop2 schema with legacy 1.x editors.
+    _forkop_v2_ui_guard "$mid" && return
     local sec; sec=$(get_active_section)
     [ "$PODKOP_VARIANT" = "forkop" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
 
