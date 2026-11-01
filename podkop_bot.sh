@@ -7980,6 +7980,19 @@ EOF
                 kb="${kb}[{\"text\":\"${E_BOLT} Проверить задержки\",\"callback_data\":\"cmd_all_delay_test\"}],"
                 kb="${kb}[{\"text\":\"${E_ADD} Прокси\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Диагностика\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"main_menu\"}]]}"
             fi
+            # Forkop 2 has a different write schema: do not advertise
+            # legacy "add proxy" or "edit subscription" buttons that cannot
+            # safely mutate native connection_link / subscription_url records.
+            if _forkop_v2; then
+                kb=$(printf '%s' "$kb" | jq -c '
+                    .inline_keyboard |= [
+                        .[] | [ .[] |
+                          select(.callback_data != "cmd_proxy_add"
+                              and .callback_data != "cmd_edit_sub_url"
+                              and .callback_data != "do_px_auto_urltest")
+                        ] | select(length > 0)
+                    ]' 2>/dev/null)
+            fi
             local _card_title _sub_url_line=""
             # Show subscription URL(s) for subscription sections
             if section_is_subscription "$sec"; then
@@ -8041,6 +8054,9 @@ PMURLEOF
                     proxy:urltest_text)  _card_title="${E_INFO} <b>URLTest (текстовый режим)</b>" ;;
                     *)                   _card_title="${E_GLOB} <b>Прокси · Selector</b>" ;;
                 esac
+            fi
+            if _forkop_v2; then
+                _card_title="$E_GLOB <b>Прокси и группы Forkop 2.0</b> · $total"
             fi
             # NetShift selector_text/urltest_text: links live in a multiline
             # scalar (not a UCI list) — full add/delete editor in _handle_text_links.
