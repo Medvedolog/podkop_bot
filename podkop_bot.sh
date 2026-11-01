@@ -16623,6 +16623,11 @@ EOF
                 [ "$_enabled" != "1" ] && [ "$_enabled" != "" ] && \
                     _text="${_text} <i>(отключён)</i>"
                 _text="${_text} · <code>${_s_esc}</code>"
+                if _forkop_v2; then
+                    local _server_label
+                    _server_label=$(uci -q get "$PODKOP_UCI.$_s.label" 2>/dev/null)
+                    [ -z "$_server_label" ] || _text="$_text\n    🏷 $(html_escape "$_server_label")"
+                fi
 
                 # Port / address
                 if [ "$_proto" = "tailscale" ]; then
@@ -16729,6 +16734,12 @@ EOF
                 # Connections from Clash API (optional)
                 if [ -f "$_conn_map_file" ]; then
                     local _inbound_tag="${_s}-server-in"
+                    # Forkop 2 inbound tags use server_display_name() (label
+                    # with UCI ID fallback), not the retired NAME-server-in tag.
+                    if _forkop_v2; then
+                        _inbound_tag=$(uci -q get "$PODKOP_UCI.$_s.label" 2>/dev/null)
+                        [ -n "$_inbound_tag" ] || _inbound_tag="$_s"
+                    fi
                     local _cs _cc _cdl _cul
                     _cs=$(_si_conn_stats "$_inbound_tag")
                     _cc=$(printf '%s' "$_cs" | awk '{print $2}')
