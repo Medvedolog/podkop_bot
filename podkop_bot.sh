@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.25-dev4
+# Podkop Telegram Bot v0.19.25-dev5
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.25-dev4"
+BOT_VERSION="0.19.25-dev5"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -4343,6 +4343,55 @@ section_display_label() {
     printf '%s' "${_label:-$_id}"
 }
 
+# Human-readable section title (UCI ID and exact runtime label stay intact).
+# Forkop auto-generates labels like "Section #1"; render them in Russian.
+_section_human_label() {
+    local _label
+    _label=$(section_display_label "$1")
+    case "$_label" in
+        'Section #'*)
+            local _num=${_label#Section #}
+            case "$_num" in
+                ''|*[!0-9]*) printf '%s\n' "$_label" ;;
+                *) printf 'Секция №%s\n' "$_num" ;;
+            esac ;;
+        *)
+            # A new/unlabelled native section still needs a stable readable
+            # display title rather than its generated section_<hash> ID.
+            if _forkop_v2 && [ "$_label" = "$1" ]; then
+                local _ordinal
+                _ordinal=$(uci -q show forkop 2>/dev/null | awk -F'[.=]' -v want="$1"                     '$1=="forkop" && $3=="section" && NF==3 {n++;if($2==want){print n;exit}}')
+                if [ -n "$_ordinal" ]; then
+                    printf 'Секция №%s\n' "$_ordinal"
+                    return 0
+                fi
+            fi
+            printf '%s\n' "$_label" ;;
+    esac
+}
+
+# Native Forkop 2 child display label. The raw ID must remain unchanged.
+_forkop_native_human_label() {
+    local _id="$1" _label="" _name=""
+    _label=$(uci -q get "forkop.${_id}.label" 2>/dev/null)
+    [ -n "$_label" ] || _label=$(uci -q get "forkop.${_id}.name" 2>/dev/null)
+    if [ -z "$_label" ]; then
+        local _kind _protocol
+        _kind=$(uci -q get "forkop.${_id}.kind" 2>/dev/null)
+        _protocol=$(uci -q get "forkop.${_id}.protocol" 2>/dev/null)
+        case "$_kind" in
+            warp) _label='WARP-туннель' ;;
+            tailscale) _label='Tailscale-туннель' ;;
+            wireguard) _label='WireGuard-туннель' ;;
+        esac
+        [ -n "$_label" ] || case "$_protocol" in
+            mixed) _label='Mixed Proxy' ;;
+            *) _label="$_id" ;;
+        esac
+    fi
+    printf '%s\n' "$_label"
+}
+
 get_selector_tag() {
     _section_selector_tag "$(get_active_section)" "$1"
 }
@@ -4589,6 +4638,21 @@ get_subscription_urls() {
             | sed "s/^[^=]*=//; s/^'//; s/'$//" \
             | grep -v "^[[:space:]]*$"
     fi
+}
+
+# Selected real outbound for a URLTest/Fallback/Selector group.
+# Never replace the API tag with this display-only name.
+_group_selected_human_name() {
+    local _tag="$1" _proxies="$2" _leaf _type _human
+    _leaf=$(_resolve_leaf "$_tag" "$_proxies")
+    [ -n "$_leaf" ] && [ "$_leaf" != "$_tag" ] || return 1
+    _type=$(printf '%s' "$_proxies" | jq -r --arg n "$_leaf" '.proxies[$n].type // empty' 2>/dev/null)
+    case "$_type" in
+        ''|Selector|URLTest|Fallback|LoadBalance) return 1 ;;
+    esac
+    _human=$(display_proxy_name "$_leaf")
+    [ -n "$_human" ] && [ "$_human" != Unknown ] || return 1
+    printf '%s\n' "$_human"
 }
 
 _resolve_leaf() {
@@ -7917,7 +7981,7 @@ _handle_sections() {
 $(_exp_v2_section_sources "$_es")
 EXP_SECTION_SOURCES
                     _e_txt=$(printf '%s\n<b>%s</b> <code>%s</code> · %s · подписки %s · ссылки %s' \
-                       "$_e_txt" "$(html_escape "$(section_display_label "$_es")")" "$(html_escape "$_es")" "$(html_escape "$(_exp_v2_section_kind "$_es")")" "$_e_sn" "$_e_link")
+                       "$_e_txt" "$(html_escape "$(_section_human_label "$_es")")" "$(html_escape "$_es")" "$(html_escape "$(_exp_v2_section_kind "$_es")")" "$_e_sn" "$_e_link")
                 done
                 [ "$_e_n" -le 8 ] || _e_txt=$(printf '%s\n<i>Остальные секции: LuCI.</i>' "$_e_txt")
                 [ -z "$_e_txt" ] || _v2_catalog=$(printf '%s' "$_e_txt")
@@ -7929,7 +7993,7 @@ EXP_SECTION_SOURCES
                     [ "$_v2_count" -le 8 ] || continue
                     _ico="$E_ON"
                     [ "$_ce" = 0 ] && _ico="$E_OFF"
-                    [ -n "$_cl" ] || _cl="$_cn"
+                    _cl=$(_section_human_label "$_cn")
                     _v2_catalog=$(printf '%s\n%s <b>%s</b> <code>%s</code> · %s\n    Подписки %s · ссылки %s · URLTest %s · Fallback %s · туннели %s · интерфейсы %s' \
                         "$_v2_catalog" "$_ico" "$(html_escape "$_cl")" "$(html_escape "$_cn")" \
                         "$(html_escape "$_ca")" "$_cs" "$_ck" "$_cu" "$_cf" "$_ct" "$_ci")
@@ -7941,7 +8005,7 @@ FORKOP_V2_SECTIONS
             for s in $sections; do
                 _sec_count=$((_sec_count + 1))
                 # Only inactive sections get a button (Variant C: no spinning active button)
-                _sdisp=$(section_display_label "$s")
+                _sdisp=$(_section_human_label "$s")
                 [ "$s" != "$sec" ] && rows="${rows}[{\"text\":\"$(json_escape "$_sdisp")\",\"callback_data\":\"set_sec_${s}\"}],"
             done
             if [ "$_sec_count" -eq 0 ]; then
@@ -7960,7 +8024,7 @@ EOF
                 text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Рабочая секция бота:</b> $(html_escape "$(section_display_label "$sec")")
+<b>Рабочая секция бота:</b> $(html_escape "$(_section_human_label "$sec")")
 
 <i>Это единственная секция — переключаться не на что. При необходимости создайте дополнительные секции в LuCI.</i>
 EOF
@@ -7973,7 +8037,7 @@ EOF
             text=$(cat <<EOF
 ${E_CLIP} <b>Управление секциями</b>
 
-<b>Рабочая секция бота:</b> $(html_escape "$(section_display_label "$sec")")
+<b>Рабочая секция бота:</b> $(html_escape "$(_section_human_label "$sec")")
 
 <i>Выберите секцию — меню бота (прокси, списки, настройки) будет работать с ней. Сам Podkop не перезапускается: у него работают все включённые секции.</i>
 EOF
@@ -7997,7 +8061,7 @@ EOF
         "set_sec_"*)
             local new_sec="${cmd#set_sec_}"
             send_or_edit "$mid" \
-                "$(printf '%s Переключить меню бота на секцию <b>%s</b>?\n\nМеняется только рабочая секция бота — Podkop не перезапускается.' "$E_CLIP" "$(html_escape "$(section_display_label "$new_sec")")")" \
+                "$(printf '%s Переключить меню бота на секцию <b>%s</b>?\n\nМеняется только рабочая секция бота — Podkop не перезапускается.' "$E_CLIP" "$(html_escape "$(_section_human_label "$new_sec")")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Да\",\"callback_data\":\"do_set_sec_${new_sec}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"sections_menu\"}]]}"
             ;;
     esac
@@ -8228,7 +8292,7 @@ SUBURLS
                 fi
                 local _clash_hint=""
                 if _forkop_v2; then
-                    _clash_hint=$(printf '\n\n<i>Forkop 2: проверьте локальный Clash API 127.0.0.1:9090 и секрет YACD; секция %s.</i>' "$(html_escape "$(section_display_label "$sec")")")
+                    _clash_hint=$(printf '\n\n<i>Forkop 2: проверьте локальный Clash API 127.0.0.1:9090 и секрет YACD; секция %s.</i>' "$(html_escape "$(_section_human_label "$sec")")")
                 fi
                 send_or_edit "$mid" "$(printf '%s <b>Clash API недоступен</b>\n<i>Прокси нельзя прочитать: API не ответил корректным списком. Это не означает, что подписка пуста.</i>%b%b' "$E_ERR" "$_dn_hint" "$_clash_hint")" \
                     "{\"inline_keyboard\":[${_dn_kb}[{\"text\":\"${E_RST} Повторить\",\"callback_data\":\"proxy_menu\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
@@ -8250,6 +8314,8 @@ SUBURLS
                 return
             fi
             current_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$current_proxy")")
+            # get_active_proxy_name walks Selector -> URLTest -> real leaf; the
+            # mode line below continues to identify the automatic group.
             local selector_chosen
             selector_chosen=$(printf '%s' "$proxies" | jq -r --arg sel "$selector" '.proxies[$sel].now // empty' 2>/dev/null)
 
@@ -8381,6 +8447,24 @@ SUBURLS
                 # Human-readable name (UCI fragment or tag)
                 human_name=$(display_proxy_name "$name")
                 if _forkop_v2 || _podkop_exp_v2; then
+                    # Show what URLTest actually selected, not only its group
+                    # title: "Автовыбор → 🇨🇭 Швейцария". The callback still
+                    # uses the full name from Clash .all[$orig_idx].
+                    local _chosen_human="" _group_human=""
+                    case "$ptype" in
+                        URLTest|Fallback|Selector|LoadBalance)
+                            _chosen_human=$(_group_selected_human_name "$name" "$proxies")
+                            if [ -n "$_chosen_human" ]; then
+                                case "$ptype" in
+                                    URLTest) _group_human='Автовыбор' ;;
+                                    Fallback) _group_human='Резерв' ;;
+                                    Selector) _group_human='Группа' ;;
+                                    LoadBalance) _group_human='Балансировка' ;;
+                                esac
+                                human_name="${_group_human} → ${_chosen_human}"
+                            fi
+                            ;;
+                    esac
                     local _source_part
                     if [ "${dupes:-0}" -gt 0 ] 2>/dev/null; then
                         case "$name" in
@@ -8580,7 +8664,7 @@ PMURLEOF
                     ;;
             esac
             text=$(cat <<EOF
-${_card_title} [$(html_escape "$(section_display_label "$sec")")]
+${_card_title} [$(html_escape "$(_section_human_label "$sec")")]
 <b>Активный прокси:</b> <code>${current_proxy_display}</code>${auto_hint}${_sub_url_line}
 
 ${list_text}
@@ -8698,7 +8782,7 @@ EOF
             esac
 
             text=$(cat <<EOF
-${E_GLOB} <b>Карточка прокси</b> [$(html_escape "$(section_display_label "$sec")")]
+${E_GLOB} <b>Карточка прокси</b> [$(html_escape "$(_section_human_label "$sec")")]
 <code>────────────────────</code>
 <b>${p_display_name}</b>
 <b>Тип:</b> ${p_type_esc}
@@ -8722,7 +8806,12 @@ EOF
                     done <<FORKOP_GROUP_MEMBERS
 $_group_members
 FORKOP_GROUP_MEMBERS
-                    [ -z "$_group_current" ] || text=$(printf '%s\n<b>Выбран:</b> %s' "$text" "$(html_escape "$(display_proxy_name "$_group_current")")")
+                    if [ -n "$_group_current" ]; then
+                        local _group_real_leaf _group_real_display
+                        _group_real_leaf=$(_resolve_leaf "$p_name" "$proxies")
+                        _group_real_display=$(display_proxy_name "$_group_real_leaf")
+                        text=$(printf '%s\n<b>Выбранный сервер:</b> %s' "$text" "$(html_escape "$_group_real_display")")
+                    fi
                     [ "${_group_count:-0}" -le 12 ] 2>/dev/null || text=$(printf '%s\n<i>Показаны первые 12 участников; полный список доступен в Forkop LuCI.</i>' "$text")
                 fi
             fi
@@ -16411,7 +16500,7 @@ _handle_bot() {
 
             # Show section name always when >1 section, on its own line before Active Route
             sec_str=""
-            [ "$sec_count" -gt 1 ] && sec_str="<b>Секция:</b> $(html_escape "$(section_display_label "$sec")")"
+            [ "$sec_count" -gt 1 ] && sec_str="<b>Секция:</b> $(html_escape "$(_section_human_label "$sec")")"
 
             # Subscription metadata for Plus (traffic/expiry) — show in main menu
             # Traffic/expiry shown in proxy view, not main menu
@@ -17101,9 +17190,19 @@ EOF
                     _tun_en=$(uci -q get "$PODKOP_UCI.$_tun.enabled" 2>/dev/null)
                     _tun_icon="$E_YLW"
                     [ "$_tun_en" = 0 ] && _tun_icon="$E_OFF"
-                    _text=$(printf '%s\n\n%s <b>Туннель %s</b> · <code>%s</code>\n    Секция: <code>%s</code> · %s\n    Состояние подключения: не проверено (UCI)' \
-                        "$_text" "$_tun_icon" "$(html_escape "$_tun_kind")" \
-                        "$(html_escape "$_tun")" "$(html_escape "$_tun_owner")" "$(html_escape "$_tun_name")")
+                    local _tun_display _tun_section_display _tun_kind_display
+                    _tun_display=$(_forkop_native_human_label "$_tun")
+                    _tun_section_display=$(_section_human_label "$_tun_owner")
+                    case "$_tun_kind" in
+                        warp) _tun_kind_display='WARP' ;;
+                        tailscale) _tun_kind_display='Tailscale' ;;
+                        wireguard) _tun_kind_display='WireGuard' ;;
+                        amneziawg) _tun_kind_display='AmneziaWG' ;;
+                        *) _tun_kind_display="$_tun_kind" ;;
+                    esac
+                    _text=$(printf '%s\n\n%s <b>%s</b> · туннель %s\n    Секция: %s\n    Состояние подключения: не проверено (UCI)' \
+                        "$_text" "$_tun_icon" "$(html_escape "$_tun_display")" \
+                        "$(html_escape "$_tun_kind_display")" "$(html_escape "$_tun_section_display")")
                 done
             fi
 
@@ -17151,21 +17250,25 @@ EOF
                 _proto_esc=$(html_escape "$_proto")
                 _pubhost_esc=$(html_escape "$_pubhost")
                 _sni_esc=$(html_escape "$_sni")
-                _routing_sec_esc=$(html_escape "$_routing_sec")
+                if _forkop_v2 && [ -n "$_routing_sec" ]; then
+                    _routing_sec_esc=$(html_escape "$(_section_human_label "$_routing_sec")")
+                else
+                    _routing_sec_esc=$(html_escape "$_routing_sec")
+                fi
 
                 local _listen_disp
                 [ "$_listen" = "0.0.0.0" ] || [ "$_listen" = "::" ] \
                     && _listen_disp="*" || _listen_disp=$(html_escape "$_listen")
 
-                _text="${_text}\n\n${_icon} <b>${_proto_esc}</b>"
-                [ "$_enabled" != "1" ] && [ "$_enabled" != "" ] && \
-                    _text="${_text} <i>(отключён)</i>"
-                _text="${_text} · <code>${_s_esc}</code>"
                 if _forkop_v2; then
                     local _server_label
-                    _server_label=$(uci -q get "$PODKOP_UCI.$_s.label" 2>/dev/null)
-                    [ -z "$_server_label" ] || _text="$_text\n    🏷 $(html_escape "$_server_label")"
+                    _server_label=$(_forkop_native_human_label "$_s")
+                    _text="${_text}\n\n${_icon} <b>$(html_escape "$_server_label")</b> · ${_proto_esc}"
+                else
+                    _text="${_text}\n\n${_icon} <b>${_proto_esc}</b> · <code>${_s_esc}</code>"
                 fi
+                [ "$_enabled" != "1" ] && [ "$_enabled" != "" ] && \
+                    _text="${_text} <i>(отключён)</i>"
 
                 # Port / address
                 if [ "$_proto" = "tailscale" ]; then
@@ -17544,7 +17647,7 @@ EOF
             _poll_route_disp=$(_route_key_disp "$LAST_ROUTE_POLL")
             _fast_route_disp=$(_route_key_disp "$LAST_ROUTE_FAST")
             text=$(cat <<EOF
-${E_HEALTH} <b>Состояние туннеля</b> [$(html_escape "$(section_display_label "$sec")")]
+${E_HEALTH} <b>Состояние туннеля</b> [$(html_escape "$(_section_human_label "$sec")")]
 <code>────────────────────</code>
 ${E_PRX} <b>sing-box:</b> ${sb_state}
 ${E_RAM} <b>PID:</b> <code>${sb_pid}</code> | <b>ОЗУ:</b> ${sb_ram} МБ
