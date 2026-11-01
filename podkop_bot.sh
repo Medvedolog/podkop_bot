@@ -1922,7 +1922,7 @@ _mixed_proxy_auth() {
 _try_socks_tiers() {
     local args="$1" max_time="$2" ct="$3"
     # tier1: primary Podkop SOCKS
-    if [ "$_t_policy" != "direct" ]; then
+    if [ "$_t_policy" != "direct" ] && [ -n "$_t_port" ]; then
         if _try_curl "-x socks5h://${_t_auth}${_t_ip}:${_t_port}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier1"
             ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
@@ -9024,6 +9024,14 @@ _handle_settings() {
     local cmd="$1" mid="$2" text="$3" state="$4"
     local sec=$(get_active_section)
 
+    if _forkop_v2; then
+        # The legacy Forkop editor assumes several fields that 2.0 removed.
+        # Read/status cards remain available, but all mutations fail closed.
+        case "$cmd" in
+            do_*|STATE_INPUT|ask_toggle_*|ask_sec_toggle_*)
+                _forkop_v2_ui_guard "$mid" && return ;;
+        esac
+    fi
     if [ "$PODKOP_VARIANT" = "forkop" ]; then
         case "$cmd" in
             proxy_mode_menu|ask_switch_mode_*|do_switch_mode_*)
