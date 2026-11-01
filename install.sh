@@ -1426,6 +1426,26 @@ _get_socks_endpoints() {
     local _results=""
     local _pkg; _pkg=$(_podkop_uci_pkg)
     local _primary_sec _port _lan_ip _field_name
+    # Forkop 2 moves Mixed Proxy listeners into dedicated routed UCI servers.
+    # Discover these first. The legacy section-field scan below only applies
+    # to older branches and cannot overwrite a correctly detected v2 listener.
+    if [ "$_pkg" = forkop ]; then
+        case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in
+            2.*)
+                for _server in $(uci -q show forkop 2>/dev/null | sed -n 's/^forkop\.\([^.=]*\)=server$/\1/p'); do
+                    [ "$(uci -q get "forkop.$_server.protocol" 2>/dev/null)" = mixed ] || continue
+                    [ "$(uci -q get "forkop.$_server.routing_mode" 2>/dev/null)" = section ] || continue
+                    [ "$(uci -q get "forkop.$_server.enabled" 2>/dev/null)" != 0 ] || continue
+                    _port=$(uci -q get "forkop.$_server.listen_port" 2>/dev/null)
+                    case "$_port" in ''|*[!0-9]*) continue ;; esac
+                    _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+                    [ -n "$_lan_ip" ] || _lan_ip=192.168.1.1
+                    _results="socks5h://$_lan_ip:$_port"
+                    break
+                done
+                ;;
+        esac
+    fi
 
     if [ "$_pkg" = "podkop-plus" ] || [ "$_pkg" = "forkop" ]; then
         _field_name="action"
