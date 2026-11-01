@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.25-dev3
+# Podkop Telegram Bot v0.19.25-dev4
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.25-dev3"
+BOT_VERSION="0.19.25-dev4"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -3726,6 +3726,27 @@ delete_message() {
 # SECTION 5: Clash API & UCI Helpers
 # ==============================================================================
 
+# Forkop 2's own allowlisted Clash API adapter reads the runtime controller
+# address and bearer secret, unlike older bots using a stale config.json.
+# Its stdout is a JSON wrapper {status, body}; the body is a STRING for JSON
+# payloads. Never log the raw wrapper (it may include URI/host information).
+_forkop_clash_cli() {
+    local _method="$1" _path="$2" _body="${3:-}" _response
+    _forkop_v2 && [ -x "${PODKOP_BIN:-/usr/bin/forkop}" ] || return 1
+    case "$_method:$_path" in
+        GET:/proxies|GET:/providers/proxies|GET:/connections|GET:/tailscale) ;;
+        GET:/proxies/*|GET:/group/*|GET:/providers/*|PUT:/proxies/*) ;;
+        *) return 1 ;;
+    esac
+    _response=$("${PODKOP_BIN:-/usr/bin/forkop}" clash_api "$_method" "$_path" "$_body" 2>/dev/null) || return 1
+    printf '%s' "$_response" | jq -er '
+        select(.status >= 200 and .status < 300) |
+        if .body == null then "{}"
+        elif (.body | type) == "string" then .body
+        else (.body | tojson) end
+    ' 2>/dev/null
+}
+
 # Communicate with the local sing-box Clash API (proxy status, delay tests, etc.)
 # --max-time 10: guards against the case where the local Clash API accepts the TCP
 # connection but then hangs on the response (e.g. sing-box under high load, OOM).
@@ -3750,16 +3771,33 @@ clash_request() {
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
             curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${base}${endpoint}" && return 0
-            [ -n "$fallback" ] || return 1
-            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${fallback}${endpoint}"
+            if [ -n "$fallback" ]; then
+                curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${fallback}${endpoint}" && return 0
+            fi
+            _forkop_clash_cli GET "$endpoint" ""
         else
             curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 "${base}${endpoint}" && return 0
-            [ -n "$fallback" ] || return 1
-            curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 "${fallback}${endpoint}"
+            if [ -n "$fallback" ]; then
+                curl -q --noproxy '*' -fsS --connect-timeout 3 --max-time 10 "${fallback}${endpoint}" && return 0
+            fi
+            _forkop_clash_cli GET "$endpoint" ""
         fi
     else
         # A mutating request must be delivered at most once: preflight the
         # endpoint with GET first rather than retrying a possibly applied PUT.
+        if _forkop_v2 && [ -z "$fallback" ]; then
+            if [ -n "$secret" ]; then
+                curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                    -H "Authorization: Bearer ${secret}" "${base}/proxies" >/dev/null 2>&1 || {
+                        _forkop_clash_cli "$method" "$endpoint" "$data"; return $?
+                    }
+            else
+                curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
+                    "${base}/proxies" >/dev/null 2>&1 || {
+                        _forkop_clash_cli "$method" "$endpoint" "$data"; return $?
+                    }
+            fi
+        fi
         if [ -n "$fallback" ]; then
             if [ -n "$secret" ]; then
                 curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
@@ -3773,10 +3811,14 @@ clash_request() {
                 # No WAN routes or third-party proxies; validate local API.
                 if [ -n "$secret" ]; then
                     curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
-                        -H "Authorization: Bearer ${secret}" "${base}/proxies" >/dev/null 2>&1 || return 1
+                        -H "Authorization: Bearer ${secret}" "${base}/proxies" >/dev/null 2>&1 || {
+                        _forkop_clash_cli "$method" "$endpoint" "$data"; return $?
+                    }
                 else
                     curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 5 \
-                        "${base}/proxies" >/dev/null 2>&1 || return 1
+                        "${base}/proxies" >/dev/null 2>&1 || {
+                        _forkop_clash_cli "$method" "$endpoint" "$data"; return $?
+                    }
                 fi
             fi
         fi
@@ -4596,9 +4638,95 @@ get_proxy_human_name_by_tag() {
     return 1
 }
 
+# Forkop 2 tags carry an exact section LABEL prefix and, for subscription
+# nodes, a source prefix (e.g. "Section #1/sub1/🇩🇪 Германия").  Those are
+# stable Clash API identities; shorten them ONLY for human-facing display.
+# Quoted case patterns preserve section labels containing '/' and glob chars.
+# Never strip arbitrary paths: a user may name a manual node "EU/Paris".
+_modern_proxy_display_tag() {
+    local _tag="$1" _sec="${2:-}" _root="" _rest="" _source="" _id=""
+    [ -n "$_tag" ] || { printf 'Unknown\n'; return; }
+    _forkop_v2 || { printf '%s\n' "$_tag"; return; }
+    [ -n "$_sec" ] || _sec=$(get_active_section)
+    [ -n "$_sec" ] || { printf '%s\n' "$_tag"; return; }
+    _root=$(section_display_label "$_sec")
+    case "$_tag" in
+        "$_root"/*) _rest=${_tag#"$_root"/} ;;
+        "$_sec"/*)  _rest=${_tag#"$_sec"/} ;;
+        *) printf '%s\n' "$_tag"; return ;;
+    esac
+    # The generator uses <section>/<subscription-tag>/<node>.  Only remove
+    # the known auto-generated subN segment, never a user-defined slash.
+    case "$_rest" in
+        sub[0-9]*/*)
+            _source=${_rest%%/*}; _id=${_source#sub}
+            case "$_id" in ''|*[!0-9]*) ;; *) _rest=${_rest#*/} ;; esac
+            ;;
+    esac
+    [ -n "$_rest" ] || _rest="$_tag"
+    printf '%s\n' "$_rest"
+}
+
+# Podkop Experimental 0.8.8: subscription/manual tags are generated by
+# numberedTags(source.Name + ": ", names), and a single link uses source.Name.
+# Only shorten names belonging to real source UCI sections; tags are kept
+# unchanged for selectors, API writes and link lookups.
+_exp_v2_proxy_display_tag() {
+    local _tag="$1" _source="" _title=""
+    _podkop_exp_v2 || { printf '%s\n' "$_tag"; return; }
+    local _section
+    _section=$(get_active_section)
+    case "$_tag" in
+        "${_section}-out") printf '%s\n' "$(section_display_label "$_section")"; return ;;
+        "${_section}-urltest") printf 'Автовыбор (URLTest)\n'; return ;;
+        "${_section}-fallback-"[0-9]*)
+            printf 'Резерв №%s\n' "${_tag#"${_section}-fallback-"}"; return ;;
+    esac
+    case "$_tag" in
+        *': '*) _source=${_tag%%: *} ;;
+        *) _source=$_tag ;;
+    esac
+    [ -n "$_source" ] || { printf '%s\n' "$_tag"; return; }
+    [ "$(uci -q get "podkop.$_source" 2>/dev/null)" = source ] || {
+        printf '%s\n' "$_tag"; return;
+    }
+    case "$_tag" in
+        "$_source":\ *)
+            _title=${_tag#"$_source": }
+            [ -n "$_title" ] && { printf '%s\n' "$_title"; return; }
+            ;;
+        "$_source")
+            _title=$(uci -q get "podkop.$_source.label" 2>/dev/null)
+            [ -n "$_title" ] && { printf '%s\n' "$_title"; return; }
+            printf 'Источник %s\n' "$_source"; return
+            ;;
+    esac
+    printf '%s\n' "$_tag"
+}
+
+# Telegram renders a single-column inline-keyboard at roughly 30-35 symbols
+# on phones.  Truncate only buttons, never API tags, cards or list entries.
+# Existing UTF-8 helpers preserve Cyrillic and paired regional flag glyphs.
+_proxy_button_name() {
+    local _value="$1" _limit="${2:-28}" _length
+    _length=$(_utf8_len "$_value")
+    if [ "$_length" -gt "$_limit" ] 2>/dev/null; then
+        printf '%s…' "$(_utf8_head "$_value" "$((_limit - 1))")"
+    else
+        printf '%s' "$_value"
+    fi
+}
+
 display_proxy_name() {
     local tag="$1" human cached_uri srv_port type_str
     [ -z "$tag" ] && { echo "Unknown"; return 0; }
+    if _forkop_v2; then
+        human=$(_modern_proxy_display_tag "$tag")
+        [ "$human" != "$tag" ] && { printf '%s\n' "$human"; return 0; }
+    elif _podkop_exp_v2; then
+        human=$(_exp_v2_proxy_display_tag "$tag")
+        [ "$human" != "$tag" ] && { printf '%s\n' "$human"; return 0; }
+    fi
     # 1. Try human name from selector_proxy_links index (fast, works for selector mode)
     human=$(get_proxy_human_name_by_tag "$tag")
     [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
@@ -4629,7 +4757,15 @@ display_proxy_name_with_tag() {
     local tag="$1" human
     [ -z "$tag" ] && { echo "Unknown"; return 0; }
     human=$(display_proxy_name "$tag")
-    [ "$human" != "$tag" ] && printf '%s (%s)\n' "$human" "$tag" || printf '%s\n' "$tag"
+    # Forkop 2 has long hierarchical tags. The raw identifier is already
+    # available in the detailed proxy card and must not clutter every status.
+    if _forkop_v2 || _podkop_exp_v2; then
+        printf '%s\n' "$human"
+    elif [ "$human" != "$tag" ]; then
+        printf '%s (%s)\n' "$human" "$tag"
+    else
+        printf '%s\n' "$tag"
+    fi
 }
 
 extract_server_port_from_uri() {
@@ -6353,6 +6489,12 @@ send_weekly_report() {
             '.proxies[$sel].all // [] | length' 2>/dev/null || echo 0)
         _manual=$(( ${_total:-0} - ${_sub_cnt:-0} ))
         [ "$_manual" -lt 0 ] && _manual=0
+        if _forkop_v2 || _podkop_exp_v2; then
+            # Modern counts are the total reachable leaves.  Source breakdown
+            # is not derivable from root Selector members without provenance.
+            _total="$_sub_cnt"
+            _manual=-1
+        fi
         [ "$_ut_flag" = "1" ] && _sec_mode_disp="URLTest" || _sec_mode_disp="Selector"
         if [ "${_total:-0}" -gt 0 ] 2>/dev/null; then
             [ "$_manual" -gt 0 ] && \
@@ -8098,12 +8240,18 @@ SUBURLS
             if [ -z "$selector" ] && { _forkop_v2 || _podkop_exp_v2; }; then
                 local _missing_tag _source_hint
                 _missing_tag=$(section_display_label "$sec")
-                _source_hint="В UCI источники присутствуют, но соответствующий Selector отсутствует в ответе Clash API. Возможно, Forkop ещё применяет подписку или использует другую конфигурацию."
+                if _podkop_exp_v2; then
+                    _source_hint="UCI source/member прочитаны, но Selector секции не найден. У Podkop Experimental имя Selector обычно <имя-секции>-out. Проверьте, что ядро запущено и источники загружены."
+                else
+                    _source_hint="В UCI источники присутствуют, но соответствующий Selector отсутствует в Clash API. Возможно, Forkop ещё применяет подписку или использует другую конфигурацию."
+                fi
                 send_or_edit "$mid" "$(printf '%s <b>Секция:</b> %s\n\n%s\n\n<i>Ожидаемый тег Clash:</i> <code>%s</code>' "$E_WARN" "$(html_escape "$_missing_tag")" "$_source_hint" "$(html_escape "$_missing_tag")")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"proxy_menu\"}],[{\"text\":\"${E_TEST} Диагностика\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"main_menu\"}]]}"
                 return
             fi
             current_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$current_proxy")")
+            local selector_chosen
+            selector_chosen=$(printf '%s' "$proxies" | jq -r --arg sel "$selector" '.proxies[$sel].now // empty' 2>/dev/null)
 
             # Detect URLTest mode and whether auto or manual is active
             local proxy_mode_cur urltest_group urltest_now is_auto_mode auto_hint
@@ -8159,7 +8307,7 @@ SUBURLS
             end_idx=$(( start_idx + per_page ))
             [ "$end_idx" -gt "$total" ] && end_idx="$total"
 
-            # ONE jq call for the entire page: returns TSV orig_idx\tname\ttype\tdelay_raw
+            # ONE jq call for the entire page: TSV idx, full tag, type, delay, duplicate-name count
             # Resolves leaf proxy for type/delay (follows Selector->URLTest chains).
             # This replaces 4 jq forks per proxy with a single call — ~10x faster on MIPS.
             # depth counter prevents infinite recursion on cyclic A->B->A proxy references.
@@ -8175,7 +8323,8 @@ SUBURLS
                 --argjson groups "$( { _forkop_v2 || _podkop_exp_v2; } && echo true || echo false)" \
                 '
                 . as $root |
-                ($root.proxies[$sel].all // []) | to_entries[$s:$e][] |
+                ($root.proxies[$sel].all // []) as $all |
+                $all | to_entries[$s:$e][] |
                 .key as $orig_idx | .value as $name |
                 # Forkop 2 presents nested groups; older providers keep leaf-only.
                 select($groups or (($root.proxies[$name].type // "") |
@@ -8191,19 +8340,27 @@ SUBURLS
                         else n end
                     end;
                 leaf($name; 5) as $lf |
+                # De-duplicate the visual label in this same jq invocation;
+                # launching jq once per button caused latency on weak routers.
+                def short(n):
+                    if (n | contains(": ")) then (n | split(": ")[1:] | join(": "))
+                    else (n | split("/") | last) end;
+                ($all | map(select(. != $name) | short(.))
+                      | map(select(. == short($name))) | length) as $dupes |
                 [
                     ($orig_idx | tostring),
                     $name,
                     (if $groups then ($root.proxies[$name].type // $root.proxies[$lf].type // "Unknown")
                      else ($root.proxies[$lf].type // $root.proxies[$lf].adapterType // "Unknown") end),
                     (($root.proxies[$name].history[-1].delay //
-                      $root.proxies[$lf].history[-1].delay // 0) | tostring)
+                      $root.proxies[$lf].history[-1].delay // 0) | tostring),
+                    ($dupes | tostring)
                 ] | @tsv
                 ' 2>/dev/null)
 
             rows=""; list_text=""; local disp_count=0 disp_idx=0
 
-            while IFS=$(printf '\t') read -r orig_idx name ptype delay_raw; do
+            while IFS=$(printf '\t') read -r orig_idx name ptype delay_raw dupes; do
                 [ -z "$name" ] && continue
                 # Paginate by display position (not .all[] index)
                 if [ "$disp_idx" -lt "$start_idx" ]; then disp_idx=$((disp_idx+1)); continue; fi
@@ -8223,8 +8380,20 @@ SUBURLS
 
                 # Human-readable name (UCI fragment or tag)
                 human_name=$(display_proxy_name "$name")
+                if _forkop_v2 || _podkop_exp_v2; then
+                    local _source_part
+                    if [ "${dupes:-0}" -gt 0 ] 2>/dev/null; then
+                        case "$name" in
+                            */*/*) _source_part=${name#*/}; _source_part=${_source_part%%/*} ;;
+                            *': '*) _source_part=${name%%: *} ;;
+                            *) _source_part="" ;;
+                        esac
+                        [ -n "$_source_part" ] && human_name="$human_name · $_source_part"
+                    fi
+                fi
 
-                # List: active proxy gets ▶ + bold; others plain
+                # List: the current Selector choice (including a URLTest group)
+                # gets ▶, while the active leaf remains visible in the heading.
                 # html_escape name: URI fragment may contain < > & from user input
                 safe_name=$(html_escape "$human_name")
                 # For Plus: mark filtered/inactive outbounds
@@ -8238,7 +8407,7 @@ SUBURLS
                 # active outbound is obvious on the button itself — no need to
                 # match the [index] against the list before tapping to test/switch.
                 local btn_mark
-                if [ "$name" = "$current_proxy" ]; then
+                if [ "$name" = "$selector_chosen" ] || [ "$name" = "$current_proxy" ]; then
                     btn_mark="${E_PLAY}"
                     list_text=$(printf '%s\n<code>[%s]</code> %s <b>%s%s</b> | %s | %s' \
                         "$list_text" "$abs_idx" "${E_PLAY}" \
@@ -8249,7 +8418,16 @@ SUBURLS
                         "$list_text" "$abs_idx" "$icon" \
                         "$_ls_mark" "$safe_name" "$ptype" "$delay_txt")
                 fi
-                short_name=$(json_escape "[${abs_idx}] ${btn_mark} ${_ls_mark}${human_name}")
+                local _button_name
+                _button_name=$(_proxy_button_name "$human_name" 28)
+                # Distinguish automatic groups from individual nodes.  The
+                # Selector tag itself (not this button text) is used on click.
+                case "$ptype" in
+                    URLTest)    _button_name="⚡ ${_button_name}" ;;
+                    Fallback)   _button_name="↪ ${_button_name}" ;;
+                    LoadBalance) _button_name="⇄ ${_button_name}" ;;
+                esac
+                short_name=$(json_escape "[${abs_idx}] ${btn_mark} ${_ls_mark}${_button_name}")
                 rows="${rows}[{\"text\":\"${short_name}\",\"callback_data\":\"px_view_${abs_idx}\"}],"
                 disp_idx=$((disp_idx + 1))
             done <<EOF
@@ -8376,7 +8554,17 @@ PMURLEOF
                 local _nodes _groups_desc
                 _nodes=$(_clash_section_leaf_count "$proxies" "$sec")
                 case "$_nodes" in ''|*[!0-9]*) _nodes="?" ;; esac
-                _groups_desc="${total} элементов · ${_nodes} серверов"
+                local _group_num
+                _group_num=$(printf '%s' "$proxies" | jq -r --arg sel "$selector" '
+                    . as $r | [($r.proxies[$sel].all // [])[] |
+                        select(($r.proxies[.].type // "") | IN("Selector","URLTest","Fallback","LoadBalance"))] | length
+                ' 2>/dev/null)
+                case "$_group_num" in ''|*[!0-9]*) _group_num=0 ;; esac
+                if [ "$_group_num" -gt 0 ] 2>/dev/null; then
+                    _groups_desc="${_nodes} серверов · ${_group_num} групп"
+                else
+                    _groups_desc="${_nodes} серверов"
+                fi
                 if _forkop_v2; then
                     _card_title="$E_GLOB <b>Прокси и группы Forkop 2.0</b> · ${_groups_desc}"
                 else
@@ -8530,11 +8718,11 @@ EOF
                     text=$(printf '%s\n\n<b>Участники группы (%s):</b>' "$text" "${_group_count:-0}")
                     while IFS= read -r _group_member; do
                         [ -n "$_group_member" ] || continue
-                        text=$(printf '%s\n • <code>%s</code>' "$text" "$(html_escape "$_group_member")")
+                        text=$(printf '%s\n • %s' "$text" "$(html_escape "$(display_proxy_name "$_group_member")")")
                     done <<FORKOP_GROUP_MEMBERS
 $_group_members
 FORKOP_GROUP_MEMBERS
-                    [ -z "$_group_current" ] || text=$(printf '%s\n<b>Выбран:</b> <code>%s</code>' "$text" "$(html_escape "$_group_current")")
+                    [ -z "$_group_current" ] || text=$(printf '%s\n<b>Выбран:</b> %s' "$text" "$(html_escape "$(display_proxy_name "$_group_current")")")
                     [ "${_group_count:-0}" -le 12 ] 2>/dev/null || text=$(printf '%s\n<i>Показаны первые 12 участников; полный список доступен в Forkop LuCI.</i>' "$text")
                 fi
             fi
@@ -8590,7 +8778,7 @@ FORKOP_GROUP_MEMBERS
             # Send separate status message below card — don't replace the card
             local _tst_payload
             _tst_payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" \
-                --arg txt "$(printf '%s Проверяем задержку: <b>%s</b>…' "$E_TIME" "$(html_escape "$p_name")")" \
+                --arg txt "$(printf '%s Проверяем задержку: <b>%s</b>…' "$E_TIME" "$(html_escape "$(display_proxy_name "$p_name")")")" \
                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
             status_resp=$(api_request_fast "sendMessage" "$_tst_payload")
             status_mid=$(printf '%s' "$status_resp" | jq -r '.result.message_id // empty' 2>/dev/null)
