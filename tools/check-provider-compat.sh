@@ -12,5 +12,6 @@ for needle in '_forkop_v2()' '_forkop_mixed_server()' '_mixed_port_for_section()
 done
 sh tools/check-forkop2-render.sh
 sh tools/test-dev4-modern-ui.sh
+sh tools/test-dev5-human-ui.sh
 sh tools/test-forkop2-native-clash.sh
 printf '%s\n' 'Podkop Experimental / Forkop 2 static compatibility guards OK'
