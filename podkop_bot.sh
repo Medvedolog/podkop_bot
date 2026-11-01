@@ -1905,9 +1905,21 @@ _url_encode_cred() {
 _mixed_proxy_auth() {
     local _sec="$1" _en _u _p
     [ -n "$_sec" ] || return 0
-    # No per-section auth in Forkop2. An authenticated server is tried and
-    # rejected by curl, then regular transport failover handles the condition.
-    _forkop_v2 && return 0
+    # Forkop2 credentials belong to server_client records, not the section.
+    if _forkop_v2; then
+        local _server _client
+        _server=$(_forkop_mixed_server "$_sec") || return 0
+        [ "$(uci -q get "forkop.$_server.mixed_auth_enabled" 2>/dev/null)" = 1 ] || return 0
+        for _client in $(uci -q show forkop 2>/dev/null | sed -n 's/^forkop\.\([^.=]*\)=server_client$/\1/p'); do
+            [ "$(uci -q get "forkop.$_client.server" 2>/dev/null)" = "$_server" ] || continue
+            _u=$(uci -q get "forkop.$_client.name" 2>/dev/null)
+            _p=$(uci -q get "forkop.$_client.password" 2>/dev/null)
+            [ -n "$_u" ] && [ -n "$_p" ] || continue
+            printf '%s:%s@' "$(_url_encode_cred "$_u")" "$(_url_encode_cred "$_p")"
+            return 0
+        done
+        return 0
+    fi
     _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
     [ "$_en" = "1" ] || return 0
     _u=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_username" 2>/dev/null)
