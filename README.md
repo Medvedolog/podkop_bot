@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.25-dev1
+# 🤖 podkop_bot 0.19.25-dev2
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.25--dev1-orange?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.19.25--dev2-orange?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -17,7 +17,7 @@
 
 ---
 
-> **0.19.25-dev1 — только разработка; не релиз, не проверено на роутерах:** Forkop 2.0 и Podkop Experimental 0.8.x распознаются отдельно. Чтение маршрутов и диагностика адаптированы частично; запись устаревших UCI-полей ограничена. Новые операции с Tailscale и подписками пока требуют штатного LuCI, а обновление Podkop Experimental — интерактивного запуска по SSH. [Состояние и ограничения](COMPAT_FORKOP2_PODKOP_EXP.md).
+> **0.19.25-dev2 — только разработка; не релиз, не проверено на роутерах:** Forkop 2.0 и Podkop Experimental 0.8.x распознаются отдельно. Чтение маршрутов и диагностика адаптированы частично; запись устаревших UCI-полей ограничена. Новые операции с Tailscale и подписками пока требуют штатного LuCI, а обновление Podkop Experimental — интерактивного запуска по SSH. [Состояние и ограничения](COMPAT_FORKOP2_PODKOP_EXP.md).
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
