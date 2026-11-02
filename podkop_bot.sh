@@ -12826,6 +12826,13 @@ _ts_provider_kind() {
     printf '%s' none
 }
 _ts_backend_native() { [ "$(_ts_provider_kind)" = "forkop-native" ]; }
+# Native Forkop 2 server/protocol=tailscale can be managed by the standalone
+# bot without installing BearGuard's optional RPC backend. All other
+# integrations still require the versioned backend.
+_ts_management_available() {
+    if _forkop_v2 && _ts_backend_native; then return 0; fi
+    _ts_backend_control_available
+}
 
 # ── Tailscale server management (Forkop) ──────────────────────────────────────
 # Read-only rendering of tailscale servers already lives in cmd_server_instances.
@@ -17072,7 +17079,7 @@ EOF
                 local _ts_empty_add=''
                 # Podkop Plus is intentionally observer-only: it is orphaned and
                 # we do not create a new tsnet integration for it.
-                if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
+                if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_management_available && [ "$(_ts_provider_kind)" != none ]; then
                     _ts_empty_add='[{"text":"➕ Tailscale через sing-box","callback_data":"ts_add"}],'
                 fi
                 send_or_edit "$mid" \
@@ -17367,7 +17374,7 @@ EOF
                 # Per-node toggles for tailscale: exit node + accept routes.
                 # Built while rendering so the labels match what the card shows.
                 [ "$_proto" = "tailscale" ] && {
-                    if ! _ts_backend_control_available; then
+                    if ! _ts_management_available; then
                         : # observer mode: render status only, never mutation buttons
                     elif [ "$_ts_legacy" = 1 ]; then
                         _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"🗑 Удалить старую Tailscale-секцию\",\"callback_data\":\"ts_ld_${_s}\"}],"
@@ -17448,7 +17455,7 @@ EOF
             # two-byte sequence backslash-n; every other byte (UTF-8 emoji, stray '\') passes through.
             local _text_nl
             _text_nl=$(printf '%s' "$_text" | awk '{gsub(/\\n/,"\n")}1')
-            if ! _ts_backend_control_available; then
+            if ! _ts_management_available; then
                 local _ts_ctl_state _ts_ctl_note
                 _ts_ctl_state=$(_ts_backend_control_state 2>/dev/null)
                 if [ "$_ts_ctl_state" = incompatible ]; then
@@ -17468,7 +17475,7 @@ EOF
             local _ts_row="" _ts_existing=""
             # Creation capability is stricter than discovery. Standalone
             # tailscaled is always shown, but Podkop Plus remains observer-only.
-            if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_backend_control_available && [ "$(_ts_provider_kind)" != none ]; then
+            if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_management_available && [ "$(_ts_provider_kind)" != none ]; then
                 _ts_existing=$(_ts_find_existing)
                 [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
             fi
@@ -19361,7 +19368,7 @@ handle_command() {
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|fkut_a_*|\
         fkutf_*|fkufm_*|fkufa_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
         ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
-            if _ts_backend_control_available; then
+            if _ts_management_available; then
                 _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id"
             else
                 case "$(_ts_backend_control_state 2>/dev/null)" in
