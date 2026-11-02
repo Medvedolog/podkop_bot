@@ -1030,7 +1030,7 @@ msg() {
 }
 
 # ── Variant detection ──────────────────────────────────────────────────────────
-# PODKOP_VARIANT one of: original | evolution | netshift | plus | none
+# PODKOP_VARIANT one of: original | podkop-exp | evolution | netshift | plus | forkop | none
 # Detection strategy, in order of confidence:
 #   1. Package name via opkg/apk (podkop-plus, podkop, etc. — name varies by
 #      maintainer/fork but is the strongest signal when present).
@@ -1044,6 +1044,12 @@ msg() {
 #   3. Fallback: "none" if podkop is not installed at all.
 detect_podkop_variant() {
     local _bin_path=""
+    # Podkop 0.8 experimental reuses /etc/config/podkop and /usr/bin/podkop,
+    # but embeds sing-box. Package identity must win over legacy UCI fingerprints.
+    if _pkg_has podkop-exp; then
+        printf 'podkop-exp'
+        return
+    fi
     # forkop = renamed/migrated Podkop Plus (package/service/UCI: podkop-plus -> forkop).
     # MUST be checked BEFORE plus: a migrated box may still have stale podkop-plus
     # files, but if forkop is present the system is Forkop.
@@ -1130,6 +1136,7 @@ detect_podkop_variant() {
 variant_label() {
     case "$1" in
         original)  msg variant_label_original ;;
+        podkop-exp) printf 'Podkop Experimental (0.8.x)' ;;
         evolution) msg variant_label_evolution ;;
         netshift)  msg variant_label_netshift ;;
         plus)      msg variant_label_plus ;;
@@ -1142,6 +1149,7 @@ variant_label() {
 # Plus uses its own UCI package "podkop-plus"; everything else uses "podkop".
 _podkop_uci_pkg() {
     case "$PODKOP_VARIANT" in
+        podkop-exp) printf 'podkop' ;;
         forkop)   printf 'forkop' ;;
         plus)     printf 'podkop-plus' ;;
         netshift) printf 'netshift' ;;
@@ -1418,6 +1426,26 @@ _get_socks_endpoints() {
     local _results=""
     local _pkg; _pkg=$(_podkop_uci_pkg)
     local _primary_sec _port _lan_ip _field_name
+    # Forkop 2 moves Mixed Proxy listeners into dedicated routed UCI servers.
+    # Discover these first. The legacy section-field scan below only applies
+    # to older branches and cannot overwrite a correctly detected v2 listener.
+    if [ "$_pkg" = forkop ]; then
+        case "$(uci -q get forkop.settings.config_version 2>/dev/null)" in
+            2.*)
+                for _server in $(uci -q show forkop 2>/dev/null | sed -n 's/^forkop\.\([^.=]*\)=server$/\1/p'); do
+                    [ "$(uci -q get "forkop.$_server.protocol" 2>/dev/null)" = mixed ] || continue
+                    [ "$(uci -q get "forkop.$_server.routing_mode" 2>/dev/null)" = section ] || continue
+                    [ "$(uci -q get "forkop.$_server.enabled" 2>/dev/null)" != 0 ] || continue
+                    _port=$(uci -q get "forkop.$_server.listen_port" 2>/dev/null)
+                    case "$_port" in ''|*[!0-9]*) continue ;; esac
+                    _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+                    [ -n "$_lan_ip" ] || _lan_ip=192.168.1.1
+                    _results="socks5h://$_lan_ip:$_port"
+                    break
+                done
+                ;;
+        esac
+    fi
 
     if [ "$_pkg" = "podkop-plus" ] || [ "$_pkg" = "forkop" ]; then
         _field_name="action"
@@ -2173,6 +2201,7 @@ else
     # variant-first: look up the package matching the detected variant first, so
     # a leftover 'podkop' package on a NetShift box can't shadow the real version.
     case "$PODKOP_VARIANT" in
+        podkop-exp) _pkg_name="podkop-exp" ;;
         forkop)   _pkg_name="forkop" ;;
         plus)     _pkg_name="podkop-plus" ;;
         netshift) _pkg_name="netshift" ;;
@@ -2184,7 +2213,8 @@ else
         PODKOP_VER=$(_pkg_ver "$_p")
         [ -n "$PODKOP_VER" ] && break
     done
-    SINGBOX_VER=$(_pkg_ver sing-box)
+    # podkop-exp embeds sing-box; a foreign/stale sing-box package is not its core.
+    if [ "$PODKOP_VARIANT" = podkop-exp ]; then SINGBOX_VER=""; else SINGBOX_VER=$(_pkg_ver sing-box); fi
     ok "$(msg podkop_found)${PODKOP_VER:+ (v${PODKOP_VER})} — $(msg variant_word): $(variant_label "$PODKOP_VARIANT")"
     [ -n "$SINGBOX_VER" ] && info "sing-box: v${SINGBOX_VER}"
 fi
