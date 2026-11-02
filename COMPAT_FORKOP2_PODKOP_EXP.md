@@ -29,3 +29,13 @@ This is **not** a general-purpose upgrade script. Back up UCI before switching u
 
 См. [FORKOP2_PODKOP_EXP_API_RESEARCH.md](FORKOP2_PODKOP_EXP_API_RESEARCH.md): ubus, Clash API, схема Forkop 2.0 и Podkop Experimental 0.8.x, полевые результаты AX6000, UI прокси, безопасность и план регрессионных тестов.
 
+
+## Dev6 (2026-11-02): нативный Tailscale-сервер Forkop 2.0
+
+- **Две разные сущности:** `config server` + `protocol=tailscale` регистрирует сам роутер в tailnet, а `config tunnel` + `kind=tailscale` служит исходящим туннелем маршрутизации Forkop. Запрещено подменять одну другой.
+- Разрешено *экспериментальное* создание native server **с `enabled=0`**, последующее включение отдельным действием Telegram/BearGuard. Требуется сборка sing-box с `with_tailscale` и `with_gvisor`, подтверждаемая через `ubus call forkop state '{}'` (`capabilities.core.features.tailscale.available`). Не запускать второй Go-процесс для опроса capabilities.
+- `tailscale_auth_key`, `tailscale_hostname`, `tailscale_control_url` записываются нативно. Старые поля `tailscale_advertise_exit_node` и `tailscale_accept_routes` для этого сервера Forkop 2 **не пишутся**: ядро само объявляет возможность Exit Node, которую затем нужно одобрить в консоли Tailscale; прием маршрутов настраивается у исходящего туннеля.
+- Для Podkop Experimental 0.8.x по-прежнему **запрещена запись Tailscale**: его Go backend нельзя настраивать через форкоповскую схему или внешнее overlay JSON.
+- Статус различает `server.protocol=tailscale` и `tunnel.kind=tailscale`; локальный state-файл не является доказательством полноценной регистрации и связности.
+- Состояние `dev6` — код и статические тесты, **реальная авторизация и выход в tailnet на OpenWrt не проверены**. Без работающего BearGuard native RPC-адаптера standalone `.sh` не реализует весь мастер.
+- Тест: `sh tools/test-forkop2-tailscale-native.sh` (в BearGuard передать путь к встроенному боту). *Старый раздел о нереализованном Tailscale CRUD выше относится к полному управлению туннелями, а не к первичному созданию native server.*
