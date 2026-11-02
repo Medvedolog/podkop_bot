@@ -173,3 +173,15 @@ display_proxy_name   = 🇩🇪 Германия
 - Местная [сводка совместимости](COMPAT_FORKOP2_PODKOP_EXP.md)
 
 **Ограничения:** исходники upstream на ветке `main` могут меняться. При переносе использовать схему именно установленного релиза Forkop 2.0.0 или Podkop-exp 0.8.x. Фактические тесты проведены только на одном AX6000 и только для отображения/Telegram-транспорта; полного функционального паритета ещё нет.
+
+## 10. Уточнение: Tailscale на самом роутере через Forkop 2.0 (dev6)
+
+В исходниках Forkop 2.0 **не одна**, а две модели Tailscale: `server.protocol=tailscale` — входящий/серверный endpoint, который регистрирует маршрутизатор в tailnet; `tunnel.kind=tailscale` — исходящий endpoint как источник маршрутизации в секции. Эти объекты используют разные поля и состояние. [Генератор native server](https://github.com/ushan0v/forkop/blob/main/forkop/files/usr/lib/singbox/servers.uc), [генератор исходящего tunnel](https://github.com/ushan0v/forkop/blob/main/forkop/files/usr/lib/config/connections.uc).
+
+- Проверять фактическую поддержку по `ubus call forkop state '{}'`: `.capabilities.core.known == true` и `.capabilities.core.features.tailscale.available == true`; upstream требует теги **`with_tailscale`, `with_gvisor`**. Не запускать новый процесс sing-box только ради статуса.
+- Для присоединения самого роутера: `config server`, `protocol=tailscale`, `enabled=0`, `routing_mode=rules`, `tailscale_auth_key`, `tailscale_hostname`, `tailscale_control_url`. Включать только отдельным действием после создания. Identity штатно хранится в `/etc/forkop/tailscale/<UCI-server-name>/`.
+- Upstream задает `advertise_exit_node: true` для native server независимо от legacy UCI-флага. Для использования роутера как Exit Node требуется разрешение администратора в Tailscale. `tailscale_accept_routes` — поле исходящего туннеля, не этого server.
+- Новый BearGuard RPC adapter `podkop_bot_tailscale` должен отличать native server от outbound tunnel; возможности native server выставлять только при подтвержденной возможности ядра, при ошибках **не менять** UCI.
+- Статус `registered` по наличию identity — только косвенный сигнал; для подтверждения подключения нужны Tailscale console и актуальные маршруты/подключения. Вмешательство в самостоятельный `tailscaled` требует отдельного подтверждения.
+- Podkop Experimental 0.8.x **не** получает эту native-серверную схему: его Tailscale остается неподдерживаемым до отдельной реализации в Go backend.
+- `dev6` содержит **первичную, не проверенную на роутере** реализацию создания/включения native Tailscale server через Telegram/BearGuard. Полный CRUD и практическое восстановление после сбоев требуют испытаний.
