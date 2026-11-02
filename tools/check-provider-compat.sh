@@ -15,4 +15,5 @@ sh tools/test-dev4-modern-ui.sh
 sh tools/test-dev5-human-ui.sh
 sh tools/test-forkop2-native-clash.sh
 sh tools/test-forkop2-tailscale-native.sh
+sh tools/test-forkop2-subs-urltest.sh
 printf '%s\n' 'Podkop Experimental / Forkop 2 static compatibility guards OK'

@@ -1322,7 +1322,7 @@ forkop_prompt_subscription_url() {
         return 1
     }
     _url=$(uci -q get "${PODKOP_UCI}.${_child}.url" 2>/dev/null)
-    _url_html=$(html_escape "$_url")
+    _url_html=$(html_escape "$(_report_mask_sub_url "$_url")")
     printf '%s\n%s\n%s\n' "wait_forkop_sub_url" "$_parent" "$_child" > "$STATE_FILE"
     send_or_edit "$_mid" \
         "$(printf '%s <b>URL подписки</b>\n\n<b>Текущий URL:</b>\n<code>%s</code>\n\nОтправьте новый URL. Остальные параметры источника будут сохранены.' "$E_EDIT" "$_url_html")" \
@@ -8357,9 +8357,10 @@ _handle_proxy() {
         case "$cmd" in
             proxy_menu|proxy_menu_p_*|px_view_*|test_px_*|cmd_all_delay_test|do_px_*|do_px_auto_urltest) ;;
             # Forkop 2: manual links are connection_link children (links_add/links_del).
-            cmd_proxy_add|ask_del_px_*|do_del_px_confirmed_*) _forkop_v2 || { _exp_v2_readonly_card "$mid"; return; } ;;
+            cmd_proxy_add|ask_del_px_*|do_del_px_confirmed_*|cmd_edit_sub_url|edit_fsub_*|do_confirm_forkop_sub_url)
+                _forkop_v2 || { _exp_v2_readonly_card "$mid"; return; } ;;
             STATE_INPUT)
-                if ! { _forkop_v2 && [ "$state" = wait_proxy_link ]; }; then
+                if ! { _forkop_v2 && case "$state" in wait_proxy_link|wait_forkop_sub_url|pending_forkop_sub_url) true ;; *) false ;; esac; }; then
                     if _podkop_exp_v2; then _exp_v2_readonly_card "$mid"
                     else forkop_readonly_notice "$mid" "proxy_menu" "Редактор источников Forkop 2.0" \
                         "Подписки и группы настраиваются в LuCI; ручные ссылки — кнопкой «Добавить»."; fi
@@ -8846,7 +8847,11 @@ EOF
             # Forkop 2 has a different write schema: do not advertise
             # legacy "add proxy" or "edit subscription" buttons that cannot
             # safely mutate native connection_link / subscription_url records.
-            if _forkop_v2 || _podkop_exp_v2; then
+            if _forkop_v2; then
+                kb=$(printf '%s' "$kb" | jq -c '
+                    .inline_keyboard |= [ .[] | [ .[] | select(.callback_data != "cmd_edit_sub_url" and .callback_data != "do_px_auto_urltest") ] | select(length > 0) ]
+                    | .inline_keyboard |= (.[0:-2] + [[{"text":"📡 Подписки","callback_data":"cmd_edit_sub_url"},{"text":"⚡ URLTest","callback_data":"fk_ut_menu"}]] + .[-2:])' 2>/dev/null)
+            elif _podkop_exp_v2; then
                 kb=$(printf '%s' "$kb" | jq -c '
                     .inline_keyboard |= [
                         .[] | [ .[] |
@@ -9377,6 +9382,19 @@ FORKOP_GROUP_MEMBERS
                 return
             }
             local _ese_sec; _ese_sec=$(get_active_section)
+            if forkop_v2; then
+                rm -f "$STATE_FILE"
+                local _f_child _f_tag _f_url _f_rows="" _f_n=0
+                for _f_child in $(forkop_subscription_children "$_ese_sec" 2>/dev/null); do
+                    _f_n=$((_f_n + 1))
+                    _f_tag=$(uci -q get "${PODKOP_UCI}.${_f_child}.tag" 2>/dev/null)
+                    _f_url=$(uci -q get "${PODKOP_UCI}.${_f_child}.url" 2>/dev/null | sed 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?].*$##; s#^.*@##' | cut -c1-24)
+                    _f_rows="${_f_rows}[{\"text\":\"✏ $(json_escape "${_f_tag:-sub${_f_n}} · ${_f_url}")\",\"callback_data\":\"edit_fsub_$(json_escape "$_f_child")\"},{\"text\":\"${E_SET}\",\"callback_data\":\"fk_sub_set_$(json_escape "$_f_child")\"},{\"text\":\"${E_RST}\",\"callback_data\":\"fksub_up_$(json_escape "$_f_child")\"},{\"text\":\"${E_DEL}\",\"callback_data\":\"fksub_del_$(json_escape "$_f_child")\"}],"
+                done
+                send_or_edit "$mid" "$(printf '%s <b>Подписки</b> [<code>%s</code>] — %s\n\n✏ адрес · %s настройки (интервал, через прокси, префикс) · %s обновить сейчас · %s удалить' "$E_LINK" "$(html_escape "$(section_clash_tag "$_ese_sec")")" "$_f_n" "$E_SET" "$E_RST" "$E_DEL")" \
+                    "{\"inline_keyboard\":[${_f_rows}[{\"text\":\"${E_ADD} Подписка\",\"callback_data\":\"fksub_add\"}$( [ "$_f_n" -gt 0 ] && printf ',{"text":"%s Обновить все","callback_data":"fksub_up"}' "$E_RST")],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            fi
             section_is_subscription "$_ese_sec" || {
                 send_or_edit "$mid" "$(printf '%s В этой секции нет подписки.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"proxy_menu\"}]]}"
@@ -10741,7 +10759,7 @@ _handle_section_extras() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
     # Forkop 2: only the mixed-server port is mapped to the new model here.
     case "$cmd:$state" in
-        cmd_set_mixed_port:*|STATE_INPUT:wait_mixed_port) ;;
+        cmd_set_mixed_port:*|STATE_INPUT:wait_mixed_port|urltest_settings:*) ;;
         *) _forkop_v2_ui_guard "$mid" && return ;;
     esac
     local sec
@@ -13870,20 +13888,152 @@ EOF
     esac
 }
 
+# ---- Forkop 2: subscriptions and URLTest groups (2.0 model) -----------------
+# subscription_url children: section, url, tag (unique "subN" in the section),
+# server_filter_mode, update/download options and request headers for remote
+# addresses. urltest children: section, name (unique among the section's child
+# names), server_filter_mode + include_/exclude_ regex/outbounds/types, check
+# options. Every write goes through _fk_txn_commit_reload (snapshot + rollback).
+
+# _fk2_child_names SECTION — names of the section's children, one per line.
+_fk2_child_names() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." -v want="$1" '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1); sub("^" p, "", k)
+          sub(/^\047/, "", v); sub(/\047$/, "", v); dot = index(k, "."); if (!dot) next
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = v; secs[substr(k, 1, dot - 1)] = 1 }
+        END { for (c in secs) if (opt[c SUBSEP "section"] == want && opt[c SUBSEP "name"] != "") print opt[c SUBSEP "name"] }'
+}
+
+# _fk2_sub_tag_next SECTION — the first free "subN" tag of the section.
+_fk2_sub_tag_next() {
+    local _taken _n=1 _c
+    _taken=$(for _c in $(forkop_subscription_children "$1" 2>/dev/null); do uci -q get "${PODKOP_UCI}.${_c}.tag" 2>/dev/null; done)
+    while printf '%s\n' "$_taken" | grep -qxF "sub${_n}"; do _n=$((_n + 1)); done
+    printf 'sub%s' "$_n"
+}
+
+# _pct_encode STRING — percent-encode everything but unreserved characters.
+_pct_encode() {
+    LC_ALL=C printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+        { for (i = 1; i <= length($0); i++) { c = substr($0, i, 1)
+            if (c ~ /[A-Za-z0-9._~-]/) printf "%s", c; else printf "%%%02X", ord[c] } }'
+}
+
+# fk2_sub_add SECTION URL — create a subscription the way Forkop's dialog does
+# (remote: hourly updates, default request headers). Returns the txn status.
+fk2_sub_add() {
+    local _sec="$1" _url="$2" _id _h _hdrs
+    _id=$(uci add "$PODKOP_UCI" subscription_url 2>/dev/null) || return 1
+    [ -n "$_id" ] || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.section" "$_sec" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.url" "$_url" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.tag" "$(_fk2_sub_tag_next "$_sec")" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.server_filter_mode" "all" || return 1
+    case "$_url" in
+        http://*|https://*)
+            _fk_stage_set "${PODKOP_UCI}.${_id}.subscription_update_enabled" "1" || return 1
+            _fk_stage_set "${PODKOP_UCI}.${_id}.subscription_update_interval" "1h" || return 1
+            _fk_stage_set "${PODKOP_UCI}.${_id}.download_via_proxy_enabled" "0" || return 1
+            _fk_stage_set "${PODKOP_UCI}.${_id}.show_dashboard_metadata" "1" || return 1
+            _hdrs=$(/usr/bin/forkop get_subscription_default_headers 2>/dev/null | jq -r '.[]? | strings' 2>/dev/null)
+            while IFS= read -r _h; do
+                [ -n "$_h" ] || continue
+                uci add_list "${PODKOP_UCI}.${_id}.header=${_h}" || { uci -q revert "$PODKOP_UCI" 2>/dev/null || true; return 1; }
+            done <<FK2HDR
+$_hdrs
+FK2HDR
+            ;;
+    esac
+    _fk_txn_commit_reload
+}
+
+# fk2_child_delete CHILD TYPE SECTION — remove one owned child (txn status).
+fk2_child_delete() {
+    _fk_child_owned "$1" "$2" "$3" || return 1
+    _fk_stage_delete "${PODKOP_UCI}.${1}" || return 1
+    _fk_txn_commit_reload
+}
+
+# fk2_sub_refresh SECTION [CHILD] — ask sing-box to fetch subscriptions now
+# (PUT /providers/proxies/<label/tag>). Prints "requested failed". A timeout
+# counts as requested: the core keeps downloading after curl gives up.
+fk2_sub_refresh() {
+    local _sec="$1" _only="$2" _c _tag _label _ok=0 _bad=0 _rc
+    _label=$(section_clash_tag "$_sec")
+    for _c in $(forkop_subscription_children "$_sec" 2>/dev/null); do
+        [ -n "$_only" ] && [ "$_c" != "$_only" ] && continue
+        _tag=$(uci -q get "${PODKOP_UCI}.${_c}.tag" 2>/dev/null); [ -n "$_tag" ] || continue
+        _rc=0; clash_request "/providers/proxies/$(_pct_encode "${_label}/${_tag}")" PUT "" >/dev/null 2>&1 || _rc=$?
+        case "$_rc" in 0|28) _ok=$((_ok + 1)) ;; *) _bad=$((_bad + 1)) ;; esac
+    done
+    printf '%s %s\n' "$_ok" "$_bad"
+}
+
+# fk2_ut_add SECTION NAME — create a URLTest group over the section's servers.
+fk2_ut_add() {
+    local _sec="$1" _name="$2" _id
+    _id=$(uci add "$PODKOP_UCI" urltest 2>/dev/null) || return 1
+    [ -n "$_id" ] || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.section" "$_sec" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.name" "$_name" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.server_filter_mode" "all" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.interrupt_exist_connections" "0" || return 1
+    _fk_txn_commit_reload
+}
+
+# _fk2_filter_value INPUT — country codes ("DE NL", "de,nl") become an alternation
+# of their flags; anything else is taken as a regular expression.
+_fk2_filter_value() {
+    local _v="$1" _c _re=""
+    if printf '%s' "$_v" | grep -qE '^[[:space:]]*[A-Za-z]{2}([[:space:],;]+[A-Za-z]{2})*[[:space:]]*$'; then
+        for _c in $(printf '%s' "$_v" | tr ',;' '  ' | tr 'a-z' 'A-Z'); do
+            _re="${_re}${_re:+|}(?:$(_country_flag "$_c"))"
+        done
+        printf '%s' "$_re"
+    else
+        printf '%s' "$_v"
+    fi
+}
+
+# fk2_ut_filter_set CHILD SECTION inc|exc VALUE — set include_/exclude_regex
+# ("" clears) and the mode that applies them: include when anything is included
+# (exclusions still apply), exclude when only exclusions, else all.
+fk2_ut_filter_set() {
+    local _ch="$1" _sec="$2" _side="$3" _val="$4" _key _inc _exc _mode
+    _fk_child_owned "$_ch" urltest "$_sec" || return 1
+    [ "$_side" = inc ] && _key=include_regex || _key=exclude_regex
+    if [ -n "$_val" ]; then
+        _fk_stage_set "${PODKOP_UCI}.${_ch}.${_key}" "$_val" || return 1
+    else
+        _fk_stage_delete "${PODKOP_UCI}.${_ch}.${_key}" || return 1
+    fi
+    _inc="$(uci -q get "${PODKOP_UCI}.${_ch}.include_regex" 2>/dev/null)$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.include_outbounds")"
+    _exc="$(uci -q get "${PODKOP_UCI}.${_ch}.exclude_regex" 2>/dev/null)$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.exclude_outbounds")$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.exclude_types")"
+    if [ -n "$_inc" ]; then _mode=include; elif [ -n "$_exc" ]; then _mode=exclude; else _mode=all; fi
+    _fk_stage_set "${PODKOP_UCI}.${_ch}.server_filter_mode" "$_mode" || return 1
+    _fk_txn_commit_reload
+}
+
 _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
     # Forkop 2's legacy routing editors remain blocked, but Tailscale uses
     # the CURRENT native server/protocol=tailscale schema and must not be
     # rejected by the general Forkop 1.x editor guard.
     if _forkop_v2; then
+        # Subscriptions, URLTest groups and Tailscale use the 2.0 model below;
+        # the routing-condition, device and detour editors are still 1.x-shaped.
         case "$cmd" in
-            ts_*) : ;;
+            fk_conds|fk_c_*|fkc_add_*|fkc_del_*|fk_dev_list|fk_dev_a_*|fk_detour|fkd_t_*|fkd_pick|fkd_s_*)
+                _forkop_v2_ui_guard "$mid" && return ;;
             STATE_INPUT)
                 case "$state" in
-                    wait_ts_url|wait_ts_hostname|wait_ts_key) : ;;
-                    *) _forkop_v2_ui_guard "$mid" && return ;;
+                    wait_fkc_*|wait_fkcd_*) _forkop_v2_ui_guard "$mid" && return ;;
                 esac ;;
-            *) _forkop_v2_ui_guard "$mid" && return ;;
+        esac
+    else
+        case "$cmd" in
+            fksub_*|fkutn_*|fkutv_*) CB_ANSWER_TEXT="Доступно в Forkop 2"; return ;;
         esac
     fi
     local sec=$(get_active_section)
@@ -14143,6 +14293,73 @@ EOF
                 send_message "$(printf '%s Удалено и применено: <code>%s</code>' "$E_OK" "$(html_escape "$_val")")" ""
                 sleep 1
                 _handle_forkop_ext "fk_c_${_f}" "" "" ""
+                return ;;
+            wait_fksub_add)
+                local _v _rc _return_mid
+                _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
+                rm -f "$STATE_FILE"; delete_message "${CALLBACK_MSG_ID:-$mid}"
+                _v=$(printf '%s' "$text" | tr -d '\r' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                case "$_v" in
+                    http://?*|https://?*|/?*) ;;
+                    *) send_message "$(printf '%s Нужен адрес <code>https://…</code> (или путь к локальному файлу <code>/…</code>).' "$E_ERR")" \
+                           "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_edit_sub_url\"}]]}"
+                       return ;;
+                esac
+                case "$_v" in *[[:space:]]*) send_message "$(printf '%s В адресе не должно быть пробелов.' "$E_ERR")" ""; return ;; esac
+                send_or_edit "$_return_mid" "$(printf '%s <b>Добавляем подписку, Forkop перезапускается…</b>' "$E_RST")" ""
+                _rc=0; fk2_sub_add "$sec" "$_v" || _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    send_message "$(printf '%s <b>Подписка добавлена.</b> Серверы появятся после загрузки, обычно через несколько секунд.' "$E_OK")" ""
+                    _handle_proxy "cmd_edit_sub_url" "$_return_mid" "" ""
+                else
+                    send_or_edit "$_return_mid" "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_edit_sub_url\"}]]}"
+                fi
+                return ;;
+            wait_fkutn_add)
+                local _v _rc _return_mid
+                _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
+                rm -f "$STATE_FILE"; delete_message "${CALLBACK_MSG_ID:-$mid}"
+                _v=$(printf '%s' "$text" | tr -d '\r' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                if [ -z "$_v" ] || [ "$(printf '%s' "$_v" | wc -c)" -gt 64 ]; then
+                    send_message "$(printf '%s Имя группы: от 1 до 64 байт.' "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
+                    return
+                fi
+                case "$_v" in */*) send_message "$(printf '%s В имени не должно быть <code>/</code>: Forkop строит из него тег «секция/имя».' "$E_ERR")" ""; return ;; esac
+                if _fk2_child_names "$sec" | grep -qxF -- "$_v"; then
+                    send_message "$(printf '%s Имя <code>%s</code> уже занято в этой секции.' "$E_ERR" "$(html_escape "$_v")")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
+                    return
+                fi
+                send_or_edit "$_return_mid" "$(printf '%s <b>Создаём URLTest, Forkop перезапускается…</b>' "$E_RST")" ""
+                _rc=0; fk2_ut_add "$sec" "$_v" || _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    _handle_forkop_ext "fk_ut_menu" "$_return_mid" "" ""
+                else
+                    send_or_edit "$_return_mid" "$(_fk_txn_fail_msg "$_rc")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"
+                fi
+                return ;;
+            wait_fkutv_inc_*|wait_fkutv_exc_*)
+                local _side _ch _v _rc _return_mid
+                case "$state" in wait_fkutv_inc_*) _side=inc; _ch="${state#wait_fkutv_inc_}" ;; *) _side=exc; _ch="${state#wait_fkutv_exc_}" ;; esac
+                _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_return_mid" in ''|*[!0-9]*) _return_mid="" ;; esac
+                rm -f "$STATE_FILE"; delete_message "${CALLBACK_MSG_ID:-$mid}"
+                _v=$(printf '%s' "$text" | tr -d '\r' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                [ "$_v" = "-" ] && _v=""
+                [ -n "$_v" ] && _v=$(_fk2_filter_value "$_v")
+                if [ "$(printf '%s' "$_v" | wc -c)" -gt 1024 ]; then
+                    send_message "$(printf '%s Слишком длинный фильтр.' "$E_ERR")" ""; return
+                fi
+                send_or_edit "$_return_mid" "$(printf '%s <b>Применяем фильтр, Forkop перезапускается…</b>' "$E_RST")" ""
+                _rc=0; fk2_ut_filter_set "$_ch" "$sec" "$_side" "$_v" || _rc=$?
+                if [ "$_rc" -eq 0 ]; then
+                    _handle_forkop_ext "fkutf_${_ch}" "$_return_mid" "" ""
+                else
+                    send_or_edit "$_return_mid" "$(printf '%s\n\n<i>Если Forkop не принял выражение, проверьте синтаксис: это регулярное выражение Go (RE2).</i>' "$(_fk_txn_fail_msg "$_rc")")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fkutf_${_ch}\"}]]}"
+                fi
                 return ;;
             wait_fkss_i_*)
                 local _ch="${state#wait_fkss_i_}" _v _rc _return_mid
@@ -14433,7 +14650,7 @@ ${_ip}"; fi
                 return
             fi
             local _upd _int _vp _vps _md _pf _px _url
-            _url=$(uci -q get "${PODKOP_UCI}.${_ch}.url" 2>/dev/null | cut -c1-60)
+            _url=$(_report_mask_sub_url "$(uci -q get "${PODKOP_UCI}.${_ch}.url" 2>/dev/null)" | cut -c1-60)
             _upd=$(uci -q get "${PODKOP_UCI}.${_ch}.subscription_update_enabled" 2>/dev/null); [ -z "$_upd" ] && _upd=1
             _int=$(uci -q get "${PODKOP_UCI}.${_ch}.subscription_update_interval" 2>/dev/null)
             _vp=$(uci -q get "${PODKOP_UCI}.${_ch}.download_via_proxy_enabled" 2>/dev/null); [ -z "$_vp" ] && _vp=0
@@ -14447,7 +14664,7 @@ ${_ip}"; fi
                 [ -n "$_px" ] && _pf=1 || _pf=0
             fi
             send_or_edit "$mid" "$(printf '%s <b>Настройки источника</b> [<code>%s</code>]\n<code>%s</code>\n\nАвтообновление: %s · Интервал: <code>%s</code>\nЧерез прокси: %s <code>%s</code> · Метаданные: %s\nПрефикс узлов: %s <code>%s</code>' "$E_SET" "$_ch" "$(html_escape "$_url")" "$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_int:-по умолчанию}" "$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "${_vps:-—}" "$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )" "$(html_escape "${_px:-—}")")" \
-                "{\"inline_keyboard\":[[{\"text\":\"$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Автообновление\",\"callback_data\":\"fkss_u_${_ch}_$( [ "$_upd" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkss_i_${_ch}\"}],[{\"text\":\"$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Через прокси\",\"callback_data\":\"fkss_v_${_ch}_$( [ "$_vp" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Метаданные\",\"callback_data\":\"fkss_m_${_ch}_$( [ "$_md" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Префикс узлов\",\"callback_data\":\"fkss_p_${_ch}_$( [ "$_pf" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Текст префикса\",\"callback_data\":\"fkss_px_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_proxy_menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"$( [ "$_upd" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Автообновление\",\"callback_data\":\"fkss_u_${_ch}_$( [ "$_upd" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkss_i_${_ch}\"}],[{\"text\":\"$( [ "$_vp" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Через прокси\",\"callback_data\":\"fkss_v_${_ch}_$( [ "$_vp" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"$( [ "$_md" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Метаданные\",\"callback_data\":\"fkss_m_${_ch}_$( [ "$_md" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"$( [ "$_pf" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Префикс узлов\",\"callback_data\":\"fkss_p_${_ch}_$( [ "$_pf" = "1" ] && echo 0 || echo 1 )\"},{\"text\":\"${E_EDIT} Текст префикса\",\"callback_data\":\"fkss_px_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"$(forkop_v2 && echo cmd_edit_sub_url || echo nav_proxy_menu)\"}]]}"
             ;;
         "fkss_u_"*|"fkss_v_"*|"fkss_m_"*|"fkss_p_"*)
             local _rest _ch _nv _key _rc
@@ -14733,10 +14950,79 @@ ${_ip}"; fi
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
             ;;
         # ---------- Блок 4: редактор существующего URLTest ----------
+        fksub_add)
+            printf '%s\n' "wait_fksub_add" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Новая подписка</b> [<code>%s</code>]\n\nОтправьте адрес подписки (<code>https://…</code>) или путь к файлу на роутере (<code>/…</code>).\n\n<i>Как в LuCI Forkop: обновление раз в час, стандартные заголовки запроса. Сообщение с адресом будет удалено.</i>' "$E_ADD" "$(html_escape "$(section_clash_tag "$sec")")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_edit_sub_url\"}]]}"
+            ;;
+        fksub_del_*)
+            local _ch="${cmd#fksub_del_}" _t
+            _fk_child_owned "$_ch" subscription_url "$sec" || { CB_ANSWER_TEXT="Подписка устарела — откройте список заново"; return; }
+            _t=$(uci -q get "${PODKOP_UCI}.${_ch}.tag" 2>/dev/null)
+            send_or_edit "$mid" "$(printf '%s <b>Удалить подписку <code>%s</code>?</b>\n\nЕё серверы пропадут из секции. Forkop будет перезапущен; если он не примет изменение (например, на подписку ссылается группа), конфигурация вернётся как была.' "$E_WARN" "$(html_escape "${_t:-$_ch}")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Удалить\",\"callback_data\":\"fksub_delok_${_ch}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"cmd_edit_sub_url\"}]]}"
+            ;;
+        fksub_delok_*)
+            local _ch="${cmd#fksub_delok_}" _rc
+            _fk_child_owned "$_ch" subscription_url "$sec" || { CB_ANSWER_TEXT="Подписка устарела"; return; }
+            send_or_edit "$mid" "$(printf '%s <b>Удаляем, Forkop перезапускается…</b>' "$E_RST")" ""
+            _rc=0; fk2_child_delete "$_ch" subscription_url "$sec" || _rc=$?
+            if [ "$_rc" -eq 0 ]; then _handle_proxy "cmd_edit_sub_url" "$mid" "" ""
+            else send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_edit_sub_url\"}]]}"; fi
+            ;;
+        fksub_up|fksub_up_*)
+            local _only="" _res _ok _bad
+            [ "$cmd" = fksub_up ] || _only="${cmd#fksub_up_}"
+            _res=$(fk2_sub_refresh "$sec" "$_only"); _ok=${_res%% *}; _bad=${_res##* }
+            if [ "${_ok:-0}" -gt 0 ] && [ "${_bad:-0}" -eq 0 ]; then
+                CB_ANSWER_TEXT="Обновление запрошено: ${_ok}"
+            elif [ "${_ok:-0}" -eq 0 ] && [ "${_bad:-0}" -eq 0 ]; then
+                CB_ANSWER_TEXT="В секции нет подписок"
+            else
+                CB_ANSWER_TEXT="Clash API не принял ${_bad} из $((_ok + _bad))"
+            fi
+            ;;
+        fkutn_add)
+            printf '%s\n' "wait_fkutn_add" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>Новая группа URLTest</b> [<code>%s</code>]\n\nОтправьте имя группы, например <code>Быстрейший</code>. Без <code>/</code>, уникальное в секции.\n\n<i>Группа берёт все серверы секции и сама выбирает самый быстрый. Выбрать её можно в списке прокси, отбор серверов — в «Фильтрах».</i>' "$E_ADD" "$(html_escape "$(section_clash_tag "$sec")")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_menu\"}]]}"
+            ;;
+        fkutn_del_*)
+            local _ch="${cmd#fkutn_del_}" _n
+            _fk_child_owned "$_ch" urltest "$sec" || { CB_ANSWER_TEXT="Группа устарела"; return; }
+            _n=$(uci -q get "${PODKOP_UCI}.${_ch}.name" 2>/dev/null)
+            send_or_edit "$mid" "$(printf '%s <b>Удалить группу URLTest <code>%s</code>?</b>\n\nForkop будет перезапущен.' "$E_WARN" "$(html_escape "${_n:-$_ch}")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Удалить\",\"callback_data\":\"fkutn_delok_${_ch}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
+            ;;
+        fkutn_delok_*)
+            local _ch="${cmd#fkutn_delok_}" _rc
+            _fk_child_owned "$_ch" urltest "$sec" || { CB_ANSWER_TEXT="Группа устарела"; return; }
+            send_or_edit "$mid" "$(printf '%s <b>Удаляем, Forkop перезапускается…</b>' "$E_RST")" ""
+            _rc=0; fk2_child_delete "$_ch" urltest "$sec" || _rc=$?
+            if [ "$_rc" -eq 0 ]; then _handle_forkop_ext "fk_ut_menu" "$mid" "" ""
+            else send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_menu\"}]]}"; fi
+            ;;
+        fkutv_inc_*|fkutv_exc_*)
+            local _side _ch _what
+            case "$cmd" in fkutv_inc_*) _side=inc; _ch="${cmd#fkutv_inc_}"; _what="Оставить только" ;; *) _side=exc; _ch="${cmd#fkutv_exc_}"; _what="Исключить" ;; esac
+            _fk_child_owned "$_ch" urltest "$sec" || { CB_ANSWER_TEXT="Группа устарела"; return; }
+            printf '%s\n' "wait_fkutv_${_side}_${_ch}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>%s</b>\n\nОтправьте коды стран через пробел — <code>DE NL FI</code> (бот подставит их флаги), или регулярное выражение по имени сервера — <code>(?i)premium|vip</code>.\nОтправьте <code>-</code>, чтобы очистить.' "$E_EDIT" "$_what")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fkutf_${_ch}\"}]]}"
+            ;;
         "fk_ut_menu")
             rm -f "$STATE_FILE"
             local _ch _cnt _rows _c2
             _cnt=$(forkop_urltest_children "$sec" 2>/dev/null | grep -c .)
+            if forkop_v2; then
+                _rows=""
+                for _c2 in $(forkop_urltest_children "$sec" 2>/dev/null); do
+                    _rows="${_rows}[{\"text\":\"⚡ $(json_escape "$(uci -q get "${PODKOP_UCI}.${_c2}.name" 2>/dev/null || echo "$_c2")")\",\"callback_data\":\"fk_ut_ed_$(json_escape "$_c2")\"}],"
+                done
+                send_or_edit "$mid" "$(printf '%s <b>Группы URLTest</b> [<code>%s</code>] — %s\n\nГруппа сама выбирает самый быстрый сервер (ротация по задержке). Включить её — выбрать группу в списке прокси.' "$E_TGT" "$(html_escape "$(section_clash_tag "$sec")")" "${_cnt:-0}")" \
+                    "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Новая группа\",\"callback_data\":\"fkutn_add\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+                return
+            fi
             if [ "${_cnt:-0}" -eq 0 ]; then
                 forkop_readonly_notice "$mid" "section_settings" "URLTest" "URLTest-секций (child) нет — режим Selector. Создание — в LuCI."
                 return
@@ -14777,7 +15063,7 @@ ${_ip}"; fi
             [ -z "$_ttol" ] && _ttol=$(uci -q get "${PODKOP_UCI}.${_ch}.urltest_tolerance" 2>/dev/null)
             _tie=$(uci -q get "${PODKOP_UCI}.${_ch}.interrupt_exist_connections" 2>/dev/null); [ -z "$_tie" ] && _tie=1
             send_or_edit "$mid" "$(printf '%s <b>Параметры URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Адрес проверки:</b> <code>%s</code>\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск задержки:</b> <code>%s</code> мс\n<i>Переключение происходит, только если другой прокси быстрее на это значение.</i>\n<b>Разрывать соединения при переключении:</b> %s\n\n<i>Любое изменение перезапускает Forkop.</i>' "$E_TGT" "$sec" "$_ch" "$(html_escape "${_turl:-gstatic (по умолчанию)}")" "${_tint:-3m}" "${_ttol:-50}" "$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" )")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"fkut_u_${_ch}\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkut_i_${_ch}\"}],[{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"fkut_t_${_ch}\"},{\"text\":\"$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkut_a_${_ch}_$( [ "$_tie" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"🔬 Фильтры ротации\",\"callback_data\":\"fkutf_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"nav_section_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"fkut_u_${_ch}\"},{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"fkut_i_${_ch}\"}],[{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"fkut_t_${_ch}\"},{\"text\":\"$( [ "$_tie" = "1" ] && echo "${E_ON}" || echo "${E_OFF}" ) Разрыв соединений\",\"callback_data\":\"fkut_a_${_ch}_$( [ "$_tie" = "1" ] && echo 0 || echo 1 )\"}],[{\"text\":\"🔬 Фильтры ротации\",\"callback_data\":\"fkutf_${_ch}\"}],$(forkop_v2 && printf '[{"text":"%s Удалить группу","callback_data":"fkutn_del_%s"}],' "$E_DEL" "$_ch")[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"$(forkop_v2 && echo fk_ut_menu || echo nav_section_settings)\"}]]}"
             ;;
         "fkutf_"*)
             rm -f "$STATE_FILE"
@@ -14797,8 +15083,8 @@ ${_ip}"; fi
                 _er=$(uci -q get "${PODKOP_UCI}.${_ch}.exclude_regex" 2>/dev/null)
                 _io=$(_fk_child_list_read "$_ch" "urltest" "$sec" "include_outbounds" | grep -c .)
                 _eo=$(_fk_child_list_read "$_ch" "urltest" "$sec" "exclude_outbounds" | grep -c .)
-                send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Режим:</b> <code>%s</code>\n<b>Включить по выражению:</b> <code>%s</code>\n<b>Включить вручную:</b> %s\n<b>Исключить по выражению:</b> <code>%s</code>\n<b>Исключить вручную:</b> %s\n\n<i>В Forkop 2 серверы отбираются по имени, страна — это флаг в имени. Фильтры редактируются в LuCI.</i>' "$E_TGT" "$sec" "$_ch" "$_fm" "$(html_escape "${_ir:-—}")" "${_io:-0}" "$(html_escape "${_er:-—}")" "${_eo:-0}")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
+                send_or_edit "$mid" "$(printf '%s <b>Фильтры URLTest</b> [<code>%s</code> → <code>%s</code>]\n\n<b>Режим:</b> <code>%s</code>\n<b>Включить по выражению:</b> <code>%s</code>\n<b>Включить вручную:</b> %s\n<b>Исключить по выражению:</b> <code>%s</code>\n<b>Исключить вручную:</b> %s\n\n<i>Серверы отбираются по имени, страна — это флаг в имени. Списки серверов «вручную» задаются в LuCI.</i>' "$E_TGT" "$sec" "$_ch" "$_fm" "$(html_escape "${_ir:-—}")" "${_io:-0}" "$(html_escape "${_er:-—}")" "${_eo:-0}")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"🌍 Оставить только…\",\"callback_data\":\"fkutv_inc_${_ch}\"},{\"text\":\"🚫 Исключить…\",\"callback_data\":\"fkutv_exc_${_ch}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"fk_ut_ed_${_ch}\"}]]}"
                 return
             fi
             _mode=$(_fk_urltest_filter_mode "$_ch")
@@ -19649,6 +19935,7 @@ handle_command() {
             wait_fk_label|wait_fkdns_server|wait_fkpg_name|wait_fkpl_country_*)
                 _handle_forkop_0198 "STATE_INPUT" "$mid" "$cmd" "$state" "" ;;
             wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*|\
+            wait_fksub_add|wait_fkutn_add|wait_fkutv_inc_*|wait_fkutv_exc_*|\
             wait_ts_url|wait_ts_hostname|wait_ts_key)
                 _handle_forkop_ext "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fully_routed_ip|wait_excl_ip|wait_remote_domain|wait_remote_subnet|\
@@ -19730,6 +20017,9 @@ handle_command() {
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|fkut_a_*|\
         fkutf_*|fkufm_*|fkufa_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
+        fksub_*|fkutn_*|fkutv_*)
+            _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;
+
         ts_add|ts_add_confirm|ts_ld_*|ts_ldc_*|ts_e_*|ts_ec_*|ts_x_*|ts_r_*)
             if _ts_management_available; then
                 _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id"
