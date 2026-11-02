@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.19.25-dev5
+# Podkop Telegram Bot v0.19.25-dev6
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.19.25-dev5"
+BOT_VERSION="0.19.25-dev6"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -1537,6 +1537,17 @@ is_singbox_extended() {
 # the already-running dataplane. Prefer the shared provider helper; standalone
 # installs fall back to package/variant markers and a streaming binary tag scan.
 singbox_supports_tailscale() {
+    if _forkop_v2; then
+        # Forkop 2 reports core capability via resident ubus. Requiring both
+        # with_tailscale and with_gvisor avoids destabilizing a router with an
+        # unsupported endpoint. Do not spawn another sing-box Go process.
+        local _ts_core
+        _ts_core=$(ubus call forkop state '{}' 2>/dev/null) || return 1
+        printf '%s' "$_ts_core" | jq -e \
+            '.capabilities.core.known == true and .capabilities.core.features.tailscale.available == true' \
+            >/dev/null 2>&1
+        return
+    fi
     if [ -r /usr/lib/podkop_bot/tsnet-provider.sh ]; then
         . /usr/lib/podkop_bot/tsnet-provider.sh
         tsnet_capable
@@ -13009,7 +13020,13 @@ _ts_create() {
     _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_control_url" "$_url"   || return 1
     _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_auth_key" "$_key"      || return 1
     _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_hostname" "$_host" || return 1
-    _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_advertise_exit_node" "$_exit" || return 1
+    # Forkop 2's Tailscale SERVER endpoint always advertises exit-node
+    # capability (approval is done in the tailnet console). The retired
+    # tailscale_advertise_exit_node and tailscale_accept_routes keys do not
+    # change this endpoint; accept_routes belongs to outbound tunnels.
+    if ! _forkop_v2; then
+        _fk_stage_set "${PODKOP_UCI}.${_n}.tailscale_advertise_exit_node" "$_exit" || return 1
+    fi
     return 0
 }
 
@@ -13052,7 +13069,9 @@ _ts_commit_created_disabled() {
     [ "$(uci -q get "${PODKOP_UCI}.${_n}.tailscale_control_url" 2>/dev/null)" = "$_url" ] || _ok=0
     [ "$(uci -q get "${PODKOP_UCI}.${_n}.tailscale_auth_key" 2>/dev/null)" = "$_key" ] || _ok=0
     [ "$(uci -q get "${PODKOP_UCI}.${_n}.tailscale_hostname" 2>/dev/null)" = "$_host" ] || _ok=0
-    [ "$(uci -q get "${PODKOP_UCI}.${_n}.tailscale_advertise_exit_node" 2>/dev/null)" = "$_exit" ] || _ok=0
+    if ! _forkop_v2; then
+        [ "$(uci -q get "${PODKOP_UCI}.${_n}.tailscale_advertise_exit_node" 2>/dev/null)" = "$_exit" ] || _ok=0
+    fi
 
     if [ "$_ok" = "1" ]; then
         rm -f "$_bak"
@@ -13539,7 +13558,20 @@ EOF
 
 _handle_forkop_ext() {
     local cmd="$1" mid="$2" text="$3" state="$4" cb_id="$5"
-    _forkop_v2_ui_guard "$mid" && return
+    # Forkop 2's legacy routing editors remain blocked, but Tailscale uses
+    # the CURRENT native server/protocol=tailscale schema and must not be
+    # rejected by the general Forkop 1.x editor guard.
+    if _forkop_v2; then
+        case "$cmd" in
+            ts_*) : ;;
+            STATE_INPUT)
+                case "$state" in
+                    wait_ts_url|wait_ts_hostname|wait_ts_key) : ;;
+                    *) _forkop_v2_ui_guard "$mid" && return ;;
+                esac ;;
+            *) _forkop_v2_ui_guard "$mid" && return ;;
+        esac
+    fi
     local sec=$(get_active_section)
     if [ "$PODKOP_VARIANT" != "forkop" ]; then
         case "$cmd" in ts_*|STATE_INPUT) ;; *) _handle_settings "section_settings" "$mid" "" ""; return ;; esac
@@ -14286,6 +14318,10 @@ ${_ip}"; fi
                 *)      _rest="${cmd#ts_r_}"; _key="tailscale_accept_routes" ;;
             esac
             _sn="${_rest%_[01]}"; _nv="${_rest##*_}"
+            if _forkop_v2 && [ "$_key" != enabled ]; then
+                CB_ANSWER_TEXT="Forkop 2: этот параметр управляется ядром или исходящим туннелем"
+                return
+            fi
             if ! _ts_backend_native; then
                 if [ "$(uci -q get "${PODKOP_UCI}.${_sn}.protocol" 2>/dev/null)" = "tailscale" ]; then
                     CB_ANSWER_TEXT="Это устаревшая native-секция — удалите её из карточки служб"
@@ -14344,7 +14380,7 @@ ${_ip}"; fi
                 _hn=$(uci -q get "${PODKOP_UCI}.${_sn}.tailscale_hostname" 2>/dev/null)
                 [ -n "$_hn" ] || _hn="forkop-${_sn}"
                 if _si_ts_registered_global "$_sn"; then
-                    send_message "$(printf '%s <b>Роутер подключён к tailnet</b>\nУзел: <code>%s</code>' "$E_OK" "$(html_escape "$_hn")")" ""
+                    send_message "$(printf '%s <b>Tailscale создал локальную identity</b>\nУзел: <code>%s</code>\n\n<i>Убедитесь, что узел виден и активен в панели Tailscale. Сам файл identity не доказывает доступность сети.</i>' "$E_OK" "$(html_escape "$_hn")")" ""
                 else
                     send_message "$(printf '%s Forkop запущен, но регистрация Tailscale пока не подтверждена. Через несколько секунд откройте «Службы»: зелёный статус появится после создания tsnet state.' "$E_YLW")" ""
                 fi
@@ -17023,8 +17059,8 @@ EOF
             _ts_standalone_present && _ts_standalone_present_flag=1
             [ "$_ts_standalone_present_flag" = 1 ] && _ts_standalone_running && _ts_standalone_running_flag=1
 
-            # Forkop 2 moved native tunnels (including Tailscale) to
-            # config tunnel children, which are not inbound servers.
+            # Forkop 2 has both routing tunnel/kind=tailscale and router
+            # identity server/protocol=tailscale. They are distinct objects.
             local _si_tunnels="" _si_tun_count=0
             if _forkop_v2; then
                 _si_tunnels=$(uci -q show "$PODKOP_UCI" 2>/dev/null |
@@ -17315,8 +17351,12 @@ EOF
                     esac
 
                     # Routing role flags
-                    [ "$_ts_exit" = "1" ]   && _text="${_text}\n    🚪 анонсирует выходной узел после подключения"
-                    [ "$_ts_accept" = "1" ] && _text="${_text}\n    📥 принимает маршруты"
+                    if _forkop_v2; then
+                        _text="${_text}\n    🚪 Возможность exit node: анонсируется ядром; включается после одобрения в tailnet"
+                    else
+                        [ "$_ts_exit" = "1" ]   && _text="${_text}\n    🚪 анонсирует выходной узел после подключения"
+                        [ "$_ts_accept" = "1" ] && _text="${_text}\n    📥 принимает маршруты"
+                    fi
 
                     _ts_state=$(_si_ts_state_dir "$_s")
                     _text="${_text}\n    💾 Каталог состояния: <code>$(html_escape "$_ts_state")</code>"
@@ -17340,7 +17380,10 @@ EOF
                         local _en_cur _en_lbl
                         _en_cur=$(uci -q get ${PODKOP_UCI}.${_s}.enabled 2>/dev/null)
                         [ "$_en_cur" = "1" ] && _en_lbl="${E_ON} Узел включён" || _en_lbl="${E_OFF} Узел выключен"
-                        _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_en_lbl")\",\"callback_data\":\"ts_e_${_s}_$([ "$_en_cur" = "1" ] && echo 0 || echo 1)\"}],[{\"text\":\"$(json_escape "$_ex_lbl")\",\"callback_data\":\"ts_x_${_s}_$([ "$_ex_cur" = "1" ] && echo 0 || echo 1)\"},{\"text\":\"$(json_escape "$_rt_lbl")\",\"callback_data\":\"ts_r_${_s}_$([ "$_rt_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                        _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_en_lbl")\",\"callback_data\":\"ts_e_${_s}_$([ "$_en_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                        if ! _forkop_v2; then
+                            _ts_toggle_rows="${_ts_toggle_rows}[{\"text\":\"$(json_escape "$_ex_lbl")\",\"callback_data\":\"ts_x_${_s}_$([ "$_ex_cur" = "1" ] && echo 0 || echo 1)\"},{\"text\":\"$(json_escape "$_rt_lbl")\",\"callback_data\":\"ts_r_${_s}_$([ "$_rt_cur" = "1" ] && echo 0 || echo 1)\"}],"
+                        fi"
                     fi
                 }
 
