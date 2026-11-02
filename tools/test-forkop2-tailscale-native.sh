@@ -31,6 +31,9 @@ MOCK_UBUS_JSON='{"capabilities":{"core":{"known":false,"features":{"tailscale":{
 export MOCK_UBUS_JSON
 if "$T/check.sh" "$T/feature.sh"; then echo "Unknown core accepted" >&2; exit 1; fi
 grep -Fq 'wait_ts_url|wait_ts_hostname|wait_ts_key' "$BOT"
+grep -Fq '_ts_management_available()' "$BOT"
+grep -Fq 'if _forkop_v2 && _ts_backend_native; then return 0; fi' "$BOT"
+grep -Fq 'singbox_supports_tailscale && _ts_management_available' "$BOT"
 grep -Fq 'if _forkop_v2 && [ "$_key" != enabled ]; then' "$BOT"
 grep -Fq 'tailscale_advertise_exit_node and tailscale_accept_routes keys do not' "$BOT"
 grep -Fq '_podkop_exp_v2' "$BOT"
