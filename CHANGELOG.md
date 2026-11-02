@@ -9,6 +9,10 @@
   - **Subscriptions:** traffic and expiry from `subscriptionInfo` in `/providers/proxies` (Forkop 2 has no section cache or metadata command); the node prefix is `override_prefix`.
   - **Priority groups** → `fallback_group` / `fallback_level`: levels by `server_filter_mode`, countries as flag patterns in `include_regex`; the "fastest" options are gone in Forkop 2 and hidden. URLTest filters are shown read-only (edited in LuCI).
   - **DNS:** the protocol is part of the server address (`tls://`, `https://`); the protocol switch is hidden. Zapret / Zapret2 / ByeDPI are not offered; Podkop checks run `check_service`, `check_dns`, `check_traffic`, `check_servers` instead of `global_check`.
+- **PODKOP EXPERIMENTAL 0.8** (`podkop-exp`, merged from the 0.19.25-dev6 dev branch): detected by its installed package before plain Podkop; sections, `source` and `member` entries are read-only, and updating Podkop Experimental from Telegram is blocked because its installer may ask to remove packages.
+- **TAILSCALE ON THE ROUTER (Forkop 2, from dev6):** the wizard creates Forkop's own `server` with `protocol=tailscale` (disabled; a separate button enables it) when the core has Tailscale, checked through `ubus call forkop state`. The outgoing `tunnel` with `kind=tailscale` is left alone.
+- **PROXY NAMES (from dev4–dev5):** short button names without "label/subN/", URLTest/Fallback groups marked as groups, the selected URLTest node shown; Clash API falls back to `forkop clash_api` when the controller is unreachable by address or secret; a server switch is sent once.
+- **STILL READ-ONLY on Forkop 2:** subscriptions and their URLs, URLTest, domain and subnet lists, global exclusions, text proxy lists and other section settings — the Forkop 1.x editors do not match the 2.0 model, change them in LuCI. Writable: the mixed server, manual links, section action, fallback groups, DNS, labels and order.
 - **INSTALLER:** reads the Forkop 2 mixed server for the bot's SOCKS endpoint and the final summary.
 
 ---

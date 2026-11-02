@@ -17,6 +17,11 @@
 
 ---
 
+> **0.19.25-dev6 — только разработка, аппаратные тесты этой версии ещё не пройдены:** Forkop 2.0 и Podkop Experimental 0.8.x распознаются отдельно. Чтение маршрутов и диагностика адаптированы частично; запись устаревших UCI-полей ограничена. Нативный Tailscale-сервер Forkop 2.0 можно создать и включить из standalone Telegram-бота при подтверждённой поддержке ядра (экспериментальный dev6, без испытаний на роутере); сложные операции с исходящими Tailscale-туннелями и подписками пока требуют штатного LuCI, а обновление Podkop Experimental — интерактивного запуска по SSH. [Состояние и ограничения](COMPAT_FORKOP2_PODKOP_EXP.md).
+> **Dev5 UI:** в Forkop 2.0 и Podkop Experimental 0.8.x группы URLTest/Fallback показывают реально выбранный сервер, а в Forkop 2.0 раздел «Службы» использует названия UCI `label/name` вместо технических идентификаторов. Точные runtime-теги не изменяются. Аппаратные тесты dev5 ещё необходимы.
+
+> **Dev4:** исправлено отображение прокси Forkop 2.0 и Podkop Experimental 0.8.x, упорядочены короткие названия кнопок и URLTest/Fallback, добавлен native Forkop Clash API fallback. [Исследование API](FORKOP2_PODKOP_EXP_API_RESEARCH.md).
+
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
 Работает со всеми вариантами podkop и определяет нужный сам: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45), **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v) и **[forkop](https://github.com/ushan0v/forkop)** — преемник Podkop Plus со своим пакетом, сервисом и UCI-namespace `forkop`, а также его форк **[Forkop X](https://github.com/slayer326/forkop)** (slayer326). Forkop и Forkop X бот различает сам: проверка версии, ссылки на releases и обновление идут в репозиторий именно того форка, который установлен.
