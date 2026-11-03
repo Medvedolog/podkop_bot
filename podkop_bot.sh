@@ -1446,7 +1446,7 @@ EXP_SOURCE_LIST
     [ -n "$_body" ] || _body=$(printf '\n<i>Источников нет.</i>')
     send_or_edit "$_mid" "$(printf '%s <b>Podkop Experimental 0.8 · секция</b>\n\n<b>Правило:</b> <code>%s</code> · %s\n<b>Источники:</b>%s\n\n<i>Изменение source/member через старый редактор запрещено. Выбор сервера через Clash API — в меню прокси.</i>' \
         "$E_INFO" "$(html_escape "$_sec")" "$(html_escape "$_kind")" "$_body")" \
-        "{\"inline_keyboard\":[[{\"text\":\"${E_GLOB} Прокси\",\"callback_data\":\"proxy_menu\"}],[{\"text\":\"${E_CLIP} Секции\",\"callback_data\":\"sections_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
+        "{\"inline_keyboard\":[[{\"text\":\"🧩 Серверы секции\",\"callback_data\":\"xp_menu\"},{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"}],[{\"text\":\"${E_GLOB} Прокси\",\"callback_data\":\"proxy_menu\"}],[{\"text\":\"${E_CLIP} Секции\",\"callback_data\":\"sections_menu\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"main_settings_menu\"}]]}"
 }
 
 _exp_v2_safe_guard() {
@@ -8859,7 +8859,8 @@ EOF
                               and .callback_data != "cmd_edit_sub_url"
                               and .callback_data != "do_px_auto_urltest")
                         ] | select(length > 0)
-                    ]' 2>/dev/null)
+                    ]
+                    | .inline_keyboard |= (.[0:-2] + [[{"text":"🧩 Серверы секции","callback_data":"xp_menu"},{"text":"📚 Источники","callback_data":"xp_src"}]] + .[-2:])' 2>/dev/null)
             fi
             local _card_title _sub_url_line=""
             # Show subscription URL(s) for subscription sections
@@ -13884,6 +13885,450 @@ EOF
             ;;
         *)
             _handle_dns "$cmd" "$mid" "$text" "$state"
+            ;;
+    esac
+}
+
+# ==============================================================================
+# Podkop Experimental 0.8.8+ (settings.config_version=2): sources and rows.
+# Model (src/backend/model/model.go upstream):
+#   config source <name>: type subscription|links|json|interface, label, url,
+#     update_interval (auto|duration), list link, udp_over_tcp, ...
+#   config member: section, role server|fallback, source (<source>|direct|block),
+#     list include / list exclude (words a server name must / must not start a
+#     word of), via (<source>). Rows of a section are its members in file order:
+#     servers form "<sec>-urltest-out", fallbacks are tried in order.
+#   settings.urltest_check_interval / urltest_tolerance / urltest_testing_url.
+# Runtime: selector "<sec>-out" = URLTest + servers; subscriptions are fetched
+# by the backend (podkop ctl subscription_update / subscription_status).
+# Every write is a txn: copy of /etc/config/podkop, commit, reload, rollback.
+# ==============================================================================
+
+# _xp_sources — "name|type|label|url|links|update_interval" per source, file order.
+_xp_sources() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1); sub("^" p, "", k)
+          dot = index(k, ".")
+          if (!dot) { if (v == "source") order[++n] = k; next }
+          o = substr(k, dot + 1); s = substr(k, 1, dot - 1)
+          if (o == "link") { c = gsub(/\047 \047/, "&", v); cnt[s] = c + 1; next }
+          sub(/^\047/, "", v); sub(/\047$/, "", v); gsub(/\|/, " ", v); opt[s SUBSEP o] = v }
+        END { for (i = 1; i <= n; i++) { s = order[i]
+            iv = opt[s SUBSEP "update_interval"]; if (iv == "") iv = "auto"
+            printf "%s|%s|%s|%s|%s|%s\n", s, opt[s SUBSEP "type"], opt[s SUBSEP "label"], opt[s SUBSEP "url"], cnt[s] + 0, iv } }'
+}
+
+# _xp_members SECTION — "id|role|source|include|exclude|via" per row, file order.
+_xp_members() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null | awk -v p="${PODKOP_UCI}." -v want="$1" '
+        function clean(x) { gsub(/\047 \047/, ", ", x); gsub(/\047/, "", x); gsub(/\|/, " ", x); return x }
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1); sub("^" p, "", k)
+          dot = index(k, ".")
+          if (!dot) { if (v == "member") order[++n] = k; next }
+          opt[substr(k, 1, dot - 1) SUBSEP substr(k, dot + 1)] = clean(v) }
+        END { for (i = 1; i <= n; i++) { m = order[i]
+            if (opt[m SUBSEP "section"] != want) continue
+            r = opt[m SUBSEP "role"]; if (r != "fallback") r = "server"
+            printf "%s|%s|%s|%s|%s|%s\n", m, r, opt[m SUBSEP "source"], opt[m SUBSEP "include"], opt[m SUBSEP "exclude"], opt[m SUBSEP "via"] } }'
+}
+
+_xp_source_label() {
+    case "$1" in
+        direct) printf 'Напрямую'; return ;;
+        block) printf 'Блокировать'; return ;;
+    esac
+    local _l; _l=$(uci -q get "${PODKOP_UCI}.$1.label" 2>/dev/null)
+    printf '%s' "${_l:-$1}"
+}
+
+_xp_member_owned() {
+    [ "$(uci -q get "${PODKOP_UCI}.$1" 2>/dev/null)" = member ] && \
+    [ "$(uci -q get "${PODKOP_UCI}.$1.section" 2>/dev/null)" = "$2" ]
+}
+_xp_is_source() { [ "$(uci -q get "${PODKOP_UCI}.$1" 2>/dev/null)" = source ]; }
+
+# _xp_source_new_name — first free "srcN".
+_xp_source_new_name() {
+    local _n=1
+    while uci -q get "${PODKOP_UCI}.src${_n}" >/dev/null 2>&1; do _n=$((_n + 1)); done
+    printf 'src%s' "$_n"
+}
+
+# xp_source_add TYPE VALUE LABEL — a subscription (VALUE = address) or a links
+# source (VALUE = one link); prints the new name on success.
+xp_source_add() {
+    local _type="$1" _val="$2" _label="$3" _name
+    _name=$(_xp_source_new_name)
+    _fk_stage_set "${PODKOP_UCI}.${_name}" source || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_name}.type" "$_type" || return 1
+    [ -n "$_label" ] && { _fk_stage_set "${PODKOP_UCI}.${_name}.label" "$_label" || return 1; }
+    if [ "$_type" = subscription ]; then
+        _fk_stage_set "${PODKOP_UCI}.${_name}.url" "$_val" || return 1
+    else
+        uci add_list "${PODKOP_UCI}.${_name}.link=${_val}" || { uci -q revert "$PODKOP_UCI" 2>/dev/null || true; return 1; }
+    fi
+    _fk_txn_commit_reload || return $?
+    printf '%s\n' "$_name"
+}
+
+# xp_source_delete NAME — the source and every row that takes servers from it.
+xp_source_delete() {
+    local _name="$1" _m
+    _xp_is_source "$_name" || return 1
+    for _m in $(uci -q show "$PODKOP_UCI" 2>/dev/null | sed -n "s/^${PODKOP_UCI}\.\([^.=]*\)\.source='\{0,1\}${_name}'\{0,1\}\$/\1/p"); do
+        [ "$(uci -q get "${PODKOP_UCI}.${_m}" 2>/dev/null)" = member ] || continue
+        _fk_stage_delete "${PODKOP_UCI}.${_m}" || return 1
+    done
+    _fk_stage_delete "${PODKOP_UCI}.${_name}" || return 1
+    _fk_txn_commit_reload
+}
+
+# xp_member_add SECTION ROLE SOURCE
+xp_member_add() {
+    local _id
+    case "$2" in server|fallback) ;; *) return 1 ;; esac
+    case "$3" in direct|block) [ "$2" = fallback ] || return 1 ;; *) _xp_is_source "$3" || return 1 ;; esac
+    _id=$(uci add "$PODKOP_UCI" member 2>/dev/null) || return 1
+    [ -n "$_id" ] || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.section" "$1" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.role" "$2" || return 1
+    _fk_stage_set "${PODKOP_UCI}.${_id}.source" "$3" || return 1
+    _fk_txn_commit_reload
+}
+
+# xp_member_words MEMBER SECTION include|exclude "a, b c" — "" or "-" clears.
+xp_member_words() {
+    local _m="$1" _key="$3" _lines
+    _xp_member_owned "$_m" "$2" || return 1
+    case "$_key" in include|exclude) ;; *) return 1 ;; esac
+    _lines=$(printf '%s' "$4" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^-\{0,1\}$')
+    _fk_list_stage_replace_any "${PODKOP_UCI}.${_m}.${_key}" "$_lines" || return 1
+    _fk_txn_commit_reload
+}
+
+# xp_member_move MEMBER SECTION up|down — swap with the neighbouring row of the
+# same role (fallback order is the order rows are tried in).
+xp_member_move() {
+    local _m="$1" _sec="$2" _dir="$3" _role _rows _other _pos
+    _xp_member_owned "$_m" "$_sec" || return 1
+    _role=$(_xp_members "$_sec" | awk -F'|' -v m="$_m" '$1 == m { print $2 }')
+    _rows=$(_xp_members "$_sec" | awk -F'|' -v r="$_role" '$2 == r { print $1 }')
+    if [ "$_dir" = up ]; then
+        _other=$(printf '%s\n' "$_rows" | awk -v m="$_m" '$0 == m { print prev; exit } { prev = $0 }')
+    else
+        _other=$(printf '%s\n' "$_rows" | awk -v m="$_m" 'f { print; exit } $0 == m { f = 1 }')
+    fi
+    [ -n "$_other" ] || return 0
+    _pos=$(uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v o="$_other" '
+        { k = $1; sub("^" p, "", k); if (index(k, ".")) next; if (k == o) { print n; exit } n++ }')
+    case "$_pos" in ''|*[!0-9]*) return 1 ;; esac
+    if [ "$_dir" = up ]; then
+        uci reorder "${PODKOP_UCI}.${_m}=${_pos}" || { uci -q revert "$PODKOP_UCI" 2>/dev/null || true; return 1; }
+    else
+        local _mpos
+        _mpos=$(uci -q show "$PODKOP_UCI" 2>/dev/null | awk -F= -v p="${PODKOP_UCI}." -v o="$_m" '
+            { k = $1; sub("^" p, "", k); if (index(k, ".")) next; if (k == o) { print n; exit } n++ }')
+        uci reorder "${PODKOP_UCI}.${_other}=${_mpos}" || { uci -q revert "$PODKOP_UCI" 2>/dev/null || true; return 1; }
+    fi
+    _fk_txn_commit_reload
+}
+
+# _xp_sub_status NAME — "servers|error|used|total|expire" from podkop ctl.
+_xp_sub_status() {
+    "$PODKOP_BIN" ctl subscription_status 2>/dev/null | jq -r --arg n "$1" '
+        .[]? | select(.name == $n) |
+        "\(.servers // 0)|\(.error // "")|\(((.provider.upload // 0) + (.provider.download // 0)))|\(.provider.total // 0)|\(.provider.expire // "")"' 2>/dev/null | head -1
+}
+
+_xp_back_kb() { printf '{"inline_keyboard":[[{"text":"%s Назад","callback_data":"%s"}]]}' "$E_BACK" "$1"; }
+
+_handle_exp_v2() {
+    local cmd="$1" mid="$2" text="$3" state="$4" sec _rc _rmid
+    sec=$(get_active_section)
+    _podkop_exp_v2 || { CB_ANSWER_TEXT="Нужен Podkop Experimental 0.8.8+"; return; }
+
+    if [ "$cmd" = STATE_INPUT ]; then
+        _rmid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null); case "$_rmid" in ''|*[!0-9]*) _rmid="" ;; esac
+        rm -f "$STATE_FILE"; delete_message "${CALLBACK_MSG_ID:-$mid}"
+        local _v; _v=$(printf '%s' "$text" | tr -d '\r' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case "$state" in
+            wait_xp_sadd_sub|wait_xp_surl_*)
+                case "$_v" in http://?*|https://?*) ;; *) send_message "${E_ERR} Нужен адрес <code>https://…</code>." "$(_xp_back_kb xp_src)"; return ;; esac
+                case "$_v" in *[[:space:]]*) send_message "${E_ERR} В адресе не должно быть пробелов." "$(_xp_back_kb xp_src)"; return ;; esac
+                send_or_edit "$_rmid" "${E_RST} <b>Сохраняем, Podkop перезапускается…</b>" ""
+                if [ "$state" = wait_xp_sadd_sub ]; then
+                    local _host; _host=$(printf '%s' "$_v" | sed 's#^[A-Za-z][A-Za-z0-9+.-]*://##; s#[/?].*$##; s#^.*@##')
+                    _rc=0; xp_source_add subscription "$_v" "$_host" >/dev/null || _rc=$?
+                else
+                    local _s="${state#wait_xp_surl_}"
+                    _rc=1; _xp_is_source "$_s" && { _fk_stage_set "${PODKOP_UCI}.${_s}.url" "$_v" && { _rc=0; _fk_txn_commit_reload || _rc=$?; }; }
+                fi
+                [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_src "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_src)"
+                ;;
+            wait_xp_sadd_link|wait_xp_slink_*)
+                case "$_v" in *://*) ;; *) send_message "${E_ERR} Нужна ссылка вида <code>vless://…</code>." "$(_xp_back_kb xp_src)"; return ;; esac
+                send_or_edit "$_rmid" "${E_RST} <b>Сохраняем, Podkop перезапускается…</b>" ""
+                if [ "$state" = wait_xp_sadd_link ]; then
+                    local _ln; _ln=$(get_proxy_human_name_from_link "$_v" 2>/dev/null)
+                    _rc=0; xp_source_add links "$_v" "${_ln:-Ссылки}" >/dev/null || _rc=$?
+                    [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_src "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_src)"
+                else
+                    local _s="${state#wait_xp_slink_}"
+                    _rc=1
+                    if _xp_is_source "$_s" && uci add_list "${PODKOP_UCI}.${_s}.link=${_v}"; then _rc=0; _fk_txn_commit_reload || _rc=$?; fi
+                    [ "$_rc" -eq 0 ] && _handle_exp_v2 "xp_s_${_s}" "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb "xp_s_${_s}")"
+                fi
+                ;;
+            wait_xp_sint_*|wait_xp_slabel_*)
+                local _s _key
+                case "$state" in wait_xp_sint_*) _s="${state#wait_xp_sint_}"; _key=update_interval ;; *) _s="${state#wait_xp_slabel_}"; _key=label ;; esac
+                if [ "$_key" = update_interval ] && [ "$_v" != auto ] && ! _fk_valid_duration "$_v"; then
+                    send_message "${E_ERR} Интервал: <code>auto</code> или длительность — <code>30m</code>, <code>6h</code>, <code>1d</code>." "$(_xp_back_kb "xp_s_${_s}")"; return
+                fi
+                [ -n "$_v" ] || { send_message "${E_ERR} Пустое значение." "$(_xp_back_kb "xp_s_${_s}")"; return; }
+                _rc=1; _xp_is_source "$_s" && _fk_stage_set "${PODKOP_UCI}.${_s}.${_key}" "$_v" && { _rc=0; _fk_txn_commit_reload || _rc=$?; }
+                [ "$_rc" -eq 0 ] && _handle_exp_v2 "xp_s_${_s}" "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb "xp_s_${_s}")"
+                ;;
+            wait_xp_mi_*|wait_xp_mx_*)
+                local _m _key
+                case "$state" in wait_xp_mi_*) _m="${state#wait_xp_mi_}"; _key=include ;; *) _m="${state#wait_xp_mx_}"; _key=exclude ;; esac
+                send_or_edit "$_rmid" "${E_RST} <b>Сохраняем, Podkop перезапускается…</b>" ""
+                _rc=0; xp_member_words "$_m" "$sec" "$_key" "$_v" || _rc=$?
+                [ "$_rc" -eq 0 ] && _handle_exp_v2 "xp_m_${_m}" "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_menu)"
+                ;;
+            wait_xp_chk_*)
+                local _key="${state#wait_xp_chk_}"
+                case "$_key" in
+                    urltest_check_interval) _fk_valid_duration "$_v" || { send_message "${E_ERR} Длительность: <code>3m</code>, <code>30s</code>." "$(_xp_back_kb xp_chk)"; return; } ;;
+                    urltest_tolerance) case "$_v" in ''|*[!0-9]*) send_message "${E_ERR} Число миллисекунд." "$(_xp_back_kb xp_chk)"; return ;; esac ;;
+                    urltest_testing_url) case "$_v" in http://?*|https://?*) ;; *) send_message "${E_ERR} Нужен адрес <code>https://…</code>." "$(_xp_back_kb xp_chk)"; return ;; esac ;;
+                    *) return ;;
+                esac
+                _rc=0; _fk_stage_set "${PODKOP_UCI}.settings.${_key}" "$_v" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+                [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_chk "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_chk)"
+                ;;
+        esac
+        return
+    fi
+
+    case "$cmd" in
+        xp_menu)
+            rm -f "$STATE_FILE"
+            local _body="" _rows="" _id _role _src _inc _exc _via _ns=0 _nf=0 _line
+            while IFS='|' read -r _id _role _src _inc _exc _via; do
+                [ -n "$_id" ] || continue
+                if [ "$_role" = fallback ]; then _nf=$((_nf + 1)); _line="🛟 ${_nf}"; else _ns=$((_ns + 1)); _line="⭐"; fi
+                _line="${_line} $(_xp_source_label "$_src")"
+                [ -n "$_inc" ] && _line="${_line} · только: ${_inc}"
+                [ -n "$_exc" ] && _line="${_line} · кроме: ${_exc}"
+                [ -n "$_via" ] && _line="${_line} · через $(_xp_source_label "$_via")"
+                _body="${_body}
+$(html_escape "$_line")"
+                _rows="${_rows}[{\"text\":\"$(json_escape "$(printf '%s' "$_line" | cut -c1-60)")\",\"callback_data\":\"xp_m_${_id}\"}],"
+            done <<XPM
+$(_xp_members "$sec")
+XPM
+            [ -n "$_body" ] || _body="
+<i>Строк нет: секция ничего не маршрутизирует.</i>"
+            send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — из них URLTest выбирает быстрый сервер. 🛟 резервные — пробуются по порядку, когда основные не отвечают.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Основная строка\",\"callback_data\":\"xp_add_s\"},{\"text\":\"${E_ADD} Резервная\",\"callback_data\":\"xp_add_f\"}],[{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"},{\"text\":\"⏱ Проверка серверов\",\"callback_data\":\"xp_chk\"}],[{\"text\":\"${E_BACK} Прокси\",\"callback_data\":\"proxy_menu\"}]]}"
+            ;;
+        xp_add_s|xp_add_f)
+            local _role _map="" _rows="" _i=0 _n _t _l _u _c _iv
+            [ "$cmd" = xp_add_s ] && _role=server || _role=fallback
+            while IFS='|' read -r _n _t _l _u _c _iv; do
+                [ -n "$_n" ] || continue
+                _map="${_map}${_role}|${_n}
+"
+                _rows="${_rows}[{\"text\":\"$(json_escape "${_l:-$_n} · ${_t}")\",\"callback_data\":\"xp_as_${_i}\"}],"
+                _i=$((_i + 1))
+            done <<XPS
+$(_xp_sources)
+XPS
+            if [ "$_role" = fallback ]; then
+                _map="${_map}fallback|direct
+fallback|block
+"
+                _rows="${_rows}[{\"text\":\"➡️ Напрямую\",\"callback_data\":\"xp_as_${_i}\"},{\"text\":\"⛔ Блокировать\",\"callback_data\":\"xp_as_$((_i + 1))\"}],"
+            fi
+            _fk_map_write "$_map" "$(_fk_map_key "$mid")"
+            send_or_edit "$mid" "$(printf '%s <b>Откуда брать серверы?</b>\n\nНовый источник (подписку или ссылку) добавьте в «Источниках».' "$E_ADD")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
+            ;;
+        xp_as_*)
+            local _row; _row=$(_fk_map_get "$(_fk_map_key "$mid")" "${cmd#xp_as_}")
+            [ -n "$_row" ] || { CB_ANSWER_TEXT="Список устарел — откройте заново"; return; }
+            send_or_edit "$mid" "${E_RST} <b>Добавляем строку, Podkop перезапускается…</b>" ""
+            _rc=0; xp_member_add "$sec" "${_row%%|*}" "${_row#*|}" || _rc=$?
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_menu "$mid" "" "" || send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_menu)"
+            ;;
+        xp_m_*)
+            local _m="${cmd#xp_m_}" _r
+            _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Строка устарела"; _handle_exp_v2 xp_menu "$mid" "" ""; return; }
+            _r=$(_xp_members "$sec" | awk -F'|' -v m="$_m" '$1 == m')
+            local _role _src _inc _exc _via
+            IFS='|' read -r _ _role _src _inc _exc _via <<XPR
+$_r
+XPR
+            send_or_edit "$mid" "$(printf '%s <b>Строка секции</b>\n\n<b>Роль:</b> %s\n<b>Источник:</b> %s\n<b>Только серверы со словами:</b> %s\n<b>Кроме слов:</b> %s%s\n\n<i>Слово ищется в начале слов имени сервера без учёта регистра: <code>de</code> найдёт «DE-1», флаг 🇩🇪 ищется как есть.</i>' "$E_SET" "$( [ "$_role" = fallback ] && echo 'резервная' || echo 'основная')" "$(html_escape "$(_xp_source_label "$_src")")" "$(html_escape "${_inc:-все}")" "$(html_escape "${_exc:-—}")" "$( [ -n "$_via" ] && printf '\n<b>Через:</b> %s' "$(html_escape "$(_xp_source_label "$_via")")")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Только…\",\"callback_data\":\"xp_mi_${_m}\"},{\"text\":\"${E_EDIT} Кроме…\",\"callback_data\":\"xp_mx_${_m}\"}],[{\"text\":\"⬆️ Выше\",\"callback_data\":\"xp_mu_${_m}\"},{\"text\":\"⬇️ Ниже\",\"callback_data\":\"xp_md_${_m}\"}],[{\"text\":\"${E_DEL} Удалить строку\",\"callback_data\":\"xp_mdel_${_m}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
+            ;;
+        xp_mi_*|xp_mx_*)
+            local _m _what
+            case "$cmd" in xp_mi_*) _m="${cmd#xp_mi_}"; _what="Только серверы, в имени которых есть слова" ;; *) _m="${cmd#xp_mx_}"; _what="Исключить серверы со словами" ;; esac
+            _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Строка устарела"; return; }
+            printf '%s\n' "wait_xp_$(printf '%s' "$cmd" | cut -c4-5)_${_m}" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '%s <b>%s</b>\n\nОтправьте слова через запятую: <code>DE, NL, 🇫🇮</code>. Отправьте <code>-</code>, чтобы очистить.' "$E_EDIT" "$_what")" "$(_xp_back_kb "xp_m_${_m}")"
+            ;;
+        xp_mu_*|xp_md_*)
+            local _m _dir
+            case "$cmd" in xp_mu_*) _m="${cmd#xp_mu_}"; _dir=up ;; *) _m="${cmd#xp_md_}"; _dir=down ;; esac
+            _rc=0; xp_member_move "$_m" "$sec" "$_dir" || _rc=$?
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_menu "$mid" "" "" || _fk_txn_report "$_rc" "$mid" xp_menu
+            ;;
+        xp_mdel_*)
+            local _m="${cmd#xp_mdel_}"
+            _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Строка устарела"; return; }
+            send_or_edit "$mid" "${E_WARN} <b>Удалить строку?</b> Источник останется в «Источниках»." \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Удалить\",\"callback_data\":\"xp_mdok_${_m}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"xp_m_${_m}\"}]]}"
+            ;;
+        xp_mdok_*)
+            local _m="${cmd#xp_mdok_}"
+            _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Строка устарела"; return; }
+            _rc=0; _fk_stage_delete "${PODKOP_UCI}.${_m}" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_menu "$mid" "" "" || send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_menu)"
+            ;;
+        xp_src)
+            rm -f "$STATE_FILE"
+            local _rows="" _body="" _n _t _l _u _c _iv _st _srv _d
+            while IFS='|' read -r _n _t _l _u _c _iv; do
+                [ -n "$_n" ] || continue
+                case "$_t" in
+                    subscription) _st=$(_xp_sub_status "$_n"); _srv=${_st%%|*}; _d="подписка · ${_srv:-?} серв." ;;
+                    links) _d="ссылки · ${_c}" ;;
+                    *) _d="${_t:-не заполнен}" ;;
+                esac
+                _body="${_body}
+• $(html_escape "${_l:-$_n}") — ${_d}"
+                _rows="${_rows}[{\"text\":\"$(json_escape "${_l:-$_n}")\",\"callback_data\":\"xp_s_${_n}\"}],"
+            done <<XPS
+$(_xp_sources)
+XPS
+            [ -n "$_body" ] || _body="
+<i>Источников нет.</i>"
+            send_or_edit "$mid" "$(printf '📚 <b>Источники серверов</b>\n%s\n\n<i>Источник сам по себе ничего не маршрутизирует: добавьте его строкой в секцию («Серверы секции»).</i>' "$_body")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Подписка\",\"callback_data\":\"xp_sadd_sub\"},{\"text\":\"${E_ADD} Ссылка\",\"callback_data\":\"xp_sadd_link\"}],[{\"text\":\"${E_RST} Обновить подписки\",\"callback_data\":\"xp_supd\"}],[{\"text\":\"${E_BACK} Серверы секции\",\"callback_data\":\"xp_menu\"}]]}"
+            ;;
+        xp_sadd_sub|xp_sadd_link)
+            printf '%s\n' "wait_${cmd}" > "$STATE_FILE"
+            if [ "$cmd" = xp_sadd_sub ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Новая подписка</b>\n\nОтправьте адрес <code>https://…</code>. Сообщение будет удалено.' "$E_ADD")" "$(_xp_back_kb xp_src)"
+            else
+                send_or_edit "$mid" "$(printf '%s <b>Новый источник-ссылка</b>\n\nОтправьте ссылку (<code>vless://</code>, <code>ss://</code>, …). Ещё ссылки в него можно добавить потом.' "$E_ADD")" "$(_xp_back_kb xp_src)"
+            fi
+            ;;
+        xp_supd|xp_supd_*)
+            local _name=""
+            [ "$cmd" = xp_supd ] || _name="${cmd#xp_supd_}"
+            if timeout 60 "$PODKOP_BIN" ctl subscription_update $_name >/dev/null 2>&1; then
+                CB_ANSWER_TEXT="Подписки обновлены"
+            else
+                CB_ANSWER_TEXT="Загрузка не завершилась — см. статус источника"
+            fi
+            [ -n "$_name" ] && _handle_exp_v2 "xp_s_${_name}" "$mid" "" "" || _handle_exp_v2 xp_src "$mid" "" ""
+            ;;
+        xp_s_*)
+            local _s="${cmd#xp_s_}" _t _l _u _c _iv _info="" _kb _st _srv _err _used _tot _exp
+            _xp_is_source "$_s" || { CB_ANSWER_TEXT="Источник удалён"; _handle_exp_v2 xp_src "$mid" "" ""; return; }
+            IFS='|' read -r _ _t _l _u _c _iv <<XPS
+$(_xp_sources | awk -F'|' -v s="$_s" '$1 == s')
+XPS
+            if [ "$_t" = subscription ]; then
+                _st=$(_xp_sub_status "$_s")
+                IFS='|' read -r _srv _err _used _tot _exp <<XPST
+$_st
+XPST
+                _info=$(printf '<b>Адрес:</b> <code>%s</code>\n<b>Обновление:</b> <code>%s</code>\n<b>Серверов:</b> %s' "$(html_escape "$(_report_mask_sub_url "$_u")")" "$_iv" "${_srv:-?}")
+                [ "${_tot:-0}" -gt 0 ] 2>/dev/null && _info="${_info}
+<b>Трафик:</b> $(( ${_used:-0} / 1073741824 )) из $(( _tot / 1073741824 )) ГБ"
+                [ -n "$_exp" ] && _info="${_info}
+<b>До:</b> $(printf '%s' "$_exp" | cut -c1-10)"
+                [ -n "$_err" ] && _info="${_info}
+${E_WARN} $(html_escape "$(printf '%s' "$_err" | cut -c1-200)")"
+                _kb="[{\"text\":\"${E_EDIT} Адрес\",\"callback_data\":\"xp_surl_${_s}\"},{\"text\":\"⏱ Интервал\",\"callback_data\":\"xp_sint_${_s}\"}],[{\"text\":\"${E_RST} Обновить сейчас\",\"callback_data\":\"xp_supd_${_s}\"}],"
+            elif [ "$_t" = links ]; then
+                _info=$(printf '<b>Ссылок:</b> %s' "$_c")
+                _kb="[{\"text\":\"${E_ADD} Ссылка\",\"callback_data\":\"xp_slink_${_s}\"},{\"text\":\"${E_DEL} Ссылки…\",\"callback_data\":\"xp_sld_${_s}\"}],"
+            else
+                _info="<i>Этот тип источника настраивается в LuCI.</i>"; _kb=""
+            fi
+            send_or_edit "$mid" "$(printf '📚 <b>%s</b> · %s\n\n%s' "$(html_escape "${_l:-$_s}")" "${_t:-?}" "$_info")" \
+                "{\"inline_keyboard\":[${_kb}[{\"text\":\"🏷 Название\",\"callback_data\":\"xp_slabel_${_s}\"},{\"text\":\"${E_DEL} Удалить\",\"callback_data\":\"xp_sdel_${_s}\"}],[{\"text\":\"${E_BACK} Источники\",\"callback_data\":\"xp_src\"}]]}"
+            ;;
+        xp_surl_*|xp_sint_*|xp_slabel_*|xp_slink_*)
+            local _s _p
+            case "$cmd" in
+                xp_surl_*) _s="${cmd#xp_surl_}"; _p="Отправьте новый адрес подписки <code>https://…</code>." ;;
+                xp_sint_*) _s="${cmd#xp_sint_}"; _p="Интервал обновления: <code>auto</code> (как просит провайдер, иначе раз в день) или <code>6h</code>, <code>1d</code>." ;;
+                xp_slabel_*) _s="${cmd#xp_slabel_}"; _p="Отправьте название источника." ;;
+                *) _s="${cmd#xp_slink_}"; _p="Отправьте ссылку для добавления." ;;
+            esac
+            _xp_is_source "$_s" || { CB_ANSWER_TEXT="Источник удалён"; return; }
+            printf '%s\n' "wait_${cmd}" > "$STATE_FILE"
+            send_or_edit "$mid" "${E_EDIT} ${_p}" "$(_xp_back_kb "xp_s_${_s}")"
+            ;;
+        xp_sld_*)
+            local _s="${cmd#xp_sld_}" _rows="" _i=0 _ln _map=""
+            _xp_is_source "$_s" || return
+            while IFS= read -r _ln; do
+                [ -n "$_ln" ] || continue
+                _map="${_map}${_s}|${_ln}
+"
+                _rows="${_rows}[{\"text\":\"${E_DEL} $(json_escape "$(get_proxy_human_name_from_link "$_ln" 2>/dev/null | cut -c1-40)")\",\"callback_data\":\"xp_sldo_${_i}\"}],"
+                _i=$((_i + 1))
+            done <<XPL
+$(_fk_list_read_any "${PODKOP_UCI}.${_s}.link" | head -20)
+XPL
+            _fk_map_write "$_map" "$(_fk_map_key "$mid")"
+            send_or_edit "$mid" "${E_DEL} <b>Какую ссылку удалить?</b>" "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_s_${_s}\"}]]}"
+            ;;
+        xp_sldo_*)
+            local _row _s _ln _rest
+            _row=$(_fk_map_get "$(_fk_map_key "$mid")" "${cmd#xp_sldo_}")
+            [ -n "$_row" ] || { CB_ANSWER_TEXT="Список устарел"; return; }
+            _s="${_row%%|*}"; _ln="${_row#*|}"
+            _rest=$(_fk_list_read_any "${PODKOP_UCI}.${_s}.link" | grep -vxF -- "$_ln")
+            [ -n "$_rest" ] || { CB_ANSWER_TEXT="Последнюю ссылку не удалить — удалите источник"; return; }
+            _rc=0; _fk_list_stage_replace_any "${PODKOP_UCI}.${_s}.link" "$_rest" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 "xp_s_${_s}" "$mid" "" "" || send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb "xp_s_${_s}")"
+            ;;
+        xp_sdel_*)
+            local _s="${cmd#xp_sdel_}" _cnt
+            _xp_is_source "$_s" || return
+            _cnt=$(uci -q show "$PODKOP_UCI" 2>/dev/null | grep -c "\.source='\{0,1\}${_s}'\{0,1\}$")
+            send_or_edit "$mid" "$(printf '%s <b>Удалить источник «%s»?</b>\n\nВместе с ним удалятся строк секций: %s.' "$E_WARN" "$(html_escape "$(_xp_source_label "$_s")")" "$_cnt")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Удалить\",\"callback_data\":\"xp_sdok_${_s}\"},{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"xp_s_${_s}\"}]]}"
+            ;;
+        xp_sdok_*)
+            local _s="${cmd#xp_sdok_}"
+            send_or_edit "$mid" "${E_RST} <b>Удаляем, Podkop перезапускается…</b>" ""
+            _rc=0; xp_source_delete "$_s" || _rc=$?
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_src "$mid" "" "" || send_or_edit "$mid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_src)"
+            ;;
+        xp_chk)
+            rm -f "$STATE_FILE"
+            local _i _t _u
+            _i=$(uci -q get "${PODKOP_UCI}.settings.urltest_check_interval" 2>/dev/null)
+            _t=$(uci -q get "${PODKOP_UCI}.settings.urltest_tolerance" 2>/dev/null)
+            _u=$(uci -q get "${PODKOP_UCI}.settings.urltest_testing_url" 2>/dev/null)
+            send_or_edit "$mid" "$(printf '⏱ <b>Проверка серверов</b> (общая для всех секций)\n\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск:</b> <code>%s</code> мс — переключаться, только если другой сервер быстрее на столько\n<b>Адрес проверки:</b> <code>%s</code>' "${_i:-по умолчанию}" "${_t:-по умолчанию}" "$(html_escape "${_u:-по умолчанию}")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"xp_chks_urltest_check_interval\"},{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"xp_chks_urltest_tolerance\"}],[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"xp_chks_urltest_testing_url\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
+            ;;
+        xp_chks_*)
+            local _key="${cmd#xp_chks_}"
+            case "$_key" in urltest_check_interval|urltest_tolerance|urltest_testing_url) ;; *) return ;; esac
+            printf '%s\n' "wait_xp_chk_${_key}" > "$STATE_FILE"
+            send_or_edit "$mid" "${E_EDIT} Отправьте новое значение." "$(_xp_back_kb xp_chk)"
             ;;
     esac
 }
@@ -19935,6 +20380,8 @@ handle_command() {
             wait_fk_label|wait_fkdns_server|wait_fkpg_name|wait_fkpl_country_*)
                 _handle_forkop_0198 "STATE_INPUT" "$mid" "$cmd" "$state" "" ;;
             wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*|\
+            wait_xp_*)
+                _handle_exp_v2 "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fksub_add|wait_fkutn_add|wait_fkutv_inc_*|wait_fkutv_exc_*|\
             wait_ts_url|wait_ts_hostname|wait_ts_key)
                 _handle_forkop_ext "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -20017,6 +20464,9 @@ handle_command() {
         fk_sub_set_*|fkss_u_*|fkss_v_*|fkss_m_*|fkss_p_*|fkss_i_*|fkss_px_*|fkss_vp_*|fkss_vs_*|\
         fk_ut_menu|fk_ut_ed_*|fkut_u_*|fkut_i_*|fkut_t_*|fkut_e_*|fkut_a_*|\
         fkutf_*|fkufm_*|fkufa_*|fkuc_*|fkuca_*|fkucc_*|fkuflag_*|fkuo_*|fkuot_*|fkuoa_*|fkuoc_*|\
+        xp_*)
+            _handle_exp_v2 "$cmd" "$mid" "" "" ;;
+
         fksub_*|fkutn_*|fkutv_*)
             _handle_forkop_ext "$cmd" "$mid" "" "" "$cb_id" ;;
 
