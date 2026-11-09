@@ -1,5 +1,16 @@
 # Changelog
 
+<!-- experimental-0.20.0-r1-status -->
+## v0.20.0 — experimental branch (Forkop 2 / Podkop Experimental 0.8.x)
+
+- **Status:** the implementation is on [`claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); `main` and the normal installer remain on stable 0.19.24. The [BearGuard 0.20.0-r1 prerelease](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) currently has no APK/IPK assets and its tag points to an older commit. Hardware validation is still pending.
+- **Forkop 2.0:** UCI `config_version 2` support, Mixed Proxy via `server` and `server_client`, `connection_link` links, subscription information via Clash API, URLTest/Fallback, readable names, and transactional rollback for configuration changes.
+- **Podkop Experimental 0.8.x:** `podkop-exp` detection; for 0.8.8+ (`config_version 2`), editing section servers, subscription/link sources and URLTest settings with rollback. Older configurations follow the plain Podkop model. Experimental updates from Telegram are intentionally blocked.
+- **Limitations:** some Forkop 2 settings remain read-only in the bot and must be edited through LuCI. See [full branch changelog](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka/CHANGELOG.md).
+
+---
+
+
 ## v0.19.24
 
 - **FIXED (LAN address with a CIDR mask):** OpenWrt 25.12 stores `network.lan.ipaddr` as `192.168.1.1/24`. Where the sing-box config gave no listen address the bot used the raw value, so the mixed proxy became `socks5h://192.168.1.1/24:2080` and the Clash API fallback `192.168.1.1/24:9090`. Podkop 0.8 (podkop-exp) has sing-box built in and no `/etc/sing-box/config.json`, so it always hit this fallback. The LAN address is now the first `ipaddr` value without the mask.
