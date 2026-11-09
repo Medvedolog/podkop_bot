@@ -1,5 +1,16 @@
 # История изменений
 
+<!-- experimental-0.20.0-r1-status -->
+## v0.20.0 — тестовая ветка для Forkop 2 / Podkop Experimental 0.8.x
+
+- **Статус:** код 0.20.0 находится в [`claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); `main` и штатная установка пока используют стабильную версию 0.19.24. [Тестовый BearGuard 0.20.0-r1](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) содержит описание, но на момент проверки не имеет APK/IPK; тег пока указывает на старый коммит. Аппаратные испытания не подтверждены.
+- **Forkop 2.0:** поддержка UCI `config_version 2`, Mixed Proxy как `server`, учётные записи в `server_client`, ссылки `connection_link`, подписки и трафик Clash API, URLTest/Fallback, короткие метки и откат конфигурации при неудачном применении.
+- **Podkop Experimental 0.8.x:** обнаружение `podkop-exp`; для конфигурации 0.8.8+ (`config_version 2`) добавлены управление серверами секции, источниками и параметрами URLTest с транзакционным откатом. Более ранняя схема обслуживается как обычный Podkop. Обновление Experimental через Telegram запрещено.
+- **Ограничения:** часть полей Forkop 2 доступна только для просмотра и редактируется через LuCI; работа на реальном оборудовании ещё требует проверки. Подробное описание возможностей есть в [changelog тестовой ветки](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka/CHANGELOG_RUS.md).
+
+---
+
+
 ## v0.19.24
 
 - **ИСПРАВЛЕНО (LAN-адрес с маской):** OpenWrt 25.12 хранит `network.lan.ipaddr` в виде `192.168.1.1/24`. Когда в конфиге sing-box не было адреса прослушивания, бот брал это значение как есть: Mixed Proxy превращался в `socks5h://192.168.1.1/24:2080`, а запасной адрес Clash API — в `192.168.1.1/24:9090`. У Podkop 0.8 (podkop-exp) sing-box встроен и `/etc/sing-box/config.json` нет, поэтому он всегда попадал на этот путь. Теперь берётся первый адрес из `ipaddr` без маски.
