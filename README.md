@@ -15,6 +15,10 @@
 
 </div>
 
+<!-- experimental-0.20.0-r1-status -->
+> **Экспериментальный podkop_bot 0.20.0:** поддержка Forkop 2.0 и Podkop Experimental 0.8.x разрабатывается в [ветке `claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); [состав изменений](CHANGELOG_RUS.md) · [BearGuard 0.20.0-r1 TEST](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) · [PR BearGuard #25](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/25). `main` и штатный установщик пока остаются на 0.19.24. Для Podkop Experimental 0.8.8+ заявлена работа с новой конфигурацией `config_version 2`; более ранняя схема обрабатывается как обычный Podkop. Обновление `podkop-exp` через Telegram заблокировано из-за возможных интерактивных действий установщика. Проверка на физическом роутере ещё требуется; страница BearGuard pre-release пока не содержит пакетов APK/IPK и тег не соответствует тестовому коммиту.
+
+
 ---
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
