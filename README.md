@@ -16,7 +16,7 @@
 </div>
 
 <!-- experimental-0.20.0-r1-status -->
-> **Доступна тестовая ветка podkop_bot 0.20.0** для Forkop 2.0 и Podkop Experimental 0.8.x: [исходный скрипт](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh) · [порядок ручного обновления](#как-вручную-обновить-podkop_bot-до-0200-через-telegram-тестовая-ветка). На `main` остаётся стабильная 0.19.24. Полноценное тестирование на роутерах ещё требуется. Пакеты APK/IPK BearGuard собраны в Actions, но к pre-release пока не прикреплены.
+> **Доступна тестовая ветка podkop_bot 0.20.0** для Forkop 2.0 и Podkop Experimental 0.8.x: [исходный скрипт](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh) · [порядок ручного обновления](#как-вручную-обновить-podkop_bot-до-0200-через-telegram-тестовая-ветка). На `main` остаётся стабильная 0.19.24. Полноценное тестирование на роутерах ещё требуется. Пакеты APK/IPK BearGuard опубликованы в [pre-release 0.20.0-r1](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1), коммит `3ce3983`.
 
 ---
 
@@ -270,7 +270,7 @@ Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
 
 **Важно:** кнопка **«🆕 Обновление бота»** использует обычный канал обновлений и может снова поставить стабильную 0.19.24. Для установки конкретно тестовой 0.20.0 используйте **«📤 Загрузить скрипт»**. APK через Telegram-меню загрузки скрипта не устанавливается.
 
-**BearGuard/LuCI 0.20.0-r1:** [pre-release](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) пока не содержит прикреплённых APK/IPK, а его тег указывает на старый `main`. [Готовые пакеты сборки находятся в GitHub Actions](https://github.com/Medvedolog/luci-app-podkop-bearguard/actions/runs/41630575580/artifacts/13227963486) (в ZIP: `noarch` → APK для OpenWrt 25.12+, `all` → IPK для OpenWrt 24.10). Для использования их необходимо извлечь и установить как пакет на роутере; это отдельная операция, не равная обновлению бота через чат.
+**BearGuard/LuCI 0.20.0-r1:** [pre-release](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) содержит APK/IPK из проверенной сборки коммита `3ce3983`. [Готовые пакеты сборки находятся в GitHub Actions](https://github.com/Medvedolog/luci-app-podkop-bearguard/actions/runs/41630575580/artifacts/13227963486) (в ZIP: `noarch` → APK для OpenWrt 25.12+, `all` → IPK для OpenWrt 24.10). Для использования их необходимо извлечь и установить как пакет на роутере; это отдельная операция, не равная обновлению бота через чат.
 
 ## 🚀 Быстрая установка
 
