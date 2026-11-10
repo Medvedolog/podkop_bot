@@ -3,6 +3,9 @@
 <!-- experimental-0.20.0-r1-status -->
 ## v0.20.0 — experimental branch (Forkop 2 / Podkop Experimental 0.8.x)
 
+- **Manual Telegram update:** download [`podkop_bot.sh` v0.20.0](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh); in your existing bot open **Menu → Maintenance (Обслуживание) → Upload script (📤 Загрузить скрипт)**, send the `.sh` file as a Telegram **document**, confirm the requested action, then verify **Status → 0.20.0**. The bot checks version and shell syntax, keeps a `.bak` backup and restarts. The normal “Update bot” command tracks the stable channel, not this test branch. [Step-by-step README](README.md#как-вручную-обновить-podkop_bot-до-0200-через-telegram-тестовая-ветка). This does not update LuCI/APK.
+
+
 - **Status:** the implementation is on [`claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); `main` and the normal installer remain on stable 0.19.24. The [BearGuard 0.20.0-r1 prerelease](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) currently has no APK/IPK assets and its tag points to an older commit. Hardware validation is still pending.
 - **Forkop 2.0:** UCI `config_version 2` support, Mixed Proxy via `server` and `server_client`, `connection_link` links, subscription information via Clash API, URLTest/Fallback, readable names, and transactional rollback for configuration changes.
 - **Podkop Experimental 0.8.x:** `podkop-exp` detection; for 0.8.8+ (`config_version 2`), editing section servers, subscription/link sources and URLTest settings with rollback. Older configurations follow the plain Podkop model. Experimental updates from Telegram are intentionally blocked.
