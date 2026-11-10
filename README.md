@@ -16,8 +16,7 @@
 </div>
 
 <!-- experimental-0.20.0-r1-status -->
-> **Экспериментальный podkop_bot 0.20.0:** поддержка Forkop 2.0 и Podkop Experimental 0.8.x разрабатывается в [ветке `claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); [состав изменений](CHANGELOG_RUS.md) · [BearGuard 0.20.0-r1 TEST](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) · [PR BearGuard #25](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/25). `main` и штатный установщик пока остаются на 0.19.24. Для Podkop Experimental 0.8.8+ заявлена работа с новой конфигурацией `config_version 2`; более ранняя схема обрабатывается как обычный Podkop. Обновление `podkop-exp` через Telegram заблокировано из-за возможных интерактивных действий установщика. Проверка на физическом роутере ещё требуется; страница BearGuard pre-release пока не содержит пакетов APK/IPK и тег не соответствует тестовому коммиту.
-
+> **Доступна тестовая ветка podkop_bot 0.20.0** для Forkop 2.0 и Podkop Experimental 0.8.x: [исходный скрипт](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh) · [порядок ручного обновления](#как-вручную-обновить-podkop_bot-до-0200-через-telegram-тестовая-ветка). На `main` остаётся стабильная 0.19.24. Полноценное тестирование на роутерах ещё требуется. Пакеты APK/IPK BearGuard собраны в Actions, но к pre-release пока не прикреплены.
 
 ---
 
@@ -258,6 +257,20 @@ Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
 > **NetShift.** Базовое управление поддерживается целиком. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, режимы `selector_text`/`urltest_text`) показываются только на чтение — править их нужно в LuCI. При обновлении с podkop-evolution на NetShift бот переключает runtime сам, вмешиваться не нужно.
 
 ---
+
+## Как вручную обновить podkop_bot до 0.20.0 через Telegram (тестовая ветка)
+
+Этот способ обновляет **только скрипт Telegram-бота**, а не пакет LuCI/BearGuard. Для использования нужен уже работающий бот с кнопкой **«📤 Загрузить скрипт»**, доступ к чату администратора и возможность отправить файл как документ.
+
+1. На телефоне или ПК скачайте файл **[podkop_bot.sh 0.20.0 из тестовой ветки](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh)**. Если браузер показывает текст, сохраните его в файл с расширением `.sh`, без `.txt` или `.html`.
+2. Откройте чат со своим ботом: **🏠 Меню → 🔧 Обслуживание → 📤 Загрузить скрипт**.
+3. Отправьте скачанный `podkop_bot.sh` **как файл/документ Telegram**, а не текстом сообщения или архивом. Следуйте запросам подтверждения, которые покажет бот.
+4. Бот проверит заголовок скрипта, `BOT_VERSION` и синтаксис через `busybox ash -n`, создаст резервную копию установленного скрипта (`.bak`), установит новую версию и перезапустится.
+5. Снова откройте **🏠 Меню → 📊 Статус** и проверьте, что версия бота — **0.20.0**. Затем проверьте определение Forkop 2.0 либо Podkop Experimental 0.8.x. Это экспериментальная версия без подтверждённых аппаратных испытаний.
+
+**Важно:** кнопка **«🆕 Обновление бота»** использует обычный канал обновлений и может снова поставить стабильную 0.19.24. Для установки конкретно тестовой 0.20.0 используйте **«📤 Загрузить скрипт»**. APK через Telegram-меню загрузки скрипта не устанавливается.
+
+**BearGuard/LuCI 0.20.0-r1:** [pre-release](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) пока не содержит прикреплённых APK/IPK, а его тег указывает на старый `main`. [Готовые пакеты сборки находятся в GitHub Actions](https://github.com/Medvedolog/luci-app-podkop-bearguard/actions/runs/41630575580/artifacts/13227963486) (в ZIP: `noarch` → APK для OpenWrt 25.12+, `all` → IPK для OpenWrt 24.10). Для использования их необходимо извлечь и установить как пакет на роутере; это отдельная операция, не равная обновлению бота через чат.
 
 ## 🚀 Быстрая установка
 
