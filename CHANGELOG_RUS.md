@@ -1,6 +1,8 @@
 # История изменений
 
 ## v0.20.1-test (P0 fixes — Forkop 2.0, без аппаратной проверки)
+- **URLTest 2.0 — фильтр серверов (P1):** старые Telegram-callback `urltest_settings` и `urltest_filters_menu` направляются в нативный список дочерних URLTest, а не в редактор Podkop. Подтверждена схема `server_filter_mode=all/include/exclude`, `include_regex`/`exclude_regex` и списки `include_outbounds`/`exclude_outbounds` по исходникам upstream Forkop 2.0. При редактировании исключений бот не активирует неиспользуемый `include_outbounds` и сохраняет явный режим `include`, когда он действителен. Добавлены фикстуры выбора режима, владения child-секцией и проверки запрета опасных Clash PUT. Аппаратная проверка остаётся открытой.
+
 
 - **URLTest:** общее меню параметров перенаправлено на нативный редактор дочерних URLTest-секций Forkop 2.0; исключён переход в legacy-редактор Podkop.
 - **Clash API:** перед PUT проверяются тип группы Selector/Fallback и точное наличие выбираемого участника; URLTest не переключается вручную. Полный тег с `/`, пробелами и Unicode кодируется как один компонент пути.
