@@ -39,7 +39,7 @@ jobs:
               if m:f[m.group(1)]=i
           names=[n for n in f if ('exp' in n.lower() or n.startswith('xp_') or n.startswith('_xp_'))]
           print('EXPERIMENTAL FUNCTIONS:', [(name,f[name]+1) for name in names])
-          for name in ('_podkop_exp_v2','_handle_exp_v2','_xp_sources','_xp_source_delete','_xp_members','_xp_member_words','_xp_member_move','_group_selected_human_name'):
+          for name in ('_podkop_exp_v2','_handle_exp_v2','_xp_sources','_xp_source_delete','_xp_members','_xp_member_words','_xp_member_move','_group_selected_human_name','_fk_txn_commit_reload','sec_mixed_toggle','section_is_proxy','fk2_section_mixed','fk2_mixed_servers'):
               i=f.get(name)
               if i is None: continue
               print('\nFUNCTION',name,i+1)
