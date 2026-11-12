@@ -50,6 +50,10 @@ podkop.src1.type='subscription'
 podkop.src1.label='Provider'
 podkop.src1.url='https://sub.example/a'
 podkop.main=section
+podkop.main.server_choice='balance'
+podkop.cure1=cure
+podkop.cure1.hash='some-stable-server-hash'
+podkop.cure1.kind='record_fragment'
 podkop.m1=member
 podkop.m1.section='main'
 podkop.m1.role='server'
@@ -77,6 +81,9 @@ if xp_member_words m1 other include 'x'; then fail "row of another section"; fi
 xp_source_delete src2 || fail "source delete"
 ! grep -q "source='src2'" "$UCIDB" || fail "rows of the deleted source left"
 ! grep -q '^podkop.src2' "$UCIDB" || fail "source left"
+[ "$(uci get podkop.main.server_choice)" = balance ] || fail "0.8.13 choice was modified"
+[ "$(uci get podkop.cure1)" = cure ] || fail "0.8.13 per-server cure removed"
+[ "$(uci get podkop.cure1.kind)" = record_fragment ] || fail "0.8.13 cure was changed"
 TEST
 sh "$tmp/run.sh" "$tmp"
 echo "Podkop Experimental sources and section rows: OK"
