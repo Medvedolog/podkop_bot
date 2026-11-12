@@ -1,6 +1,8 @@
 # История изменений
 
 ## v0.20.1-test (P0 fixes — Forkop 2.0, без аппаратной проверки)
+- **Tailscale native (диагностика):** на экране «Службы» Forkop 2.0 при неподтверждённой поддержке Tailscale появилась кнопка просмотра `core.known` и `features.tailscale.available` из `ubus forkop state`. Вместо скрытого мастера пользователь видит причину ограничения; секции `server.protocol=tailscale` автоматически не создаются и конфигурация не изменяется. Требуется аппаратная проверка full-сборки.
+
 - **URLTest 2.0 — фильтр серверов (P1):** старые Telegram-callback `urltest_settings` и `urltest_filters_menu` направляются в нативный список дочерних URLTest, а не в редактор Podkop. Подтверждена схема `server_filter_mode=all/include/exclude`, `include_regex`/`exclude_regex` и списки `include_outbounds`/`exclude_outbounds` по исходникам upstream Forkop 2.0. При редактировании исключений бот не активирует неиспользуемый `include_outbounds` и сохраняет явный режим `include`, когда он действителен. Добавлены фикстуры выбора режима, владения child-секцией и проверки запрета опасных Clash PUT. Аппаратная проверка остаётся открытой.
 
 
