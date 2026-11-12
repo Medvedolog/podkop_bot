@@ -1,0 +1,40 @@
+name: Forkop 2 Mixed Proxy 0.20.1 regression fix
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/forkop2-mixed-0201.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/funny-pascal-1kzrka
+          persist-credentials: true
+      - name: Patch transaction and UI binding
+        run: python3 tools/fix-forkop2-mixed-0201.py
+      - name: Verify Forkop 2 mixed and Podkop Experimental
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          sh -n podkop_bot.sh
+          sh tools/test-forkop2-mixed-0201.sh
+          sh tools/test-forkop2-subs-urltest.sh
+          sh tools/test-forkop2-native-clash.sh
+          sh tools/test-podkop-exp-sources.sh
+          sh tools/test-forkop2-tailscale-native.sh
+          test "$(cat version.txt)" = "0.20.1"
+          grep -Fq 'BOT_VERSION="0.20.1"' podkop_bot.sh
+      - name: Commit patch to experimental branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add podkop_bot.sh
+          git diff --cached --quiet && { echo "No change"; exit 1; }
+          git commit -m "fix: transactional Forkop2 Mixed and accurate server identity"
+          git push origin HEAD:claude/funny-pascal-1kzrka
