@@ -13,7 +13,7 @@ once(
             # Off, or on with a free port when none is set; on Forkop 2 the mixed
             # proxy is a server routed to the section (see sec_mixed_toggle).
             sec_mixed_toggle "$sec"
-            uci_commit_safe "\${PODKOP_UCI}"
+            uci_commit_safe "${PODKOP_UCI}"
 ''',
 '''        "do_toggle_mixed")
             # Forkop 2 mixes are standalone UCI server objects; never use the
@@ -25,7 +25,7 @@ once(
                 if [ "$_mixed_rc" -eq 0 ]; then
                     _fk_txn_commit_reload || _mixed_rc=$?
                 else
-                    uci -q revert "\${PODKOP_UCI}" 2>/dev/null || true
+                    uci -q revert "${PODKOP_UCI}" 2>/dev/null || true
                 fi
                 if [ "$_mixed_rc" -eq 0 ]; then
                     _handle_settings "section_settings" "$mid" "" ""
@@ -36,7 +36,7 @@ once(
             fi
             # Legacy Podkop/Forkop 1.x retain their existing workflow.
             sec_mixed_toggle "$sec"
-            uci_commit_safe "\${PODKOP_UCI}"
+            uci_commit_safe "${PODKOP_UCI}"
 ''',
 "transactional Forkop2 mixed toggle")
 once(
@@ -48,10 +48,10 @@ once(
                     _actual_mixed=$(fk2_section_mixed "$sec" | cut -d'|' -f1)
                     _actual_mixed_en=$(sec_mixed_enabled "$sec")
                     if [ -n "$_actual_mixed" ]; then
-                        _fk_extra_text="\${_fk_extra_text}
-<b>Mixed UCI сервер:</b> <code>$(html_escape "$_actual_mixed")</code> (enabled=\${_actual_mixed_en})"
+                        _fk_extra_text="${_fk_extra_text}
+<b>Mixed UCI сервер:</b> <code>$(html_escape "$_actual_mixed")</code> (enabled=${_actual_mixed_en})"
                     else
-                        _fk_extra_text="\${_fk_extra_text}
+                        _fk_extra_text="${_fk_extra_text}
 <b>Mixed UCI сервер:</b> не создан для этой секции"
                     fi
                 fi
