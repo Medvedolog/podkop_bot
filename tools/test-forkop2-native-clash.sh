@@ -1,5 +1,6 @@
 #!/bin/sh
-# No network, no router changes. Test upstream Forkop's {status,body} wrapper.
+# No network or router writes: validate the native Forkop2 Clash adapter and
+# fail-closed switching when a group is URLTest or the member is absent.
 set -eu
 cd "$(dirname "$0")/.."
 bot=podkop_bot.sh
@@ -12,42 +13,32 @@ cat > "$tmp/forkop" <<'EOF'
 [ "$1" = clash_api ] || exit 1
 printf '%s %s\n' "$2" "$3" >> "$TEST_FORKOP_LOG"
 case "$2:$3" in
- 'GET:/proxies') printf '{"status":200,"body":"{\\"proxies\\":{\\"main\\":{\\"type\\":\\"Selector\\",\\"all\\":[\\"src1: Node A\\"]},\\"Auto\\":{\\"type\\":\\"URLTest\\",\\"all\\":[\\"src1: Node A\\"]}}}"}\n';;
- 'PUT:/proxies/main') printf '{"status":204,"body":""}\n';;
- *) printf '{"status":403,"body":"denied"}\n';;
+  'GET:/proxies') printf '{"status":200,"body":"{\"proxies\":{\"main\":{\"type\":\"Selector\",\"all\":[\"src1: Node A\"]},\"Auto\":{\"type\":\"URLTest\",\"all\":[\"src1: Node A\"]}}}"}\n' ;;
+  'PUT:/proxies/main') printf '{"status":204,"body":""}\n' ;;
+  *) printf '{"status":403,"body":"denied"}\n' ;;
 esac
 EOF
 chmod +x "$tmp/forkop"
 (
-. "$tmp/clash.sh"
-PODKOP_BIN="$tmp/forkop"; PODKOP_UCI=forkop
-CLASH_API=http://127.0.0.1:9090
-TEST_FORKOP_LOG="$tmp/calls"; export TEST_FORKOP_LOG
-: > "$TEST_FORKOP_LOG"
-_forkop_v2(){ return 0; }
-_podkop_exp_v2(){ return 1; }
-lan_ipv4(){ echo ''; }
-uci(){ echo ''; }
-curl(){ return 7; }
-got=$(clash_request /proxies)
-printf '%s' "$got" | jq -e '.proxies.main.type=="Selector"' >/dev/null
-clash_request /proxies/main PUT '{"name":"src1: Node A"}' >/dev/null
-[ "$(grep -c '^PUT /proxies/main$' "$TEST_FORKOP_LOG")" = 1 ]
-[ "$(grep -c '^GET /proxiesif _forkop_clash_cli DELETE /connections '' >/dev/null; then exit 1; fi
+  . "$tmp/clash.sh"
+  PODKOP_BIN="$tmp/forkop"; PODKOP_UCI=forkop
+  CLASH_API=http://127.0.0.1:9090
+  TEST_FORKOP_LOG="$tmp/calls"; export TEST_FORKOP_LOG
+  : > "$TEST_FORKOP_LOG"
+  _forkop_v2(){ return 0; }
+  _podkop_exp_v2(){ return 1; }
+  lan_ipv4(){ echo ''; }
+  uci(){ echo ''; }
+  curl(){ return 7; }
+  got=$(clash_request /proxies)
+  printf '%s' "$got" | jq -e '.proxies.main.type=="Selector"' >/dev/null
+  clash_request /proxies/main PUT '{"name":"src1: Node A"}' >/dev/null
+  [ "$(grep -c '^PUT /proxies/main$' "$TEST_FORKOP_LOG")" = 1 ]
+  [ "$(grep -c '^GET /proxies$' "$TEST_FORKOP_LOG")" = 2 ]
+  if clash_request /proxies/Auto PUT '{"name":"src1: Node A"}' >/dev/null; then exit 1; fi
+  if clash_request /proxies/main PUT '{"name":"missing-node"}' >/dev/null; then exit 1; fi
+  [ "$(grep -c '^PUT /proxies/main$' "$TEST_FORKOP_LOG")" = 1 ]
+  if grep -q '^PUT /proxies/Auto$' "$TEST_FORKOP_LOG"; then exit 1; fi
+  if _forkop_clash_cli DELETE /connections '' >/dev/null; then exit 1; fi
 )
-echo 'PASS native Forkop2 Clash read + single-write fallback'
- "$TEST_FORKOP_LOG")" = 2 ]
-# Unsafe or stale selections MUST be rejected without a PUT.
-if clash_request /proxies/Auto PUT '{"name":"src1: Node A"}' >/dev/null; then exit 1; fi
-if clash_request /proxies/main PUT '{"name":"missing-node"}' >/dev/null; then exit 1; fi
-[ "$(grep -c '^PUT /proxies/mainif _forkop_clash_cli DELETE /connections '' >/dev/null; then exit 1; fi
-)
-echo 'PASS native Forkop2 Clash read + single-write fallback'
- "$TEST_FORKOP_LOG")" = 1 ]
-! grep -q '^PUT /proxies/Autoif _forkop_clash_cli DELETE /connections '' >/dev/null; then exit 1; fi
-)
-echo 'PASS native Forkop2 Clash read + single-write fallback'
- "$TEST_FORKOP_LOG"
-if _forkop_clash_cli DELETE /connections '' >/dev/null; then exit 1; fi
-)
-echo 'PASS native Forkop2 Clash read + single-write fallback'
+echo 'PASS native Forkop2 Clash read, safe Selector PUT and URLTest guard'
