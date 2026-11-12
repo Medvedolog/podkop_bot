@@ -5,7 +5,7 @@ on:
     paths: [.github/workflows/audit-podkop-exp-0813.yml]
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   audit:
     runs-on: ubuntu-24.04
@@ -56,3 +56,38 @@ jobs:
           cd bot
           sh -n podkop_bot.sh
           sh tools/test-podkop-exp-sources.sh
+
+  apply-0201:
+    needs: audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/funny-pascal-1kzrka
+          persist-credentials: true
+      - name: Apply 0.20.1 and experimental schema UI patch
+        run: python3 tools/fix-exp0813-v0201.py
+      - name: Verify version, shell, experimental 0.8.13 and existing regressions
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          test "$(cat version.txt)" = "0.20.1"
+          grep -Fq 'BOT_VERSION="0.20.1"' podkop_bot.sh
+          grep -Fq 'Индивидуальные обходы (cure)' podkop_bot.sh
+          grep -Fq 'server_choice' podkop_bot.sh
+          sh -n podkop_bot.sh
+          sh tools/test-podkop-exp-sources.sh
+          sh tools/test-forkop2-subs-urltest.sh
+          sh tools/test-forkop2-native-clash.sh
+          sh tools/test-forkop2-tailscale-native.sh
+          sh tools/check-forkop2-render.sh
+      - name: Commit verified 0.20.1 code
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add podkop_bot.sh
+          git diff --cached --quiet && { echo "Nothing changed"; exit 1; }
+          git commit -m "fix: Podkop Exp 0.8.13 choice/cure visibility and bot 0.20.1"
+          git push origin HEAD:claude/funny-pascal-1kzrka
