@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.0"
+BOT_VERSION="0.20.1"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -14153,7 +14153,23 @@ $(_xp_members "$sec")
 XPM
             [ -n "$_body" ] || _body="
 <i>Строк нет: секция ничего не маршрутизирует.</i>"
-            send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — из них URLTest выбирает быстрый сервер. 🛟 резервные — пробуются по порядку, когда основные не отвечают.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
+            # Podkop Experimental 0.8.13 adds server_choice=loss/balance;
+            # do not claim "fastest" when the native engine selects otherwise.
+            # Cure sections are per-server engine settings and are read-only here.
+            local _xp_choice _xp_choice_human _xp_cure_count
+            _xp_choice=$(uci -q get "\${PODKOP_UCI}.\${sec}.server_choice" 2>/dev/null)
+            case "$_xp_choice" in
+                ''|fastest) _xp_choice=fastest; _xp_choice_human="минимальная задержка" ;;
+                loss) _xp_choice_human="с учётом потерь" ;;
+                balance) _xp_choice_human="балансировка" ;;
+                *) _xp_choice_human="неизвестный режим (только просмотр)" ;;
+            esac
+            _xp_cure_count=$(uci -q show "\${PODKOP_UCI}" 2>/dev/null | grep -Ec "^\${PODKOP_UCI}\.[^.]+=cure$" || true)
+            case "$_xp_cure_count" in ''|*[!0-9]*) _xp_cure_count=0 ;; esac
+            _body="\${_body}
+<b>Режим:</b> $(html_escape "$_xp_choice_human") (<code>$(html_escape "$_xp_choice")</code>)
+<b>Индивидуальные обходы (cure):</b> \${_xp_cure_count} · управление в LuCI"
+            send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — участвуют в режиме выбора сервера. 🛟 резервные — используются по порядку при недоступности основных.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
                 "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Основная строка\",\"callback_data\":\"xp_add_s\"},{\"text\":\"${E_ADD} Резервная\",\"callback_data\":\"xp_add_f\"}],[{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"},{\"text\":\"⏱ Проверка серверов\",\"callback_data\":\"xp_chk\"}],[{\"text\":\"${E_BACK} Прокси\",\"callback_data\":\"proxy_menu\"}]]}"
             ;;
         xp_add_s|xp_add_f)
