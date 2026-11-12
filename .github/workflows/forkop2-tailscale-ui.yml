@@ -24,7 +24,7 @@ jobs:
           sh tools/test-forkop2-tailscale-native.sh
           sh tools/test-forkop2-subs-urltest.sh
           grep -Fq 'ts_cap_info' podkop_bot.sh
-          grep -Fq 'Только чтение состояния. Настройки Forkop не изменены' podkop_bot.sh
+          grep -Fq 'Это только чтение состояния. Настройки Forkop не изменены' podkop_bot.sh
       - name: Commit to experimental branch
         run: |
           set -euo pipefail
