@@ -10107,10 +10107,11 @@ _handle_settings() {
     if _forkop_v2; then
         # Forkop 2 URLTest owns independent UCI child sections. Never open
         # Podkop's legacy section-level URLTest editor from the common menu.
-        if [ "$cmd" = "urltest_settings" ]; then
-            _handle_forkop_ext "fk_ut_menu" "$mid" "" ""
-            return
-        fi
+        case "$cmd" in
+            urltest_settings|urltest_filters_menu)
+                _handle_forkop_ext "fk_ut_menu" "$mid" "" ""
+                return ;;
+        esac
         # The legacy Forkop editor assumes several fields that 2.0 removed.
         # Read/status cards remain available, but all mutations fail closed.
         case "$cmd" in
@@ -14469,7 +14470,14 @@ _fk2_filter_value() {
 fk2_ut_filter_set() {
     local _ch="$1" _sec="$2" _side="$3" _val="$4" _key _inc _exc _mode
     _fk_child_owned "$_ch" urltest "$_sec" || return 1
-    [ "$_side" = inc ] && _key=include_regex || _key=exclude_regex
+    local _current_mode
+    _current_mode=$(uci -q get "${PODKOP_UCI}.${_ch}.server_filter_mode" 2>/dev/null)
+    case "$_current_mode" in all|include|exclude|'') ;; *) return 1 ;; esac
+    case "$_side" in
+        inc) _key=include_regex ;;
+        exc) _key=exclude_regex ;;
+        *) return 1 ;;
+    esac
     if [ -n "$_val" ]; then
         _fk_stage_set "${PODKOP_UCI}.${_ch}.${_key}" "$_val" || return 1
     else
@@ -14477,7 +14485,20 @@ fk2_ut_filter_set() {
     fi
     _inc="$(uci -q get "${PODKOP_UCI}.${_ch}.include_regex" 2>/dev/null)$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.include_outbounds")"
     _exc="$(uci -q get "${PODKOP_UCI}.${_ch}.exclude_regex" 2>/dev/null)$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.exclude_outbounds")$(_fk_list_read_any "${PODKOP_UCI}.${_ch}.exclude_types")"
-    if [ -n "$_inc" ]; then _mode=include; elif [ -n "$_exc" ]; then _mode=exclude; else _mode=all; fi
+    if [ "$_side" = inc ] && [ -n "$_inc" ]; then
+        # Explicit include action selects include mode.
+        _mode=include
+    elif [ "$_side" = exc ] && [ "$_current_mode" = include ] && [ -n "$_inc" ]; then
+        # Preserve active include mode while editing its exclusions.
+        _mode=include
+    elif [ -n "$_exc" ]; then
+        # Do NOT activate a latent, unused include_outbounds list from LuCI.
+        _mode=exclude
+    elif [ "$_current_mode" = include ] && [ -n "$_inc" ]; then
+        _mode=include
+    else
+        _mode=all
+    fi
     _fk_stage_set "${PODKOP_UCI}.${_ch}.server_filter_mode" "$_mode" || return 1
     _fk_txn_commit_reload
 }
