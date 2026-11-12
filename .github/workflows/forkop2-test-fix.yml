@@ -37,7 +37,11 @@ jobs:
               print('FIND',needle,[i+1 for i in idx[:35]])
               for i in idx[:6]:
                   for j in range(max(0,i-5),min(len(s),i+11)): print(f'{j+1}: {s[j][:500]}')
-          for first,last in [(1045,1090),(10155,10188),(14500,14520),(14600,14650)]:
+          for first,last in [(1055,1133),(1190,1248),(3558,3592),(10080,10115),(10185,10245),(10740,10780),(1110,1170),(14465,14485),(16710,16880),(16900,17050),(940,1005)]:
+              print('RANGE',first,last)
+              for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:600]}')
+          PY
+          #,(10155,10188),(14500,14520),(14600,14650)]:
               print('RANGE',first,last)
               for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:700]}')
           PY
