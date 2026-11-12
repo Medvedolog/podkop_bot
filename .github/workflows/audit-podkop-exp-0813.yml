@@ -1,0 +1,58 @@
+name: Audit Podkop Experimental v0.8.13 against bot
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/audit-podkop-exp-0813.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/funny-pascal-1kzrka
+          path: bot
+      - uses: actions/checkout@v4
+        with:
+          repository: podkop-net/podkop-experimental
+          ref: v0.8.13
+          path: upstream
+      - name: Confirm upstream 0.8.13 UCI and critical source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq "option config_version '2'" upstream/podkop/files/etc/config/podkop
+          grep -Fq "config member" upstream/podkop/files/etc/config/podkop
+          grep -Fq "server_choice" upstream/src/backend/model/model.go
+          grep -Fq 'SectionsOfType("cure")' upstream/src/backend/model/model.go
+          grep -Fq 'urltest' upstream/src/backend/ctl/outbounds.go
+          echo 'VERIFIED upstream v0.8.13 schema'
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          s=Path('bot/podkop_bot.sh').read_text().splitlines()
+          f={}
+          for i,line in enumerate(s):
+              m=re.match(r'^([a-zA-Z_][a-zA-Z_0-9]*)\(\) *\{',line)
+              if m:f[m.group(1)]=i
+          names=[n for n in f if ('exp' in n.lower() or n.startswith('xp_') or n.startswith('_xp_'))]
+          print('EXPERIMENTAL FUNCTIONS:', [(name,f[name]+1) for name in names])
+          for name in ('_podkop_exp_v2','_handle_exp_v2','_xp_sources','_xp_source_delete','_xp_members','_xp_member_words','_xp_member_move','_group_selected_human_name'):
+              i=f.get(name)
+              if i is None: continue
+              print('\nFUNCTION',name,i+1)
+              for j in range(i,min(i+115,len(s))):
+                  if j>i and re.match(r'^}\s*$',s[j]): break
+                  print(str(j+1)+': '+s[j][:500])
+          for needle in ('server_choice','config_version','cure','podkop-exp','get_active_section','Серверы секции','clash_request /proxies'):
+              inds=[i for i,l in enumerate(s) if needle in l]
+              print('\nFIND',needle,'count',len(inds),'first',[i+1 for i in inds[:35]])
+          PY
+      - name: Existing experimental source tests
+        run: |
+          set -euo pipefail
+          cd bot
+          sh -n podkop_bot.sh
+          sh tools/test-podkop-exp-sources.sh
