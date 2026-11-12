@@ -32,7 +32,12 @@ jobs:
                   print('AT',i+1)
                   for j in range(max(0,i-12),min(len(s),i+13)):
                       print(f'{j+1}: {s[j][:250]}')
-          for first,last in [(14460,14485),(14796,14845),(15468,15510),(10232,10263),(1755,1785),(1120,1165),(1235,1275)]:
+          for needle in ('get_active_section()', 'ask_toggle_mixed', 'do_toggle_mixed', 'cmd_set_mixed_port', 'wait_ts_url', '_ts_management_available', 'Tailscale', 'singbox_supports_tailscale', 'Только просмотр (Forkop)'):
+              idx=[i for i,l in enumerate(s) if needle in l]
+              print('FIND',needle,[i+1 for i in idx[:35]])
+              for i in idx[:6]:
+                  for j in range(max(0,i-5),min(len(s),i+11)): print(f'{j+1}: {s[j][:500]}')
+          for first,last in [(1045,1090),(10155,10188),(14500,14520),(14600,14650)]:
               print('RANGE',first,last)
-              for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:1100]}')
+              for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:700]}')
           PY
