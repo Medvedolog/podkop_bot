@@ -152,7 +152,7 @@ _mixed_enabled_for_section() {
 }
 _forkop_v2_ui_guard() {
     _forkop_v2 || return 1
-    forkop_readonly_notice "$1" "section_settings" "Несовместимое поле Forkop 1.x" "Для настройки используйте LuCI Forkop 2.0"
+    forkop_readonly_notice "$1" "section_settings" "Это действие использует устаревшие поля Forkop 1.x" "Для URLTest и подписок откройте отдельные разделы Forkop 2; остальные операции пока выполняйте в LuCI."
     return 0
 }
 
@@ -4032,6 +4032,22 @@ clash_request() {
                 endpoint="/proxies/${_seg}${_rest}" ;;
             esac ;;
     esac
+    if [ "$method" = "PUT" ] && _forkop_v2; then
+        # P0: only exact, verified Selector/Fallback membership may be changed.
+        # Do not PUT to URLTest: it selects automatically and has no pinning API.
+        local _group _member _snapshot _encoded
+        case "$endpoint" in /proxies/*) ;; *) return 1 ;; esac
+        _group="${endpoint#/proxies/}"
+        # Reject pre-encoded or ambiguous paths rather than double-encoding.
+        case "$_group" in ''|*'%'*) return 1 ;; esac
+        _member=$(printf '%s' "$data" | jq -er '.name | select(type=="string" and length>0)' 2>/dev/null) || return 1
+        _snapshot=$(clash_request /proxies GET 2>/dev/null) || return 1
+        printf '%s' "$_snapshot" | jq -e --arg g "$_group" --arg n "$_member" \
+            '.proxies[$g] | select(.type == "Selector" or .type == "Fallback") | (.all // []) | index($n) != null' \
+            >/dev/null 2>&1 || return 1
+        _encoded=$(jq -nr --arg group "$_group" '$group | @uri') || return 1
+        endpoint="/proxies/${_encoded}"
+    fi
     secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
     # Forkop 2 may bind the API to LAN when YACD is enabled, but localhost
     # when disabled. A config.json may not exist in the newer Go/ucode engines.
@@ -10089,6 +10105,12 @@ _handle_settings() {
         esac
     fi
     if _forkop_v2; then
+        # Forkop 2 URLTest owns independent UCI child sections. Never open
+        # Podkop's legacy section-level URLTest editor from the common menu.
+        if [ "$cmd" = "urltest_settings" ]; then
+            _handle_forkop_ext "fk_ut_menu" "$mid" "" ""
+            return
+        fi
         # The legacy Forkop editor assumes several fields that 2.0 removed.
         # Read/status cards remain available, but all mutations fail closed.
         case "$cmd" in
