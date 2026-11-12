@@ -41,7 +41,3 @@ jobs:
               print('RANGE',first,last)
               for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:600]}')
           PY
-          #,(10155,10188),(14500,14520),(14600,14650)]:
-              print('RANGE',first,last)
-              for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:700]}')
-          PY
