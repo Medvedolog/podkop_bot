@@ -1,5 +1,13 @@
 # История изменений
 
+## v0.20.1 — тестовый выпуск BearGuard 0.20.1-r1 (опубликован)
+
+- [Pre-release `0.20.1-r1`](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.1-r1) опубликован с APK/IPK из проверенного коммита `ff410fe37`. Стабильный канал бота `main` остаётся на 0.19.24.
+- Исправлены Forkop 2 Mixed Proxy с откатом при ошибке, фильтры URLTest 2.0, вложенный выбор конечного узла, безопасный Clash API; добавлена диагностика доступности Tailscale. Проверена модель Podkop Experimental 0.8.13 (`source`, `member`, `server_choice`, `cure`).
+- Ручное обновление тестового бота: [скачать podkop_bot.sh 0.20.1](https://raw.githubusercontent.com/Medvedolog/podkop_bot/845068c4569240e5448537e537b6727fa347eaf9/podkop_bot.sh) и отправить документом через **Меню → Обслуживание → Загрузить скрипт**. Аппаратные испытания AX6000 не завершены.
+
+---
+
 <!-- experimental-0.20.0-r1-status -->
 ## v0.20.0 — тестовая ветка для Forkop 2 / Podkop Experimental 0.8.x
 
