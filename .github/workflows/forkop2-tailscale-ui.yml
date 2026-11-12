@@ -1,0 +1,36 @@
+name: Forkop 2 read-only Tailscale capability diagnostics
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/forkop2-tailscale-ui.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/funny-pascal-1kzrka
+      - name: Apply read-only UI fix
+        run: python3 tools/fix-forkop2-tailscale-ui.py
+      - name: Shell and capability contract
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          sh -n podkop_bot.sh
+          sh tools/test-forkop2-tailscale-native.sh
+          sh tools/test-forkop2-subs-urltest.sh
+          grep -Fq 'ts_cap_info' podkop_bot.sh
+          grep -Fq 'Только чтение состояния. Настройки Forkop не изменены' podkop_bot.sh
+      - name: Commit to experimental branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add podkop_bot.sh
+          git diff --cached --quiet && { echo "Nothing changed"; exit 1; }
+          git commit -m "fix: expose safe Forkop2 native Tailscale capability diagnostics"
+          git push origin HEAD:claude/funny-pascal-1kzrka
