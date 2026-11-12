@@ -18,16 +18,16 @@ once(
                 fi''',
 "empty services diagnostic button")
 once(
-'''                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
+r'''                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
             fi''',
-'''                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
+r'''                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
             elif _forkop_v2; then
                 _ts_row='[{"text":"ℹ️ Tailscale: проверить поддержку ядра","callback_data":"ts_cap_info"}],'
             fi''',
 "populated services diagnostic button")
 once('''        "ts_add")
 ''',
-'''        "ts_cap_info")
+r'''        "ts_cap_info")
             # Read only two booleans from ubus. Never print the full state or
             # call a second sing-box process on constrained OpenWrt devices.
             local _ts_state _ts_known=unknown _ts_avail=unknown _ts_guidance
