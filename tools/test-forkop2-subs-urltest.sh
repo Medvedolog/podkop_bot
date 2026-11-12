@@ -60,6 +60,17 @@ fk2_ut_filter_set "$ut" main inc "" && fk2_ut_filter_set "$ut" main exc 'x' || f
 [ "$(uci get forkop.$ut.server_filter_mode)" = exclude ] || fail "exclude mode"
 fk2_ut_filter_set "$ut" main exc "" || fail "filter clear"
 [ "$(uci get forkop.$ut.server_filter_mode)" = all ] || fail "all mode"
+# Regression: a hidden include_outbounds list must not flip an exclude-only
+# Forkop 2 URLTest into include mode while editing its exclude regex.
+uci set "forkop.$ut.include_outbounds=spare-node"
+fk2_ut_filter_set "$ut" main exc 'bad' || fail "filter exclude with latent includes"
+[ "$(uci get forkop.$ut.server_filter_mode)" = exclude ] || fail "hidden include list enabled by accident"
+fk2_ut_filter_set "$ut" main inc 'good' || fail "filter explicit inc"
+[ "$(uci get forkop.$ut.server_filter_mode)" = include ] || fail "explicit include was not selected"
+fk2_ut_filter_set "$ut" main exc 'bad2' || fail "edit exclusion under include"
+[ "$(uci get forkop.$ut.server_filter_mode)" = include ] || fail "include mode lost on exclude edit"
+if fk2_ut_filter_set "$ut" main bad 'x'; then fail "bad filter direction accepted"; fi
+if fk2_ut_filter_set "$ut" other inc 'bad'; then fail "foreign section modified"; fi
 if fk2_child_delete "$ut" urltest other; then fail "deleted a child of another section"; fi
 fk2_child_delete s1 subscription_url main || fail "sub delete"
 ! grep -q '^forkop.s1' "$UCIDB" || fail "subscription still present"
