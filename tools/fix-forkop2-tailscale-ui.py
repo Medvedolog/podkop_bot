@@ -25,7 +25,7 @@ r'''                [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscal
                 _ts_row='[{"text":"ℹ️ Tailscale: проверить поддержку ядра","callback_data":"ts_cap_info"}],'
             fi''',
 "populated services diagnostic button")
-once('''        "ts_add")
+once('''        "ts_add"|"ts_add_confirm")
 ''',
 r'''        "ts_cap_info")
             # Read only two booleans from ubus. Never print the full state or
@@ -50,7 +50,7 @@ r'''        "ts_cap_info")
             send_or_edit "$mid" "$(printf '%s <b>Forkop 2: Tailscale через sing-box</b>\n\n<b>Данные ядра известны:</b> <code>%s</code>\n<b>Tailscale доступен:</b> <code>%s</code>\n\n%s\n\n<i>Это только чтение состояния. Настройки Forkop не изменены.</i>' "$E_SET" "$_ts_known" "$_ts_avail" "$_ts_guidance")" \
                 "{\"inline_keyboard\":[[{\"text\":\"← К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
             ;;
-        "ts_add")
+        "ts_add"|"ts_add_confirm")
 ''',
 "native Tailscale capability callback"
 )
