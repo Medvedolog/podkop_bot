@@ -1,0 +1,35 @@
+name: Forkop 2 bot code inspection
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/forkop2-test-fix.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/funny-pascal-1kzrka
+      - name: Find exact source handlers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          s=Path('podkop_bot.sh').read_text().splitlines()
+          pattern=re.compile(r'^([a-zA-Z_][a-zA-Z_0-9]*)\(\) *\{')
+          f=[(i,m.group(1)) for i,l in enumerate(s) if (m:=pattern.match(l))]
+          terms=('forkop','fk2','mixed','tailscale','clash','urltest','filter','readonly','read_only','service','proxy_card','proxy_detail','select_proxy')
+          for i,name in f:
+              if any(t in name.lower() for t in terms):
+                  print('FN',i+1,name)
+          for needle in ('Несовместимое поле Forkop 1.x','Только просмотр (Forkop)','Сервер: Не определён по тегу','Выбрать Clash API','Требуется Podkop','Параметры URLTest'):
+              print('\nMATCH',repr(needle))
+              indices=[i for i,l in enumerate(s) if needle.lower() in l.lower()]
+              for i in indices[:6]:
+                  print('AT',i+1)
+                  for j in range(max(0,i-12),min(len(s),i+13)):
+                      print(f'{j+1}: {s[j][:250]}')
+          PY
