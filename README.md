@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.20.0
+# 🤖 podkop_bot 0.20.1
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.20.0-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.20.1-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -17,10 +17,7 @@
 
 ---
 
-> **0.19.25-dev6 — только разработка, аппаратные тесты этой версии ещё не пройдены:** Forkop 2.0 и Podkop Experimental 0.8.x распознаются отдельно. Чтение маршрутов и диагностика адаптированы частично; запись устаревших UCI-полей ограничена. Нативный Tailscale-сервер Forkop 2.0 можно создать и включить из standalone Telegram-бота при подтверждённой поддержке ядра (экспериментальный dev6, без испытаний на роутере); сложные операции с исходящими Tailscale-туннелями и подписками пока требуют штатного LuCI, а обновление Podkop Experimental — интерактивного запуска по SSH. [Состояние и ограничения](COMPAT_FORKOP2_PODKOP_EXP.md).
-> **Dev5 UI:** в Forkop 2.0 и Podkop Experimental 0.8.x группы URLTest/Fallback показывают реально выбранный сервер, а в Forkop 2.0 раздел «Службы» использует названия UCI `label/name` вместо технических идентификаторов. Точные runtime-теги не изменяются. Аппаратные тесты dev5 ещё необходимы.
-
-> **Dev4:** исправлено отображение прокси Forkop 2.0 и Podkop Experimental 0.8.x, упорядочены короткие названия кнопок и URLTest/Fallback, добавлен native Forkop Clash API fallback. [Исследование API](FORKOP2_PODKOP_EXP_API_RESEARCH.md).
+> **0.20.1 — экспериментальная ветка:** проверена схема Podkop Experimental **0.8.13** (`podkop-exp`, `config_version=2`). Редактор источников и строк `member` сохраняет `server_choice=fastest/loss/balance` и `cure`, отдельно показывает текущий режим; установщик Experimental остаётся интерактивным и не запускается из Telegram без подтверждения. Для Forkop 2 исправлены фильтры URLTest, защищён Clash API, Mixed Proxy работает с существующими `server.protocol=mixed` и транзакцией с откатом; Tailscale показывает диагностику возможностей ядра. **Аппаратные испытания AX6000 ещё не завершены.**
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
