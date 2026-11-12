@@ -32,7 +32,7 @@ jobs:
                   print('AT',i+1)
                   for j in range(max(0,i-12),min(len(s),i+13)):
                       print(f'{j+1}: {s[j][:250]}')
-          for needle in ('get_active_section()', 'ask_toggle_mixed', 'do_toggle_mixed', 'cmd_set_mixed_port', 'wait_ts_url', '_ts_management_available', 'Tailscale', 'singbox_supports_tailscale', 'Только просмотр (Forkop)'):
+          for needle in ('ts_add', 'get_active_section()', 'ask_toggle_mixed', 'do_toggle_mixed', 'cmd_set_mixed_port', 'wait_ts_url', '_ts_management_available', 'Tailscale', 'singbox_supports_tailscale', 'Только просмотр (Forkop)'):
               idx=[i for i,l in enumerate(s) if needle in l]
               print('FIND',needle,[i+1 for i in idx[:35]])
               for i in idx[:6]:
