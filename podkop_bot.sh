@@ -4950,6 +4950,14 @@ _group_selected_human_name() {
         ''|Selector|URLTest|Fallback|LoadBalance) return 1 ;;
     esac
     _human=$(display_proxy_name "$_leaf")
+    # Forkop2 leaves are section/subscription/name tags. If the generic
+    # formatter does not know that tag, show the last path component only
+    # after _resolve_leaf confirmed it is a real, non-group Clash proxy.
+    if { [ -z "$_human" ] || [ "$_human" = Unknown ]; } && _forkop_v2; then
+        case "$_leaf" in
+            */*) _human=$(printf '%s' "$_leaf" | awk -F/ '{ print $NF }') ;;
+        esac
+    fi
     [ -n "$_human" ] && [ "$_human" != Unknown ] || return 1
     printf '%s\n' "$_human"
 }
