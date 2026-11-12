@@ -58,12 +58,5 @@ once(
 ''',
 "mixed server identity in section card"
 )
-once(
-'''                _note="\n\n<i>Порт не задан — будет выбран автоматически: \${_candidate}.</i>"
-''',
-'''                _note="\n\n<i>Порт не задан — будет выбран автоматически: \${_candidate}.</i>"
-''',
-"mixed note no-op anchor"
-)
 p.write_text(s)
 print("Applied Forkop2 Mixed Proxy transactional toggle and identity display")
