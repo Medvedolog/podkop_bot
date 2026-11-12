@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.20.1 — experimental compatibility fixes
+
+- Updated bot version and checked Podkop Experimental v0.8.13 (`podkop-exp`, config version 2), including `source`, `member`, `server_choice` (fastest/loss/balance) and `cure`. The server menu now shows the actual choice and read-only cure count; editing sources preserves the engine's cure sections.
+- Forkop 2 Mixed Proxy toggles now use transactional UCI commit/reload with rollback, and display the bound UCI server name. Regression coverage includes two mixed servers on ports 2080 and 2081.
+- The upstream Experimental installer is interactive and may remove conflicting packages. Automated Telegram updates remain blocked. Changes are not yet hardware validated.
+
+---
+
+
 ## v0.20.0
 
 - **FORKOP 2.0:** support for Forkop 2.0 (`forkop.settings.config_version` 2.x), shown as "Forkop 2". Forkop 1.x, Forkop X and the other variants are unchanged.
