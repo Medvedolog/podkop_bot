@@ -37,6 +37,25 @@ jobs:
               for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:350]}')
           PY
 
+
+      - name: Inspect Forkop 2 URLTest filtering, Mixed and Tailscale
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('podkop_bot.sh').read_text().splitlines()
+          needles=['"fkutf_"*','"fkutv_"*','"fk_ut_menu"','"ask_toggle_mixed"','"do_toggle_mixed"','"cmd_set_mixed_port"','"do_set_mixed_port"','"urltest_filters_menu"','"singbox_supports_tailscale"','"wait_ts_url"']
+          for needle in needles:
+              n=needle.replace('"','').replace('*','')
+              indices=[i for i,l in enumerate(s) if n in l]
+              print('HIT',needle,[i+1 for i in indices[:30]])
+              for i in indices[:3]:
+                  first=max(0,i-7);last=min(len(s),i+13)
+                  for j in range(first,last): print(f'{j+1}: {s[j][:500]}')
+          for first,last in [(14395,14465),(15495,15780),(15780,16010),(1235,1270),(1755,1805),(4045,4110)]:
+              print('RANGE',first,last)
+              for j in range(first-1,min(last,len(s))): print(f'{j+1}: {s[j][:500]}')
+          PY
+
   repair:
     needs: inspect
     runs-on: ubuntu-latest
