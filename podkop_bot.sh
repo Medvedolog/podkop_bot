@@ -15241,6 +15241,29 @@ ${_ip}"; fi
             send_or_edit "$mid" "$(printf '%s <b>Интервал автообновления</b>\n\nОтправьте интервал: <code>12h</code>, <code>1d</code>, <code>30m</code>.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Отмена\",\"callback_data\":\"fk_sub_set_${_ch}\"}]]}"
             ;;
+        "ts_cap_info")
+            # Read only two booleans from ubus. Never print the full state or
+            # call a second sing-box process on constrained OpenWrt devices.
+            local _ts_state _ts_known=unknown _ts_avail=unknown _ts_guidance
+            if ! _forkop_v2; then
+                CB_ANSWER_TEXT="Диагностика предназначена для Forkop 2"
+                return
+            fi
+            _ts_state=$(ubus call forkop state '{}' 2>/dev/null) || _ts_state=''
+            if [ -n "$_ts_state" ]; then
+                _ts_known=$(printf '%s' "$_ts_state" | jq -r '.capabilities.core.known // false' 2>/dev/null)
+                _ts_avail=$(printf '%s' "$_ts_state" | jq -r '.capabilities.core.features.tailscale.available // false' 2>/dev/null)
+            fi
+            if [ "$_ts_known" = true ] && [ "$_ts_avail" = true ]; then
+                _ts_guidance="Ядро подтверждает Tailscale. Если мастер недоступен, проверьте совместимость backend BearGuard и версию бота."
+            elif [ "$_ts_known" != true ]; then
+                _ts_guidance="Forkop не подтвердил возможности ядра. Проверьте, запущен ли штатный state-service и доступен ли <code>ubus call forkop state '{}'</code>."
+            else
+                _ts_guidance="Установленная сборка sing-box не предоставляет native Tailscale. Нужна совместимая сборка full с <code>with_tailscale</code> и <code>with_gvisor</code>."
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Forkop 2: Tailscale через sing-box</b>\n\n<b>Данные ядра известны:</b> <code>%s</code>\n<b>Tailscale доступен:</b> <code>%s</code>\n\n%s\n\n<i>Это только чтение состояния. Настройки Forkop не изменены.</i>' "$E_SET" "$_ts_known" "$_ts_avail" "$_ts_guidance")" \
+                "{\"inline_keyboard\":[[{\"text\":\"← К службам\",\"callback_data\":\"cmd_server_instances\"}]]}"
+            ;;
         "ts_add"|"ts_add_confirm")
             if [ "$cmd" = "ts_add" ] && _ts_standalone_running; then
                 send_or_edit "$mid" \
@@ -18205,6 +18228,8 @@ EOF
                 # we do not create a new tsnet integration for it.
                 if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_management_available && [ "$(_ts_provider_kind)" != none ]; then
                     _ts_empty_add='[{"text":"➕ Tailscale через sing-box","callback_data":"ts_add"}],'
+                elif _forkop_v2; then
+                    _ts_empty_add='[{"text":"ℹ️ Tailscale: проверить поддержку ядра","callback_data":"ts_cap_info"}],'
                 fi
                 send_or_edit "$mid" \
                     "$(printf '%s <b>Службы</b>\n\n<i>Серверы и Tailscale-службы не настроены.</i>\n<i>Поддерживаются: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto, Tailscale и JSON-входящие подключения.</i>\n\n<i>Настройка: LuCI → %s → Серверы</i>' "$E_SRV" "$PODKOP_DISPLAY_NAME")" \
@@ -18602,6 +18627,8 @@ EOF
             if [ "$PODKOP_VARIANT" != "plus" ] && singbox_supports_tailscale && _ts_management_available && [ "$(_ts_provider_kind)" != none ]; then
                 _ts_existing=$(_ts_find_existing)
                 [ -n "$_ts_existing" ] || _ts_row="[{\"text\":\"➕ Tailscale через sing-box\",\"callback_data\":\"ts_add\"}],"
+            elif _forkop_v2; then
+                _ts_row='[{"text":"ℹ️ Tailscale: проверить поддержку ядра","callback_data":"ts_cap_info"}],'
             fi
             send_or_edit "$mid" "$_text_nl" \
                 "{\"inline_keyboard\":[${_ts_row}${_ts_toggle_rows}[{\"text\":\"${E_RST} Обновить\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"/menu\"}]]}"
