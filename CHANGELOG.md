@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.20.2 — 0.20.1 regression fixes; Forkop 2 / Podkop Experimental 0.8.14
+
+- Fixed the Experimental section servers menu printing literal shell variables, incorrect selection mode and cure count.
+- Forkop 2 Clash selection now decodes encoded Cyrillic/space/slash group tags, verifies Selector/Fallback membership and re-encodes; URLTest/non-member PUT stays blocked, while provider subscription refresh PUT is allowed.
+- Podkop Experimental Clash groups resolve by rule label with duplicate-name disambiguation.
+- Experimental URLTest test addresses are stored as a UCI list; update checks prevent downgrading a newer bundled bot.
+- Hardware validation on AX6000 is still pending; this is an experimental release.
+
+---
+
 ## v0.20.1 — experimental compatibility fixes
 
 - Updated bot version and checked Podkop Experimental v0.8.13 (`podkop-exp`, config version 2), including `source`, `member`, `server_choice` (fastest/loss/balance) and `cure`. The server menu now shows the actual choice and read-only cure count; editing sources preserves the engine's cure sections.
