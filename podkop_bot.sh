@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.20.0
+# Podkop Telegram Bot v0.20.2
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -33,7 +33,7 @@ mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.1"
+BOT_VERSION="0.20.2"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -1074,10 +1074,37 @@ forkop_v2() {
     [ -r /usr/share/sing-box-forkop/variant ]
 }
 
+# _exp_rule_name_awk SECTION — reads `uci show podkop`, prints the rule name.
+_exp_rule_name_awk() {
+    awk -v p="${PODKOP_UCI}." -v want="$1" '
+        { eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+          sub("^" p, "", k); sub(/^\047/, "", v); sub(/\047$/, "", v); gsub(/\047\\\047\047/, "\047", v)
+          d = index(k, ".")
+          if (!d) { if (v == "section") ord[++n] = k; next }
+          if (substr(k, d + 1) == "label") lab[substr(k, 1, d - 1)] = v }
+        END { for (i = 1; i <= n; i++) {
+                  sec = ord[i]; l = lab[sec]; gsub(/[ \t\r\n]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l)
+                  if (l == "") l = sec
+                  c = l
+                  if (c in taken) c = l " (" sec ")"
+                  for (num = 2; c in taken; num++) c = l " (" sec ") #" num
+                  taken[c] = 1
+                  if (sec == want) { print c; exit } } }'
+}
+
 # section_clash_tag SECTION — the name the section's group has in the Clash API:
-# its label on Forkop 2 (else its name), the section name everywhere else.
+# its label on Forkop 2 (else its name), the rule name on Podkop Experimental
+# 0.8 (group "<name>-out"), the section name everywhere else.
 section_clash_tag() {
     local _l
+    if _podkop_exp_v2; then
+        # Podkop Experimental 0.8 names a rule by its label (whitespace folded),
+        # else by its section; a repeated name becomes "<label> (<section>)",
+        # then "... #N" — exactly as model.Names() does.
+        _l=$(uci -q show "${PODKOP_UCI}" 2>/dev/null | _exp_rule_name_awk "$1")
+        [ -n "$_l" ] && { printf '%s\n' "$_l"; return 0; }
+        printf '%s\n' "$1"; return 0
+    fi
     if forkop_v2; then
         _l=$(uci -q get "${PODKOP_UCI}.$1.label" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$_l" ] && { printf '%s\n' "$_l"; return 0; }
@@ -4012,6 +4039,23 @@ _forkop_clash_cli() {
 # --max-time 10: guards against the case where the local Clash API accepts the TCP
 # connection but then hangs on the response (e.g. sing-box under high load, OOM).
 # connect-timeout 3 alone only covers the TCP handshake, not the full transfer.
+# _clash_tag_decode STRING — strict %XX decode of one Clash API path segment
+# (no "+" → space: jq @uri encodes spaces as %20). Fails on malformed input
+# or on a decoded NUL/control character.
+_clash_tag_decode() {
+    local _esc
+    # Malformed escapes, a backslash (would be read by %b) or "?" are refused.
+    case "$1" in *%[!0-9A-Fa-f]*|*%?[!0-9A-Fa-f]*|*%|*%?|*\\*|*'?'*) return 1 ;; esac
+    _esc=$(printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN { for (i = 0; i < 256; i++) oct[sprintf("%02X", i)] = sprintf("\\%03o", i) }
+        { s = $0; r = ""
+          while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+              h = toupper(substr(s, RSTART + 1, 2))
+              if (h ~ /^[01][0-9A-F]$/ || h == "7F") exit 1
+              r = r substr(s, 1, RSTART - 1) oct[h]; s = substr(s, RSTART + 3) }
+          printf "%s", r s }') || return 1
+    printf '%b' "$_esc"
+}
 clash_request() {
     # Local control-plane traffic must never inherit Bearhole or /root/.curlrc.
     local endpoint="$1" method="${2:-GET}" data="${3:-}"
@@ -4032,14 +4076,19 @@ clash_request() {
                 endpoint="/proxies/${_seg}${_rest}" ;;
             esac ;;
     esac
-    if [ "$method" = "PUT" ] && _forkop_v2; then
-        # P0: only exact, verified Selector/Fallback membership may be changed.
-        # Do not PUT to URLTest: it selects automatically and has no pinning API.
+    # P0: on Forkop 2 only an exact, verified Selector/Fallback membership may
+    # be changed. Do not PUT to URLTest: it selects automatically and has no
+    # pinning API. Other PUTs (/providers/proxies/<tag>: subscription refresh)
+    # are not selections and keep their previous behaviour.
+    if [ "$method" = "PUT" ] && [ "${endpoint#/proxies/?}" != "$endpoint" ] && _forkop_v2; then
         local _group _member _snapshot _encoded
-        case "$endpoint" in /proxies/*) ;; *) return 1 ;; esac
+        # Callers pass the group percent-encoded (jq @uri), and Forkop 2 group
+        # tags are section labels (spaces, Cyrillic) or "<label>/<name>".
+        # Decode once to the exact Clash tag, verify it, then re-encode.
         _group="${endpoint#/proxies/}"
-        # Reject pre-encoded or ambiguous paths rather than double-encoding.
-        case "$_group" in ''|*'%'*) return 1 ;; esac
+        case "$_group" in *'?'*) return 1 ;; esac
+        case "$_group" in *%*) _group=$(_clash_tag_decode "$_group") || return 1 ;; esac
+        [ -n "$_group" ] || return 1
         _member=$(printf '%s' "$data" | jq -er '.name | select(type=="string" and length>0)' 2>/dev/null) || return 1
         _snapshot=$(clash_request /proxies GET 2>/dev/null) || return 1
         printf '%s' "$_snapshot" | jq -e --arg g "$_group" --arg n "$_member" \
@@ -14161,10 +14210,28 @@ _handle_exp_v2() {
                 case "$_key" in
                     urltest_check_interval) _fk_valid_duration "$_v" || { send_message "${E_ERR} Длительность: <code>3m</code>, <code>30s</code>." "$(_xp_back_kb xp_chk)"; return; } ;;
                     urltest_tolerance) case "$_v" in ''|*[!0-9]*) send_message "${E_ERR} Число миллисекунд." "$(_xp_back_kb xp_chk)"; return ;; esac ;;
-                    urltest_testing_url) case "$_v" in http://?*|https://?*) ;; *) send_message "${E_ERR} Нужен адрес <code>https://…</code>." "$(_xp_back_kb xp_chk)"; return ;; esac ;;
+                    urltest_testing_url)
+                        local _tu
+                        [ -n "$(printf '%s' "$_v" | tr -s ' \t\r\n' ' ' | sed 's/^ //;s/ $//')" ] || { send_message "${E_ERR} Нужен адрес <code>https://…</code>." "$(_xp_back_kb xp_chk)"; return; }
+                        for _tu in $_v; do
+                            case "$_tu" in http://?*|https://?*) ;; *) send_message "${E_ERR} Нужен адрес <code>https://…</code> (несколько — через пробел или с новой строки)." "$(_xp_back_kb xp_chk)"; return ;; esac
+                        done ;;
                     *) return ;;
                 esac
-                _rc=0; _fk_stage_set "${PODKOP_UCI}.settings.${_key}" "$_v" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+                _rc=0
+                if [ "$_key" = urltest_testing_url ]; then
+                    # A list since 0.8.10: replace the whole list, never collapse it
+                    # into one option value.
+                    _fk_stage_delete "${PODKOP_UCI}.settings.${_key}" || _rc=1
+                    if [ "$_rc" -eq 0 ]; then
+                        for _tu in $_v; do
+                            uci add_list "${PODKOP_UCI}.settings.${_key}=${_tu}" || { uci -q revert "${PODKOP_UCI}" 2>/dev/null; _rc=1; break; }
+                        done
+                    fi
+                    [ "$_rc" -eq 0 ] && { _fk_txn_commit_reload || _rc=$?; }
+                else
+                    _fk_stage_set "${PODKOP_UCI}.settings.${_key}" "$_v" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+                fi
                 [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_chk "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_chk)"
                 ;;
         esac
@@ -14194,18 +14261,18 @@ XPM
             # do not claim "fastest" when the native engine selects otherwise.
             # Cure sections are per-server engine settings and are read-only here.
             local _xp_choice _xp_choice_human _xp_cure_count
-            _xp_choice=$(uci -q get "\${PODKOP_UCI}.\${sec}.server_choice" 2>/dev/null)
+            _xp_choice=$(uci -q get "${PODKOP_UCI}.${sec}.server_choice" 2>/dev/null)
             case "$_xp_choice" in
                 ''|fastest) _xp_choice=fastest; _xp_choice_human="минимальная задержка" ;;
                 loss) _xp_choice_human="с учётом потерь" ;;
                 balance) _xp_choice_human="балансировка" ;;
                 *) _xp_choice_human="неизвестный режим (только просмотр)" ;;
             esac
-            _xp_cure_count=$(uci -q show "\${PODKOP_UCI}" 2>/dev/null | grep -Ec "^\${PODKOP_UCI}\.[^.]+=cure$" || true)
+            _xp_cure_count=$(uci -q show "${PODKOP_UCI}" 2>/dev/null | grep -Ec "^${PODKOP_UCI}\.[^.]+=cure$" || true)
             case "$_xp_cure_count" in ''|*[!0-9]*) _xp_cure_count=0 ;; esac
-            _body="\${_body}
+            _body="${_body}
 <b>Режим:</b> $(html_escape "$_xp_choice_human") (<code>$(html_escape "$_xp_choice")</code>)
-<b>Индивидуальные обходы (cure):</b> \${_xp_cure_count} · управление в LuCI"
+<b>Индивидуальные обходы (cure):</b> ${_xp_cure_count} · управление в LuCI"
             send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — участвуют в режиме выбора сервера. 🛟 резервные — используются по порядку при недоступности основных.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
                 "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Основная строка\",\"callback_data\":\"xp_add_s\"},{\"text\":\"${E_ADD} Резервная\",\"callback_data\":\"xp_add_f\"}],[{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"},{\"text\":\"⏱ Проверка серверов\",\"callback_data\":\"xp_chk\"}],[{\"text\":\"${E_BACK} Прокси\",\"callback_data\":\"proxy_menu\"}]]}"
             ;;
@@ -14396,8 +14463,8 @@ XPL
             local _i _t _u
             _i=$(uci -q get "${PODKOP_UCI}.settings.urltest_check_interval" 2>/dev/null)
             _t=$(uci -q get "${PODKOP_UCI}.settings.urltest_tolerance" 2>/dev/null)
-            _u=$(uci -q get "${PODKOP_UCI}.settings.urltest_testing_url" 2>/dev/null)
-            send_or_edit "$mid" "$(printf '⏱ <b>Проверка серверов</b> (общая для всех секций)\n\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск:</b> <code>%s</code> мс — переключаться, только если другой сервер быстрее на столько\n<b>Адрес проверки:</b> <code>%s</code>' "${_i:-по умолчанию}" "${_t:-по умолчанию}" "$(html_escape "${_u:-по умолчанию}")")" \
+            _u=$(uci -q show "${PODKOP_UCI}.settings.urltest_testing_url" 2>/dev/null | sed "s/^[^=]*=//" | sed "s/' '/\n/g; s/^'//; s/'\$//" | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')
+            send_or_edit "$mid" "$(printf '⏱ <b>Проверка серверов</b> (общая для всех секций)\n\n<b>Интервал:</b> <code>%s</code>\n<b>Допуск:</b> <code>%s</code> мс — переключаться, только если другой сервер быстрее на столько\n<b>Адреса проверки:</b> <code>%s</code>' "${_i:-по умолчанию}" "${_t:-по умолчанию}" "$(html_escape "${_u:-по умолчанию}")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Интервал\",\"callback_data\":\"xp_chks_urltest_check_interval\"},{\"text\":\"${E_EDIT} Допуск\",\"callback_data\":\"xp_chks_urltest_tolerance\"}],[{\"text\":\"${E_EDIT} Адрес проверки\",\"callback_data\":\"xp_chks_urltest_testing_url\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
             ;;
         xp_chks_*)
@@ -18786,7 +18853,7 @@ EOF
                     _s_sel=$(printf '%s' "$th_proxies" | jq -r \
                         --arg s "$_s" --arg t "$(section_clash_tag "$_s")" \
                         '[ .proxies | to_entries[] |
-                           select(.key == $t or .key == ($s + "-out") or (.key | startswith($s + "-"))) |
+                           select(.key == $t or .key == ($t + "-out") or .key == ($s + "-out") or (.key | startswith($s + "-"))) |
                            select(.value.type == "Selector" or .value.type == "URLTest") ]
                          | sort_by((.value.all // []) | length) | last | .key // empty' 2>/dev/null)
                     # Get delay — from selector or direct outbound
@@ -20223,7 +20290,14 @@ https://github.com/podkop-net/podkop-experimental" '{"inline_keyboard":[[{"text"
 
             local changelog_link="https://github.com/Medvedolog/podkop_bot/blob/main/CHANGELOG.md"
 
-            if ! _ver_is_newer "$BOT_VERSION" "$remote_ver"; then
+            if _ver_is_newer "$remote_ver" "$BOT_VERSION"; then
+                # Installed build (e.g. a 0.20.x test bundled with BearGuard) is
+                # newer than the public main branch: never offer a downgrade.
+                text=$(printf '%s Установлена версия бота <b>v%s</b>, новее опубликованной <b>v%s</b> (тестовая сборка).\n\n<i>Обновление через бота отключено, чтобы не откатить версию. Обновляйте пакет BearGuard.</i>%s' \
+                    "$E_OK" "$BOT_VERSION" "$remote_ver" "$_via_note")
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]]}"
+                send_or_edit "$mid" "$text" "$kb"
+            elif ! _ver_is_newer "$BOT_VERSION" "$remote_ver"; then
                 if [ -n "$highlights" ]; then
                     text=$(printf '%s Установлена актуальная версия бота: <b>v%s</b>\n\n<i>%s</i>\n\n<a href="%s">Полный список изменений</a>%s' \
                         "$E_OK" "$BOT_VERSION" "$(html_escape "$highlights")" "$changelog_link" "$_via_note")
