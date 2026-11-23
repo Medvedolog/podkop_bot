@@ -2,6 +2,7 @@
 
 ## v0.20.2 — engine status and 0.20.1 regression fixes (test branch)
 
+- Follow-up review: Telegram diagnostic exports omit secrets and raw configuration/log content. An unavailable service bus stays unknown in the status card. Credential-bearing proxy URLs no longer travel in curl arguments.
 - Fixed false “sing-box stopped” in the status card and watchdog on Podkop Experimental 0.8.14 and 0.8.21. Read the embedded engine status from Podkop rather than searching for a separate process.
 - Standalone Podkop Engine still runs as the procd-managed `sing-box` service. An unavailable status is not treated as a confirmed stop, and an unrelated process does not count as Podkop's engine.
 
