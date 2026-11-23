@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.20.1
+# 🤖 podkop_bot 0.20.2
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.20.1-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.20.2-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -17,7 +17,18 @@
 
 ---
 
-> **0.20.1 — экспериментальная ветка:** проверена схема Podkop Experimental **0.8.13** (`podkop-exp`, `config_version=2`). Редактор источников и строк `member` сохраняет `server_choice=fastest/loss/balance` и `cure`, отдельно показывает текущий режим; установщик Experimental остаётся интерактивным и не запускается из Telegram без подтверждения. Для Forkop 2 исправлены фильтры URLTest, защищён Clash API, Mixed Proxy работает с существующими `server.protocol=mixed` и транзакцией с откатом; Tailscale показывает диагностику возможностей ядра. **Аппаратные испытания AX6000 ещё не завершены.**
+> **0.20.2 — тестовая ветка.** Исправлен ложный статус «sing-box остановлен» на Podkop Experimental. Сохраняются исправления меню серверов Experimental и выбора сервера в Forkop 2. Стабильная версия не менялась. Проверка на реальном роутере для этой сборки ещё не выполнена.
+
+Диагностика, выгруженная в Telegram, предназначена для передачи в поддержку:
+она не включает сырой UCI, конфиг sing-box и системный журнал. Для подробного
+разбора смотрите оригиналы локально на роутере и не пересылайте их без проверки
+на пароли, токены и ссылки подписок.
+
+### Как проверяется sing-box
+
+- **Podkop Experimental** ([0.8.21](https://github.com/podkop-net/podkop-experimental/releases/tag/v0.8.21), со встроенным Podkop Engine r28): sing-box работает внутри `podkop daemon`. Отдельного процесса не должно быть; состояние читается у самого Podkop через `ubus`. Автозапуск Podkop и готовность движка показываются отдельно.
+- **Обычный Podkop 0.7 и отдельный [Podkop Engine](https://github.com/podkop-net/podkop-engine/blob/v1.14.4-r28/openwrt/podkop-engine/files/sing-box.init):** sing-box всё ещё отдельная служба. Статус берётся у её экземпляра OpenWrt, а не у службы `podkop-engine`, которая только следит за сбоями.
+- «Статус неизвестен» означает, что ответ о состоянии получить не удалось. Это не повод перезапускать Podkop. Доступность прокси и Telegram проверяется отдельно от состояния движка.
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 

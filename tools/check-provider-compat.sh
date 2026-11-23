@@ -17,4 +17,7 @@ sh tools/test-forkop2-native-clash.sh
 sh tools/test-forkop2-tailscale-native.sh
 sh tools/test-forkop2-subs-urltest.sh
 sh tools/test-podkop-exp-sources.sh
+sh tools/test-engine-status.sh
+sh tools/test-proxy-argv.sh
+sh tools/test-diagnostics-privacy.sh
 printf '%s\n' 'Podkop Experimental / Forkop 2 static compatibility guards OK'
