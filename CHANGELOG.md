@@ -1,6 +1,9 @@
 # Changelog
 
-## v0.20.2 — 0.20.1 regression fixes; Forkop 2 / Podkop Experimental 0.8.14
+## v0.20.2 — engine status and 0.20.1 regression fixes (test branch)
+
+- Fixed false “sing-box stopped” in the status card and watchdog on Podkop Experimental 0.8.14 and 0.8.21. Read the embedded engine status from Podkop rather than searching for a separate process.
+- Standalone Podkop Engine still runs as the procd-managed `sing-box` service. An unavailable status is not treated as a confirmed stop, and an unrelated process does not count as Podkop's engine.
 
 - Fixed the Experimental section servers menu printing literal shell variables, incorrect selection mode and cure count.
 - Forkop 2 Clash selection now decodes encoded Cyrillic/space/slash group tags, verifies Selector/Fallback membership and re-encodes; URLTest/non-member PUT stays blocked, while provider subscription refresh PUT is allowed.

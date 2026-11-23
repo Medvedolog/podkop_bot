@@ -29,7 +29,6 @@ export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # All bot runtime state files live under one directory for easy cleanup.
 BOT_DIR="/tmp/podkop_bot"
-mkdir -p "$BOT_DIR"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
@@ -91,6 +90,113 @@ _detect_podkop_variant() {
     fi
     echo "original"
 }
+
+# Read only the named procd service, not a host-wide search for a binary.
+# Output "running|PID" / "stopped|" for an authoritative reply, or fail.
+# More than one eligible instance is ambiguous, not an arbitrary first PID.
+_engine_procd() {
+    local _svc="$1" _reply
+    _reply=$(ubus -t 2 call service list "{\"name\":\"$_svc\"}" 2>/dev/null) || return 1
+    printf '%s' "$_reply" | jq -er --arg svc "$_svc" '
+        if type != "object" then error("invalid procd reply")
+        elif length == 0 then "stopped|"
+        elif has($svc) | not then error("unrelated procd reply")
+        else .[$svc] as $service |
+            if ($service | type) != "object" then error("invalid service")
+            elif ($service | has("instances") | not) then "stopped|"
+            elif ($service.instances | type) != "object" then error("invalid instances")
+            else
+                [$service.instances | to_entries[] |
+                    select(if $svc == "podkop" then .key == "main" else true end) |
+                    .value |
+                    if type != "object" or (.running | type) != "boolean" then
+                        error("invalid instance")
+                    elif .running == false then empty
+                    elif $svc == "podkop" and
+                         (.command[0] != "/usr/bin/podkop" or .command[1] != "daemon") then
+                        error("unverified podkop process")
+                    elif $svc == "sing-box" and
+                         ((.command[0] | type) != "string" or
+                          ((.command[0] | split("/") | last) != "sing-box") or
+                          (.command | index("run")) == null) then
+                        error("unverified sing-box process")
+                    elif (.pid | type) != "number" or .pid <= 0 or (.pid | floor) != .pid then
+                        error("invalid pid")
+                    else .pid end] |
+                if length == 0 then "stopped|"
+                elif length == 1 then "running|" + (.[0] | tostring)
+                else error("ambiguous sing-box processes") end
+            end
+        end' 2>/dev/null
+}
+
+_engine_exp_call() {
+    local _command="$1" _reply
+    _reply=$(ubus -t 2 call podkop run "{\"command\":\"$_command\",\"params\":[]}" 2>/dev/null) || return 1
+    printf '%s' "$_reply" | jq -er 'select(.code == 0 and (.stdout | type) == "string") | .stdout' 2>/dev/null
+}
+
+_engine_exp_parse_readiness() {
+    jq -er 'select((.running | type) == "boolean") |
+        if .running then "running" else "stopped" end' 2>/dev/null
+}
+
+_engine_exp_state() {
+    local _reply _result
+    _reply=$(ubus -t 2 call podkop stats '{}' 2>/dev/null) &&
+        _result=$(printf '%s' "$_reply" | _engine_exp_parse_readiness) && {
+        printf '%s\n' "$_result"
+        return 0
+    }
+    # If the public UBUS stats method is unavailable, use the daemon's
+    # read-only status endpoint on its local Unix socket. Never contact WAN.
+    _reply=$(curl -q --noproxy '*' -fsS --connect-timeout 1 --max-time 2 \
+        --unix-socket /var/run/podkop/ctl.sock http://localhost/status 2>/dev/null) &&
+        _result=$(printf '%s' "$_reply" | _engine_exp_parse_readiness) && {
+        printf '%s\n' "$_result"
+        return 0
+    }
+    # Old wrapped status maps daemon communication failure to .running=0.
+    # Accept only positive evidence from it, not a false stopped transition.
+    _reply=$(_engine_exp_call get_sing_box_status) || return 1
+    printf '%s' "$_reply" | jq -er 'select(.running == 1) | "running"' 2>/dev/null
+}
+
+# Set the per-call runtime snapshot. Exp separates its daemon (PID and RSS)
+# from dataplane readiness: a registered process can be up with no tunnel.
+# An unavailable status source is "unknown", never a synthetic outage.
+_engine_status() {
+    local _snapshot
+    ENGINE_STATE=unknown ENGINE_PROCESS_STATE=unknown ENGINE_PID="" ENGINE_SERVICE=sing-box
+    [ "$PODKOP_VARIANT" != "podkop-exp" ] || ENGINE_SERVICE=podkop
+    _snapshot=$(_engine_procd "$ENGINE_SERVICE") || return 0
+    ENGINE_PROCESS_STATE=${_snapshot%%|*}
+    ENGINE_PID=${_snapshot#*|}
+    if [ "$ENGINE_SERVICE" = "podkop" ] && [ "$ENGINE_PROCESS_STATE" = "running" ]; then
+        ENGINE_STATE=$(_engine_exp_state) || ENGINE_STATE=unknown
+    else
+        ENGINE_STATE=$ENGINE_PROCESS_STATE
+    fi
+}
+
+_engine_running_pid() {
+    _engine_status
+    [ "$ENGINE_STATE" = "running" ] || return 1
+    printf '%s\n' "$ENGINE_PID"
+}
+
+_engine_status_json() {
+    _engine_status
+    printf '{"state":"%s","process_state":"%s","pid":%s,"service":"%s","variant":"%s"}\n' \
+        "$ENGINE_STATE" "$ENGINE_PROCESS_STATE" "${ENGINE_PID:-null}" "$ENGINE_SERVICE" "$PODKOP_VARIANT"
+}
+
+# Supports --engine-status-json (read-only)
+if [ "${1:-}" = "--engine-status-json" ]; then
+    PODKOP_VARIANT=$(_detect_podkop_variant)
+    _engine_status_json
+    exit 0
+fi
 
 _forkop_display_name() {
     # Version 2 is authoritative even if legacy files remain.
@@ -322,6 +428,7 @@ PODKOP_VARIANT=$(_detect_podkop_variant)
 # above (also re-run mid-session after do_update_podkop migrations), so the
 # startup values can never drift from the re-apply path.
 _apply_variant_env
+mkdir -p "$BOT_DIR"
 
 # Helper: does this variant support subscriptions?
 _variant_has_subscription() {
@@ -1693,9 +1800,12 @@ SB_RESTART_LOG="${BOT_DIR}/sb_restart_log"
 # an upstream DNS-failover storm no longer reads as sing-box dying repeatedly.
 SB_RELOAD_LOG="${BOT_DIR}/sb_reload_log"
 get_singbox_version_display() {
-    # There is no external sing-box core on the experimental Go backend.
+    # Do not mistake an unrelated standalone package for the compiled-in core.
     if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
-        printf 'встроен в Podkop Experimental'
+        local _exp_info _exp_core
+        _exp_info=$(_engine_exp_call get_system_info)
+        _exp_core=$(printf '%s' "$_exp_info" | jq -r '.engine // .sing_box_version // empty | select(type == "string")' 2>/dev/null)
+        printf '%s' "${_exp_core:-встроен в Podkop Experimental}"
         return 0
     fi
     # Cache key is the sing-box binary's inode:mtime:size (same signature style
@@ -1727,12 +1837,15 @@ get_singbox_version_display() {
     # 1. Prefer metadata/state written by the owning project. Forkop's installer
     #    may manage sing-box as a standalone binary with no opkg/apk ownership;
     #    its UI cache is therefore a first-class source, not merely a fallback.
-    local _sb_state="/etc/podkop-plus/sing-box-version" _sb_ui_state=""
-    if [ "$PODKOP_VARIANT" = "forkop" ]; then
-        _sb_state="/etc/forkop/sing-box-version"
-        _sb_ui_state="/var/run/forkop/ui-state/sing-box-version"
-    fi
-    [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
+    local _sb_state="" _sb_ui_state=""
+    case "$PODKOP_VARIANT" in
+        plus) _sb_state="/etc/podkop-plus/sing-box-version" ;;
+        forkop)
+            _sb_state="/etc/forkop/sing-box-version"
+            _sb_ui_state="/var/run/forkop/ui-state/sing-box-version"
+            ;;
+    esac
+    [ -n "$_sb_state" ] && [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
     # Forkop's UI cache may be a JSON object with a .version property,
     # while legacy metadata files contain only a plain version string.
     # Never leak the complete JSON object into Status/daily reports.
@@ -1746,16 +1859,26 @@ get_singbox_version_display() {
         esac
     fi
 
-    # 2. opkg (OpenWrt 24.10 and earlier)
-    if [ -z "$ver" ] && command -v opkg >/dev/null 2>&1; then
-        ver=$(opkg list-installed 2>/dev/null | awk '/^sing-box/ && $2 == "-" {print $3; exit}')
-    fi
-
-    # 3. apk (OpenWrt 25.x+)
-    if [ -z "$ver" ] && command -v apk >/dev/null 2>&1; then
-        _apk_line_sbv=$(apk list --installed 2>/dev/null | grep '^sing-box' | head -1)
-        [ -n "$_apk_line_sbv" ] && ver=$(printf '%s' "$_apk_line_sbv" | \
-            sed 's/^sing-box-extended-//; s/^sing-box-//; s/[[:space:]].*//')
+    # 2–3. Package ownership. Podkop Engine deliberately runs through the
+    # sing-box service but is not a package whose name begins with "sing-box".
+    if [ -z "$ver" ]; then
+        local _sb_packages _sb_pkg_version _sb_pkg
+        if command -v opkg >/dev/null 2>&1; then
+            _sb_packages=$(opkg list-installed 2>/dev/null | awk '$2 == "-" {print $1 "|" $3}')
+        elif command -v apk >/dev/null 2>&1; then
+            _sb_packages=$(apk list --installed 2>/dev/null |
+                sed -nE 's/^(podkop-engine-full|podkop-engine|sing-box-forkop|sing-box-extended|sing-box-tiny|sing-box)-([0-9][^[:space:]]*).*/\1|\2/p')
+        fi
+        for _sb_pkg in podkop-engine-full podkop-engine sing-box-forkop sing-box-extended sing-box-tiny sing-box; do
+            _sb_pkg_version=$(printf '%s\n' "$_sb_packages" | awk -F '|' -v p="$_sb_pkg" '$1 == p {print $2; exit}')
+            [ -n "$_sb_pkg_version" ] || continue
+            ver="$_sb_pkg_version"
+            case "$_sb_pkg" in
+                podkop-engine-full) ver="$ver · Podkop Engine Full" ;;
+                podkop-engine)      ver="$ver · Podkop Engine" ;;
+            esac
+            break
+        done
     fi
 
     # 4. Plus/Forkop-safe fallback: get_system_info returns sing_box_version without
@@ -1893,14 +2016,15 @@ format_age() {
     fi
 }
 
-# _status_severity: returns "ok"|"warn"|"degraded"|"fail" based on service state.
-# Args: $1=podkop_running(0/1) $2=sb_running(0/1) $3=tg_transport(ok/fail/?)
+# _status_severity: classify confirmed service, unknown, and transport outcomes.
+# Args: $1=podkop_running(0/1/unknown) $2=sb_running(0/1/unknown) $3=tg_transport(ok/fail/?)
 #       $4=socks(up/down/?) $5=LAST_ROUTE(tier1/tier2_N/tier4/tier5/...)
 _status_severity() {
     # $1=podkop_running $2=sb_running $3=tg_transport $4=socks $5=LAST_ROUTE
     # socks=down triggers degraded; socks=unknown (no data) does NOT
     local pk="$1" sb="$2" tgt="$3" socks="$4"
     if   [ "$pk" = "0" ] || [ "$sb" = "0" ]; then echo "fail"
+    elif [ "$pk" = "unknown" ] || [ "$sb" = "unknown" ]; then echo "unknown"
     elif [ "$socks" = "down" ]; then echo "degraded"
     elif [ "$tgt" = "fail" ];   then echo "warn"
     else echo "ok"; fi
@@ -2395,11 +2519,14 @@ _mixed_proxy_auth() {
         printf '%s:%s@' "$(_url_encode_cred "${_acc%%|*}")" "$(_url_encode_cred "${_acc#*|}")"
         return 0
     fi
-    _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
-    [ "$_en" = "1" ] || return 0
+    if [ "$PODKOP_VARIANT" != "podkop-exp" ]; then
+        _en=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_auth_enabled" 2>/dev/null)
+        [ "$_en" = "1" ] || return 0
+    fi
     _u=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_username" 2>/dev/null)
     _p=$(uci -q get "${PODKOP_UCI}.${_sec}.mixed_proxy_password" 2>/dev/null)
     [ -n "$_u" ] || return 0
+    [ "$PODKOP_VARIANT" != "podkop-exp" ] || [ -n "$_p" ] || return 0
     printf '%s:%s@' "$(_url_encode_cred "$_u")" "$(_url_encode_cred "$_p")"
 }
 
@@ -5705,19 +5832,20 @@ probe_throughput() {
 
 
 do_podkop_stop() {
-    local rc pid_list
-    ${PODKOP_INIT} stop 2>/dev/null; rc=$?
-    pid_list=$(pidof sing-box 2>/dev/null)
-    if [ -n "$pid_list" ]; then
-        logger -t podkop-bot "[Stop] Orphaned sing-box PIDs: ${pid_list}, sending SIGTERM"
-        kill $pid_list 2>/dev/null; sleep 1
-        pid_list=$(pidof sing-box 2>/dev/null)
-        if [ -n "$pid_list" ]; then
-            logger -t podkop-bot "[Stop] Sending SIGKILL to: ${pid_list}"
-            kill -9 $pid_list 2>/dev/null
-        fi
-    fi
-    pidof sing-box >/dev/null 2>&1 && return 1 || return 0
+    # Only the selected backend owns its stop procedure. In particular,
+    # Experimental must never stop a separate sing-box process.
+    local _wait=0
+    "$PODKOP_INIT" stop 2>/dev/null || return 1
+    while :; do
+        _engine_status
+        case "$ENGINE_PROCESS_STATE" in
+            stopped) return 0 ;;
+            unknown) return 1 ;;
+        esac
+        [ "$_wait" -lt 3 ] || return 1
+        _wait=$((_wait + 1))
+        sleep 1
+    done
 }
 
 # ==============================================================================
@@ -5731,10 +5859,14 @@ run_internal_diagnostics() {
         echo "Дата: $(date '+%d.%m.%Y %H:%M:%S')"; echo "Устройство: $(cat /proc/sys/kernel/hostname 2>/dev/null || echo "роутер")"
         echo; echo "--- Версия бота ---"; echo "${BOT_VERSION}"
         echo; echo "--- Основная конфигурация UCI ---"
-        uci -q show ${PODKOP_UCI}.main 2>/dev/null || true
-        uci -q show ${PODKOP_UCI}.main_routing 2>/dev/null || true
-        uci -q show ${PODKOP_UCI}.dns 2>/dev/null || true
-        uci -q show ${PODKOP_UCI}.settings 2>/dev/null || true
+        if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+            _engine_exp_call show_config || echo "не удалось получить конфигурацию с маскировкой секретов"
+        else
+            uci -q show ${PODKOP_UCI}.main 2>/dev/null || true
+            uci -q show ${PODKOP_UCI}.main_routing 2>/dev/null || true
+            uci -q show ${PODKOP_UCI}.dns 2>/dev/null || true
+            uci -q show ${PODKOP_UCI}.settings 2>/dev/null || true
+        fi
         echo; echo "--- Clash API ---"
         if clash_request "/version" "GET" 2>/dev/null | jq . >/dev/null 2>&1; then echo "УСПЕШНО"
         else echo "ОШИБКА"; rc=1; fi
@@ -5998,8 +6130,14 @@ _traffic_stats_init() {
 # Silent no-op (return 1) if Clash API is unreachable or returns junk — never
 # blocks the watchdog loop on this.
 _traffic_accum_tick() {
-    local _conn _cur_dl _cur_ul
-    _conn=$(clash_request "/connections" 2>/dev/null)
+    local _conn _cur_dl _cur_ul _cur_pid="$1"
+    [ -n "$_cur_pid" ] || return 1
+    if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+        _conn=$(ubus -t 2 call podkop stats '{}' 2>/dev/null) || return 1
+        _conn=$(printf '%s' "$_conn" | jq -ce 'select(.running == true) | {downloadTotal: .down, uploadTotal: .up}') || return 1
+    else
+        _conn=$(clash_request "/connections" 2>/dev/null)
+    fi
     local _traffic_totals
     _traffic_totals=$(printf '%s' "$_conn" | jq -r '[.downloadTotal // "", .uploadTotal // ""] | map(tostring) | join("|")' 2>/dev/null)
     IFS='|' read -r _cur_dl _cur_ul <<EOF
@@ -6016,9 +6154,6 @@ EOF
         case "$_last_dl" in ''|*[!0-9]*) _last_dl=0 ;; esac
         case "$_last_ul" in ''|*[!0-9]*) _last_ul=0 ;; esac
     fi
-    local _cur_pid; _cur_pid=$(pidof sing-box 2>/dev/null)
-    _cur_pid=${_cur_pid%% *}
-    case "$_cur_pid" in ''|*[!0-9]*) _cur_pid="" ;; esac
 
     if [ "$_cur_dl" -ge "$_last_dl" ] 2>/dev/null && [ "$_cur_ul" -ge "$_last_ul" ] 2>/dev/null; then
         _banked_dl=$(( _banked_dl + (_cur_dl - _last_dl) ))
@@ -6794,7 +6929,7 @@ send_weekly_report() {
     _bot_uptime=$(awk -v s="$_bot_elapsed" 'BEGIN{
         d=int(s/86400);h=int((s%86400)/3600);m=int((s%3600)/60);
         if(d>0) printf "%d д %d ч",d,h; else printf "%d ч %d мин",h,m}')
-    local _sb_pid_rt; _sb_pid_rt=$(pgrep -f "sing-box run" 2>/dev/null | head -1)
+    local _sb_pid_rt; _sb_pid_rt=$(_engine_running_pid)
     _sb_uptime="нет данных"
     if [ -n "$_sb_pid_rt" ]; then
         local _tps _boot _sb_ticks _sb_elapsed
@@ -7308,7 +7443,7 @@ send_daily_report() {
     # Tunnel uptime (аптайм процесса sing-box) — диагностическая инфа отдельно
     # от окна трафика выше; отображается в блоке "Туннель" ниже.
     local _sb_since=""
-    local _sb_pid_rt; _sb_pid_rt=$(pgrep -f "sing-box run" 2>/dev/null | head -1)
+    local _sb_pid_rt; _sb_pid_rt=$(_engine_running_pid)
     if [ -n "$_sb_pid_rt" ]; then
         local _tps _boot _sb_ticks _sb_start_ts _sb_elapsed
         _tps=$(getconf CLK_TCK 2>/dev/null || echo 100)
@@ -7431,7 +7566,7 @@ start_health_daemon() {
         local interval
         local last_tg_state="unknown"  curr_tg_state
         local tg_fail_streak=0         tg_ok_streak=0
-        local last_sb_state="running"  curr_sb_state sb_alert_txt new_pid
+        local last_sb_state="running" curr_sb_state sb_alert_txt last_sb_pid="" _sb_stopped_streak=0
         local last_socks_state=""      curr_socks_state socks_alert_txt
         local socks_fail_streak=0      socks_ok_streak=0
         local sec m_ip m_port admin_payload last_ok_route="tier1"
@@ -7638,7 +7773,12 @@ start_health_daemon() {
 
             # Bank traffic + detect Перезапуски sing-box every tick (survives
             # restarts unlike a raw Clash downloadTotal/uploadTotal snapshot).
-            _traffic_accum_tick
+            _engine_status
+            local curr_sb_pid="$ENGINE_PID"
+            curr_sb_state="$ENGINE_STATE"
+            if [ "$curr_sb_state" = "running" ]; then
+                _traffic_accum_tick "$curr_sb_pid"
+            fi
 
             # Periodically refresh emergency IPs via DoH (every 6h, or if never done)
             local _now_ts; _now_ts=$(date +%s)
@@ -7708,10 +7848,11 @@ start_health_daemon() {
             # watchdog ticks, so state can look running -> running while PID
             # changes. Treat that as a real restart and alert separately.
             # ------------------------------------------------------------------
-            local curr_sb_pid=""
-            curr_sb_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
-            if [ -n "$curr_sb_pid" ]; then curr_sb_state="running"
-            else curr_sb_state="stopped"; fi
+            if [ "$curr_sb_state" = "stopped" ]; then
+                _sb_stopped_streak=$((_sb_stopped_streak + 1))
+            else
+                _sb_stopped_streak=0
+            fi
 
             if [ "$curr_sb_state" = "running" ] && [ "$last_sb_state" = "running" ] && \
                [ -n "${last_sb_pid:-}" ] && [ -n "$curr_sb_pid" ] && \
@@ -7779,7 +7920,8 @@ start_health_daemon() {
                     _lk_dg_sbr=$(( _lk_dg_sbr + 1 ))
                     [ "$_lk_dg_first" -eq 0 ] && _lk_dg_first=$_sbf_now
                 fi
-            elif [ "$_sbf_flapping" -eq 1 ] && [ $(( $(date +%s) - _sbf_last_ts )) -ge "$_SBF_WINDOW" ]; then
+            elif [ "$curr_sb_state" = "running" ] && [ "$_sbf_flapping" -eq 1 ] && \
+                 [ $(( $(date +%s) - _sbf_last_ts )) -ge "$_SBF_WINDOW" ]; then
                 # No new restart for a full window: the flap has settled.
                 local _sbf_total=$_sbf_count _sbf_recover_pl
                 _sbf_flapping=0; _sbf_count=0
@@ -7793,7 +7935,7 @@ start_health_daemon() {
                 fi
             fi
 
-            if [ "$curr_sb_state" != "$last_sb_state" ]; then
+            if [ "$curr_sb_state" != "unknown" ] && [ "$curr_sb_state" != "$last_sb_state" ]; then
                 # IPC below must run even with alerts off — only messages are gated.
                 if [ "$curr_sb_state" = "stopped" ]; then
                     local _sb_leaf _sb_leaf_disp
@@ -7805,7 +7947,6 @@ start_health_daemon() {
                     printf 'down' > "$ROUTE_CMD_FILE"
                     logger -t podkop-bot "[Transport] sing-box stopped. Signalling route reset."
                 else
-                    new_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
                     # Get current leaf after recovery (may take a moment to settle)
                     local _rec_leaf_disp
                     _rec_leaf_disp=$(display_proxy_name "${last_leaf:-unknown}")
@@ -7828,17 +7969,17 @@ start_health_daemon() {
                 _sb_stop_alerted=0
                 last_sb_state="$curr_sb_state"
             elif [ "$curr_sb_state" = "stopped" ] && [ "$_sb_stop_alerted" = "0" ] && \
-                 [ "$_lk_send" = "1" ] && [ "$_lam" != "all" ]; then
+                 [ "$_lk_send" = "1" ] && [ "$_lam" != "all" ] && [ "$_sb_stopped_streak" -ge 2 ]; then
                 # smart/critical: still stopped on the next check — a real outage,
                 # not a restart that the PID check happened to catch mid-way.
                 _sb_stop_alerted=1
                 admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt \
-                    "$(printf '<b>[%s]</b> %s <b>sing-box не работает</b>\n\nПроцесс не запущен уже две проверки подряд — туннель не работает.\n<b>Последний прокси:</b> <code>%s</code>\n\n<i>Бот переключается на резервный канал.</i>' \
+                    "$(printf '<b>[%s]</b> %s <b>sing-box не работает</b>\n\nТуннель не готов уже две проверки подряд — туннель не работает.\n<b>Последний прокси:</b> <code>%s</code>\n\n<i>Бот переключается на резервный канал.</i>' \
                         "$_hn" "$E_ERR" "$(html_escape "$(display_proxy_name "${last_leaf:-unknown}")")")" \
                     '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                 send_health_alert "$admin_payload"
             fi
-            last_sb_pid="$curr_sb_pid"
+            [ "$curr_sb_state" = "unknown" ] || last_sb_pid="$curr_sb_pid"
 
             # ------------------------------------------------------------------
             # Check C: SOCKS upstream — Telegram getMe through tier1 / tier2
@@ -17794,9 +17935,12 @@ _handle_bot() {
             install_reply_keyboard_once
             local _stop_start hostname p_ver active_proxy active_proxy_display sec sec_count sec_str text kb
 
-            _stop_start="{\"text\":\"${E_STP} Остановить\",\"callback_data\":\"ask_cmd_stop\"}"
-            pidof sing-box >/dev/null 2>&1 || \
-                _stop_start="{\"text\":\"${E_ON} Запустить\",\"callback_data\":\"cmd_start\"}"
+            _engine_status
+            case "$ENGINE_PROCESS_STATE" in
+                running) _stop_start=",{\"text\":\"${E_STP} Остановить\",\"callback_data\":\"ask_cmd_stop\"}" ;;
+                stopped) _stop_start=",{\"text\":\"${E_ON} Запустить\",\"callback_data\":\"cmd_start\"}" ;;
+                *)       _stop_start="" ;;
+            esac
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Роутер")
             p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
@@ -17857,7 +18001,7 @@ EOF
             esac
             kb="${kb}[{\"text\":\"${E_STAT} Статус\",\"callback_data\":\"cmd_status\"},{\"text\":\"${proxy_btn_lbl}\",\"callback_data\":\"${proxy_btn_cb}\"}],"
             kb="${kb}[{\"text\":\"${E_SET} Настройки\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"${E_RST} Перезапустить\",\"callback_data\":\"ask_reload_podkop\"}],"
-            kb="${kb}[{\"text\":\"${E_BOT} Настройки бота\",\"callback_data\":\"bot_settings\"},${_stop_start}],"
+            kb="${kb}[{\"text\":\"${E_BOT} Настройки бота\",\"callback_data\":\"bot_settings\"}${_stop_start}],"
             case "$PODKOP_VARIANT" in
                 original|plus|forkop)
                     kb="${kb}[{\"text\":\"${E_SRV} Службы\",\"callback_data\":\"cmd_server_instances\"}],"
@@ -17901,9 +18045,18 @@ EOF
             }')
             [ -n "$extra_ifs" ] && extra_ifs="${extra_ifs}
 "
-            # Podkop state
-            podkop_running=0
-            ${PODKOP_INIT} status 2>&1 | grep -qi "running" && podkop_running=1
+            # Experimental is a daemon, not a reference to the separate core.
+            _engine_status
+            if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+                case "$ENGINE_PROCESS_STATE" in
+                    running) podkop_running=1 ;;
+                    stopped) podkop_running=0 ;;
+                    *)       podkop_running=unknown ;;
+                esac
+            else
+                podkop_running=0
+                ${PODKOP_INIT} status 2>&1 | grep -qi "^running" && podkop_running=1
+            fi
             podkop_autostart_ok=0
             ${PODKOP_INIT} enabled >/dev/null 2>&1 && podkop_autostart_ok=1
 
@@ -17921,9 +18074,12 @@ EOF
             esac
 
             # Sing-box state
-            sb_running=0
-            pidof sing-box >/dev/null 2>&1 && sb_running=1
-            sb_pid=$(pidof sing-box 2>/dev/null || echo "")
+            case "$ENGINE_STATE" in
+                running) sb_running=1 ;;
+                stopped) sb_running=0 ;;
+                *)       sb_running=unknown ;;
+            esac
+            sb_pid="$ENGINE_PID"
             sb_ram="0"
             [ -n "$sb_pid" ] && \
                 sb_ram=$(awk '/VmRSS/{print int($2/1024)}' /proc/"$sb_pid"/status 2>/dev/null || echo "0")
@@ -18029,6 +18185,10 @@ EOF
                         esac
                     fi
                     ;;
+                unknown)
+                    _sev_title="${E_WARN} <b>Состояние туннеля неизвестно</b>"
+                    _sev_note="Служба статуса не ответила. Это не означает, что туннель остановлен."
+                    ;;
                 warn)
                     _sev_title="${E_WARN} <b>Работает с ограничениями</b>"
                     _sev_note="Podkop работает, но Telegram недоступен через туннель."
@@ -18091,13 +18251,17 @@ EOF
             # ── Build text ────────────────────────────────────────────────────
             # Short version for display (strip trailing build number after 3rd dot for singbox)
             local sb_ver_short p_ver_short
-            sb_ver_short=$(printf '%s' "$sb_ver_st" | sed 's/-[0-9]*\.[0-9]*\.[0-9]*$//')
+            sb_ver_short=$(html_escape "$(printf '%s' "$sb_ver_st" | sed 's/-[0-9]*\.[0-9]*\.[0-9]*$//')")
             p_ver_short="$p_ver_st"
 
             # Podkop status icons
             local _pk_icon _sb_icon _as_icon
-            [ "$podkop_running"    = "1" ] && _pk_icon="$E_OK" || _pk_icon="$E_ERR"
-            [ "$sb_running"        = "1" ] && _sb_icon="$E_OK" || _sb_icon="$E_ERR"
+            case "$podkop_running" in 1) _pk_icon="$E_OK";; 0) _pk_icon="$E_ERR";; *) _pk_icon="$E_OFF";; esac
+            case "$sb_running" in
+                1) _sb_icon="$E_OK" ;;
+                0) _sb_icon="$E_ERR" ;;
+                *) _sb_icon="$E_OFF статус неизвестен" ;;
+            esac
             [ "$podkop_autostart_ok" = "1" ] && _as_icon="$E_OK" || _as_icon="$E_ERR"
 
             # Precompute all optional fragments outside the message body.
@@ -18149,7 +18313,7 @@ ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
             kb="${kb}[{\"text\":\"${E_MICRO} Полный тест Outbound\",\"callback_data\":\"ask_probe_outbound_status\"}],"
             if [ "$podkop_running" = "1" ]; then
                 kb="${kb}[{\"text\":\"♻️ Перезапустить Podkop\",\"callback_data\":\"ask_reload_podkop\"}],"
-            else
+            elif [ "$podkop_running" = "0" ] && [ "$ENGINE_STATE" != "unknown" ]; then
                 kb="${kb}[{\"text\":\"${E_ON} Запустить\",\"callback_data\":\"cmd_start\"}],"
             fi
             kb="${kb}[{\"text\":\"🔃 Обновить\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Меню\",\"callback_data\":\"/menu\"}]"
@@ -18160,7 +18324,9 @@ ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
             local conn_data curr_conn total_dl total_ul dl_fmt ul_fmt text kb
             local proxies selector active_proxy active_proxy_display p_delay_raw p_delay p_type active_leaf
             local sb_uptime_str sb_pid_rt
-            sb_pid_rt=$(pidof sing-box 2>/dev/null)
+            _engine_status
+            sb_pid_rt=""
+            [ "$ENGINE_STATE" != "running" ] || sb_pid_rt="$ENGINE_PID"
             if [ -n "$sb_pid_rt" ]; then
                 local _now _lrr _diff _sb_start _tps _boot
                 _now=$(date +%s)
@@ -18176,8 +18342,10 @@ ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
                 if   [ "$_diff" -lt 60 ];   then sb_uptime_str="${_diff} с"
                 elif [ "$_diff" -lt 3600 ]; then sb_uptime_str="$((  _diff/60)) мин"
                 else sb_uptime_str="$((_diff/3600)) ч $((_diff%3600/60)) мин"; fi
-            else
+            elif [ "$ENGINE_STATE" = "stopped" ]; then
                 sb_uptime_str="остановлен"
+            else
+                sb_uptime_str="статус неизвестен"
             fi
 
             conn_data=$(clash_request "/connections")
@@ -18415,10 +18583,10 @@ EOF
             _text="${E_SRV} <b>Службы</b> (${_si_total})\n"
             _text="${_text}<code>────────────────────</code>"
 
-            # Compute sing-box liveness once (used by tailscale status); avoids one
-            # pgrep per server inside the loop.
+            # Compute managed-core liveness once, not a global process search.
+            _engine_status
             local _sb_alive=0
-            pgrep -f sing-box >/dev/null 2>&1 && _sb_alive=1
+            [ "$ENGINE_STATE" != "running" ] || _sb_alive=1
 
             # Classic standalone tailscaled card. Read-only by design: this bot
             # does not take ownership of a separately installed Tailscale daemon.
@@ -18771,9 +18939,13 @@ EOF
             nft_count="${nft_raw:-0}"
 
             # sing-box process
-            if pidof sing-box >/dev/null 2>&1; then sb_state="${E_OK} работает"
-            else sb_state="${E_ERR} остановлен"; fi
-            sb_pid=$(pidof sing-box 2>/dev/null || echo "—")
+            _engine_status
+            case "$ENGINE_STATE" in
+                running) sb_state="${E_OK} работает" ;;
+                stopped) sb_state="${E_ERR} остановлен" ;;
+                *)       sb_state="${E_OFF} статус неизвестен" ;;
+            esac
+            sb_pid="${ENGINE_PID:-—}"
             sb_ram="0"
             [ "$sb_pid" != "—" ] && \
                 sb_ram=$(awk '/VmRSS/{print int($2/1024)}' /proc/"$sb_pid"/status 2>/dev/null || echo "0")
@@ -19748,7 +19920,20 @@ EOF
                 ]}"
             ;;
         "cmd_get_config")  api_document "/etc/config/${PODKOP_UCI}" "Конфигурация ${PODKOP_DISPLAY_NAME}" ;;
-        "cmd_get_sb_json") api_document "${SINGBOX_CONFIG_PATH}" "Конфигурация sing-box" ;;
+        "cmd_get_sb_json")
+            if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+                local _cfg_export
+                _cfg_export=$(mktemp "${BOT_DIR}/sb-config.XXXXXX") || return 1
+                if _engine_exp_call show_sing_box_config >"$_cfg_export" && [ -s "$_cfg_export" ]; then
+                    api_document "$_cfg_export" "Конфигурация sing-box (секреты скрыты)"
+                else
+                    send_or_edit "$mid" "Не удалось получить конфигурацию от Podkop Experimental." ""
+                fi
+                rm -f "$_cfg_export"
+            else
+                api_document "${SINGBOX_CONFIG_PATH}" "Конфигурация sing-box"
+            fi
+            ;;
         "cmd_get_log")
             logread | grep -iE "${PODKOP_PKG}|sing-box" | tail -n 150 > /tmp/podkop_syslog.txt
             api_document "/tmp/podkop_syslog.txt" "Фрагмент системного журнала"
@@ -19778,16 +19963,23 @@ EOF
                 ${PODKOP_INIT} status 2>&1 || echo "не удалось получить состояние"
                 echo ""
                 echo "=== Процесс sing-box ==="
-                if pidof sing-box >/dev/null 2>&1; then
-                    local sb_pid; sb_pid=$(pidof sing-box | awk '{print $1}')
-                    echo "PID: $sb_pid"
-                    awk '/VmRSS/{print "ОЗУ: "int($2/1024)" МБ"}' /proc/"$sb_pid"/status 2>/dev/null
-                else
-                    echo "НЕ ЗАПУЩЕН"
+                _engine_status
+                case "$ENGINE_STATE" in
+                    running) echo "Туннель работает" ;;
+                    stopped) echo "Туннель остановлен" ;;
+                    *)       echo "Статус туннеля неизвестен" ;;
+                esac
+                if [ -n "$ENGINE_PID" ]; then
+                    echo "PID: $ENGINE_PID"
+                    awk '/VmRSS/{print "ОЗУ: "int($2/1024)" МБ"}' "/proc/$ENGINE_PID/status" 2>/dev/null
                 fi
                 echo ""
                 echo "=== Конфигурация UCI (${PODKOP_UCI}) ==="
-                uci show ${PODKOP_UCI} 2>&1
+                if [ "$PODKOP_VARIANT" = "podkop-exp" ]; then
+                    _engine_exp_call show_config || echo "не удалось получить конфигурацию с маскировкой секретов"
+                else
+                    uci show ${PODKOP_UCI} 2>&1
+                fi
                 echo ""
                 echo "=== Конфигурация UCI (podkop_bot) ==="
                 uci show podkop_bot 2>&1 | grep -v "bot_token\|chat_id\|admin_ids"
