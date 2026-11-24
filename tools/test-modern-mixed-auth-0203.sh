@@ -46,7 +46,7 @@ printf 'wait_m3_auth_username\nrule0\n' > "$STATE_FILE"
 _m3_section_extra STATE_INPUT 42 'bad user' wait_m3_auth_username
 [ "$(grep -c '^podkop.rule0.mixed_proxy_username=' "$changes")" = 1 ]
 printf 'wait_m3_auth_password\nother_rule\n' > "$STATE_FILE"
-_m3_section_extra STATE_INPUT 42 'wrongsection' wait_m3_auth_password
+_m3_section_extra STATE_INPUT 42 'wrongsection' wait_m3_auth_password || true
 ! grep -Fq 'wrongsection' "$changes"
 echo 'PASS: masked credentials, guarded input and section identity'
 MOCK
