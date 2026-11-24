@@ -10962,7 +10962,10 @@ _m4_dns_abspos() {
 _m4_dns_address() {
     local _kind="$1" _v="$2" _host _port _path
     [ -n "$_v" ] && [ "$(printf '%s' "$_v" | wc -c)" -le 240 ] || return 1
-    printf '%s' "$_v" | LC_ALL=C grep -Eq '^[A-Za-z0-9._:/\[\]?&=%+~-]+$' || return 1
+    case "$_v" in
+        \[*\]*) printf '%s' "$_v" | LC_ALL=C grep -Eq '^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?(/[-A-Za-z0-9._/?&=%+~]+)?$' || return 1 ;;
+        *) printf '%s' "$_v" | LC_ALL=C grep -Eq '^[-A-Za-z0-9._:/?&=%+~]+$' || return 1 ;;
+    esac
     case "$_v" in *://*) return 1 ;; esac
     case "$_v" in
         */*)
