@@ -10774,10 +10774,54 @@ _m3x_name() {
 _m3x_ipv4() {
     printf '%s\n' "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++)if($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255)exit 1}'
 }
+_m3x_ipv6() {
+    # Fully parse hextet count and :: compression, including an IPv4 tail.
+    # Never accept arbitrary colon/hex character strings as IPv6 addresses.
+    printf '%s\n' "$1" | awk '
+    function ipv4(s, a, n, i) {
+        n=split(s,a,"."); if(n!=4) return 0
+        for(i=1;i<=4;i++) if(a[i] !~ /^[0-9]+$/ || length(a[i])>3 || a[i]+0>255) return 0
+        return 1
+    }
+    function valid(s, a, n, i, count, compressed, tail, k) {
+        if(length(s)<2 || length(s)>45 || index(s,":")==0) return 0
+        if(index(s,".")>0) {
+            k=match(s,/:[^:]*$/)
+            if(k==0) return 0
+            tail=substr(s,k+1)
+            if(!ipv4(tail)) return 0
+            s=substr(s,1,k) "ffff:ffff"
+        }
+        if(s ~ /[^0-9a-fA-F:]/ || index(s,":::")>0) return 0
+        compressed=gsub(/::/,"Z",s)
+        if(compressed>1) return 0
+        # Restore the separator before counting the individual hex blocks.
+        gsub(/Z/,"::",s)
+        n=split(s,a,":"); count=0
+        for(i=1;i<=n;i++){
+            if(a[i]=="") continue
+            if(length(a[i])>4 || a[i] !~ /^[0-9a-fA-F]+$/) return 0
+            count++
+        }
+        if(!compressed) return count==8 && s !~ /^:/ && s !~ /:$/
+        return count<8
+    }
+    { exit !valid($0) }'
+}
 _m3x_ip() {
-    case "$1" in
-        *:*) [ "$(printf '%s' "$1" | wc -c)" -le 45 ] && printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
-        *) _m3x_ipv4 "$1" ;;
+    case "$1" in *:*) _m3x_ipv6 "$1" ;; *) _m3x_ipv4 "$1" ;; esac
+}
+_m3x_ip_or_cidr() {
+    local _v="$1" _ip _mask _max
+    case "$_v" in
+        */*)
+            _ip=$(printf '%s' "$_v" | cut -d/ -f1)
+            _mask=$(printf '%s' "$_v" | cut -d/ -f2)
+            case "$_mask" in ''|*[!0-9]*) return 1 ;; esac
+            case "$_ip" in *:*) _max=128 ;; *) _max=32 ;; esac
+            [ "$_mask" -le "$_max" ] 2>/dev/null || return 1
+            _m3x_ip "$_ip" ;;
+        *) _m3x_ip "$_v" ;;
     esac
 }
 _m3x_valid() {
@@ -10789,7 +10833,7 @@ _m3x_valid() {
             [ -d "/sys/class/net/$_v" ] || [ "$(uci -q get "network.$_v" 2>/dev/null)" = interface ] ;;
         routing_excluded_ips)
             if _forkop_v2 && [ "$_v" = "@system" ]; then return 0; fi
-            case "$_v" in */*) validate_ip_or_cidr "$_v" ;; *) _m3x_ip "$_v" ;; esac ;;
+            _m3x_ip_or_cidr "$_v" ;;
         dns_server|bootstrap_dns_server)
             printf '%s' "$_v" | tr -d '[]' | LC_ALL=C grep -Eq '^[A-Za-z0-9._:/?&=%+~-]+$' || return 1
             if [ "$_f" = bootstrap_dns_server ]; then
