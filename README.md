@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.20.2
+# 🤖 podkop_bot 0.20.3-dev4
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.20.2-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.20.3--dev4-orange?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -14,6 +14,8 @@
 [**Установка**](#-быстрая-установка) · [Как это выглядит](#-как-это-выглядит-в-telegram) · [Возможности](#-возможности) · [Поддержка форков](#-поддержка-форков-podkop) · [Веб-интерфейс](#web-ui) · [История изменений](CHANGELOG_RUS.md)
 
 </div>
+
+> **0.20.3-dev4 — тестовая ветка, не релиз.** Добавлены нативные упорядоченные DNS-секции Podkop Experimental, расширенные DNS fallback/detour/WAN для Forkop 2, IPv6/CIDR-валидация, тесты и синхронизация с [BearGuard PR #27](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/27). Аппаратных испытаний ещё нет. [Подробный план](docs/ROADMAP_0.20.3.md) · [Draft PR #18](https://github.com/Medvedolog/podkop_bot/pull/18).
 
 > **0.20.2 — стабильный канал standalone-бота.** Поддержка Podkop Experimental 0.8.21 и Forkop 2.0. Код совпадает с проверенным в CI пререлизом r3; эту сборку на физическом роутере ещё не проверяли. [Обновление из Telegram](#обновление-подкоп-бота-из-telegram) · [История изменений (RU)](CHANGELOG_RUS.md) · [Changelog (EN)](CHANGELOG.md)
 
