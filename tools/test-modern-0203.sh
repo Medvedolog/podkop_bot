@@ -71,7 +71,7 @@ grep -qx 'DEL:podkop.main.user_domains=example.org' "$LOG"
 if _m3_apply_items add mixed_proxy_password secret main; then exit 1; fi
 echo "PASS modern 0.20.3 UCI field allowlists, list edits, no legacy overwrite"
 # Exercise the callback UI with fake UCI; validate each generated keyboard JSON.
-for fn in _m3_ui _m3_settings_ui _m3_section_extra; do
+for fn in _m3_ui _m3_settings_ui _m3_section_extra _m3_bool_allowed; do
     awk -v fn="$fn" '$0 == fn"() {" {p=1} p{print} p && /^}$/ {exit}' podkop_bot.sh
 done > "$tmp/ui.sh"
 sh -n "$tmp/ui.sh"
@@ -79,6 +79,7 @@ sh -n "$tmp/ui.sh"
 STATE_FILE="$tmp/state"
 LAST_MENU_MSG_FILE="$tmp/menu"
 CALLBACK_MSG_ID=42
+E_SET='[SET]' E_GLOB='[GLOB]' E_WARN='[WARN]' E_ERR='[ERR]' E_EDIT='[EDIT]' E_BACK='[BACK]'
 echo 42 > "$LAST_MENU_MSG_FILE"
 get_active_section() { echo main; }
 html_escape() { printf '%s' "$1"; }
