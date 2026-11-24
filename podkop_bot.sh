@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.20.3-dev1
+# Podkop Telegram Bot v0.20.3-dev2
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -32,7 +32,7 @@ BOT_DIR="/tmp/podkop_bot"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.3-dev1"
+BOT_VERSION="0.20.3-dev2"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -10671,7 +10671,9 @@ _m3_settings_ui() {
             _v=$(uci -q get "$PODKOP_UCI.$_sec.enabled" 2>/dev/null); [ -n "$_v" ] || _v=1
             _rows='[{"text":"Включить / выключить","callback_data":"m3_sw_enabled"}],'
             if [ "$_variant" = experimental ]; then
-                _rows="$_rows"'[{"text":"Выбор: fastest / loss / balance","callback_data":"m3_choose"}],'
+                _rows="$_rows"'[{"text":"Выбор: fastest / loss / balance","callback_data":"m3_choose"}],[{"text":"Mixed Proxy","callback_data":"m3_mixed"},{"text":"Порт Mixed","callback_data":"m3_port"}],'
+            else
+                _rows="$_rows"'[{"text":"Действие маршрута","callback_data":"m3_action"}],'
             fi
             send_or_edit "$_mid" "$(printf '%s <b>Секция</b>: <code>%s</code>\nСейчас enabled=%s.' "$E_SET" "$(html_escape "$_sec")" "$_v")" \
                 "{\"inline_keyboard\":[$_rows[{\"text\":\"Маршруты\",\"callback_data\":\"m3_route\"}],[{\"text\":\"Назад\",\"callback_data\":\"m3_main\"}]]}"
@@ -10747,6 +10749,76 @@ _m3_settings_ui() {
             _fk_stage_set "$PODKOP_UCI.settings.log_level" "$_new" || return
             _fk_txn_commit_reload; _rc=$?
             [ "$_rc" -eq 0 ] && _m3_settings_ui m3_global "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+    esac
+}
+
+
+# 0.20.3: native Forkop 2 section actions and Podkop 0.8 Mixed Proxy.
+_m3_section_extra() {
+    local _cmd="$1" _mid="$2" _txt="$3" _state="$4" _sec _v _new _rc _saved _target_mid
+    _sec=$(get_active_section)
+    [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+    if [ "$_cmd" = STATE_INPUT ]; then
+        _saved=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+        _target_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        case "$_target_mid" in ''|*[!0-9]*) _target_mid='' ;; esac
+        rm -f "$STATE_FILE"
+        delete_message "$CALLBACK_MSG_ID"
+        [ "$_saved" = "$_sec" ] && _podkop_exp_v2 || return
+        [ "$_state" = wait_m3_port ] || return
+        _new=$(printf '%s' "$_txt" | tr -d '\r\n ')
+        case "$_new" in ''|*[!0-9]*) send_message "$E_ERR Порт должен быть числом 1–65535." ""; return ;; esac
+        [ "$_new" -ge 1 ] && [ "$_new" -le 65535 ] || { send_message "$E_ERR Неверный порт." ""; return; }
+        _fk_stage_set "$PODKOP_UCI.$_sec.mixed_proxy_port" "$_new" || return
+        _fk_txn_commit_reload; _rc=$?
+        [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_target_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+        return
+    fi
+    case "$_cmd" in
+        m3_action)
+            _forkop_v2 || return
+            _v=$(uci -q get "$PODKOP_UCI.$_sec.action" 2>/dev/null)
+            send_or_edit "$_mid" "$(printf '%s <b>Действие Forkop 2</b>\nСейчас: <code>%s</code>. Выбор изменит маршрутизацию секции.' "$E_WARN" "$(html_escape "$_v")")" \
+                '{"inline_keyboard":[[{"text":"Connection","callback_data":"m3_action_pick_connection"},{"text":"Bypass","callback_data":"m3_action_pick_bypass"}],[{"text":"Block","callback_data":"m3_action_pick_block"},{"text":"DNS","callback_data":"m3_action_pick_dns"}],[{"text":"Назад","callback_data":"m3_sec"}]]}'
+            ;;
+        m3_action_pick_connection|m3_action_pick_bypass|m3_action_pick_block|m3_action_pick_dns)
+            _forkop_v2 || return
+            _new=$(printf '%s' "$_cmd" | sed 's/^m3_action_pick_//')
+            send_or_edit "$_mid" "$(printf '%s Подтвердите изменение действия секции <code>%s</code> на <b>%s</b>.' "$E_WARN" "$(html_escape "$_sec")" "$_new")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Применить\",\"callback_data\":\"m3_action_set_$_new\"}],[{\"text\":\"Отмена\",\"callback_data\":\"m3_sec\"}]]}"
+            ;;
+        m3_action_set_connection|m3_action_set_bypass|m3_action_set_block|m3_action_set_dns)
+            _forkop_v2 || return
+            _new=$(printf '%s' "$_cmd" | sed 's/^m3_action_set_//')
+            _fk_stage_set "$PODKOP_UCI.$_sec.action" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_mixed)
+            _podkop_exp_v2 || return
+            _v=$(uci -q get "$PODKOP_UCI.$_sec.mixed_proxy_enabled" 2>/dev/null)
+            [ "$_v" = 1 ] && _new=0 || _new=1
+            if [ "$_new" = 1 ]; then
+                _v=$(uci -q get "$PODKOP_UCI.$_sec.mixed_proxy_port" 2>/dev/null)
+                case "$_v" in ''|*[!0-9]*) send_or_edit "$_mid" "$E_WARN Сначала задайте порт Mixed Proxy." '{"inline_keyboard":[[{"text":"Указать порт","callback_data":"m3_port"}],[{"text":"Назад","callback_data":"m3_sec"}]]}'; return ;; esac
+            fi
+            send_or_edit "$_mid" "$(printf '%s Переключить Mixed Proxy в состояние <b>%s</b>?' "$E_WARN" "$_new")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Применить\",\"callback_data\":\"m3_mixed_set_$_new\"}],[{\"text\":\"Отмена\",\"callback_data\":\"m3_sec\"}]]}"
+            ;;
+        m3_mixed_set_0|m3_mixed_set_1)
+            _podkop_exp_v2 || return
+            _new=$(printf '%s' "$_cmd" | sed 's/^.*_//')
+            _fk_stage_set "$PODKOP_UCI.$_sec.mixed_proxy_enabled" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_port)
+            _podkop_exp_v2 || return
+            printf 'wait_m3_port\n%s\n' "$_sec" > "$STATE_FILE"
+            _v=$(uci -q get "$PODKOP_UCI.$_sec.mixed_proxy_port" 2>/dev/null)
+            send_or_edit "$_mid" "$(printf '%s <b>Порт Mixed Proxy</b>\nСейчас: <code>%s</code>.\nОтправьте номер 1–65535. Изменение может прервать соединение бота.' "$E_EDIT" "$_v")" \
+                '{"inline_keyboard":[[{"text":"Отмена","callback_data":"m3_sec"}]]}'
             ;;
     esac
 }
@@ -21087,6 +21159,7 @@ handle_command() {
             wait_ts_url|wait_ts_hostname|wait_ts_key) logger -t podkop-bot "[ts] dispatcher state=$state" ;;
         esac
         case "$state" in
+            wait_m3_port) _m3_section_extra STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_*) _m3_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -21131,6 +21204,7 @@ handle_command() {
         "noop") ;;
         "doc_to_runtime") delete_message "$mid"; _handle_bot "cmd_runtime" "" "" "" ;;
         "delete_msg")     delete_message "$mid" ;;
+        m3_action*|m3_mixed*|m3_port) _m3_section_extra "$cmd" "$mid" "" "" ;;
         m3_sec|m3_sw_*|m3_do_enabled_*|m3_choose*|m3_global|m3_apply_*|m3_log*)
             _m3_settings_ui "$cmd" "$mid" "" "" ;;
         m3_*) _m3_ui "$cmd" "$mid" "" "" ;;
