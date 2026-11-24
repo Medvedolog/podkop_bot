@@ -10757,7 +10757,7 @@ _m3_settings_ui() {
 # --- 0.20.3 modern global DNS and interface editors ---
 _m3x_kind() {
     if _forkop_v2; then
-        case "$1" in dns_server|bootstrap_dns_server|source_network_interfaces) echo list ;; *) return 1 ;; esac
+        case "$1" in dns_server|bootstrap_dns_server|source_network_interfaces|routing_excluded_ips) echo list ;; *) return 1 ;; esac
     elif _podkop_exp_v2; then
         case "$1" in bootstrap_dns_server) echo scalar ;;
             source_network_interfaces|routing_excluded_ips) echo list ;; *) return 1 ;; esac
@@ -10788,6 +10788,7 @@ _m3x_valid() {
             case "$_v" in lo|-*|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
             [ -d "/sys/class/net/$_v" ] || [ "$(uci -q get "network.$_v" 2>/dev/null)" = interface ] ;;
         routing_excluded_ips)
+            if _forkop_v2 && [ "$_v" = "@system" ]; then return 0; fi
             case "$_v" in */*) validate_ip_or_cidr "$_v" ;; *) _m3x_ip "$_v" ;; esac ;;
         dns_server|bootstrap_dns_server)
             printf '%s' "$_v" | tr -d '[]' | LC_ALL=C grep -Eq '^[A-Za-z0-9._:/?&=%+~-]+$' || return 1
@@ -10837,7 +10838,12 @@ $_input
 M3X
     [ "$_n" -gt 0 ] || return 5
     [ "$_kind" = list ] || [ "$_n" -eq 1 ] || return 5
-    if [ "$_op" = del ] && { [ "$_f" = dns_server ] || [ "$_f" = bootstrap_dns_server ]; }; then
+    if [ "$_kind" = list ]; then
+        # Reject duplicate lines before staging any UCI mutation.
+        _cnt=$(printf '%s\n' "$_input" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' | sort -u | wc -l)
+        [ "$_cnt" -eq "$_n" ] || return 5
+    fi
+    if [ "$_op" = del ] && { [ "$_f" = dns_server ] || [ "$_f" = bootstrap_dns_server ] || [ "$_f" = source_network_interfaces ]; }; then
         _cnt=$(printf '%s\n' "$_old" | grep -c .)
         [ "$_cnt" -gt "$_n" ] || return 5
     fi
@@ -10894,8 +10900,7 @@ _m3x_ui() {
                     _v='Podkop 0.8: Bootstrap — скаляр. Основные DNS — отдельные секции dns_server (пока редактировать в LuCI).'
                 fi
             else
-                _fields='source_network_interfaces'
-                _podkop_exp_v2 && _fields="$_fields routing_excluded_ips"
+                _fields='source_network_interfaces routing_excluded_ips'
                 _v='Изменение LAN может разорвать сеть. Добавляются только существующие интерфейсы.'
             fi
             _rows=''
