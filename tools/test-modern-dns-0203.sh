@@ -45,19 +45,23 @@ _fk_txn_fail_msg() { echo "TXN $1"; }
 
 [ "$(_m3x_kind dns_server)" = list ]
 [ "$(_m3x_kind bootstrap_dns_server)" = list ]
-if _m3x_kind routing_excluded_ips >/dev/null 2>&1; then exit 1; fi
+[ "$(_m3x_kind routing_excluded_ips)" = list ]
 _m3x_apply add dns_server 'https://dns.google/dns-query'
 grep -qx 'ADD:forkop.settings.dns_server=https://dns.google/dns-query' "$LOG"
 _m3x_apply add bootstrap_dns_server '1.0.0.1'
 grep -qx 'ADD:forkop.settings.bootstrap_dns_server=1.0.0.1' "$LOG"
 _m3x_apply add source_network_interfaces 'lanif'
 grep -qx 'ADD:forkop.settings.source_network_interfaces=lanif' "$LOG"
+_m3x_apply add routing_excluded_ips '@system'
+grep -qx 'ADD:forkop.settings.routing_excluded_ips=@system' "$LOG"
 cp "$LOG" "$tmp/prev"
 if _m3x_apply add dns_server 'https://dns.google/dns-query;reboot'; then exit 1; fi
 if _m3x_apply add dns_server '999.1.2.3'; then exit 1; fi
 if _m3x_apply del dns_server '77.88.8.8
 1.1.1.1'; then exit 1; fi
 if _m3x_apply add source_network_interfaces 'missing_interface'; then exit 1; fi
+if _m3x_apply del source_network_interfaces 'br-lan'; then exit 1; fi
+if _m3x_apply add source_network_interfaces 'lanif\nlanif'; then exit 1; fi
 cmp "$LOG" "$tmp/prev"
 
 PODKOP_UCI=podkop
