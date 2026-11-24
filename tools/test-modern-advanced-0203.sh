@@ -1,6 +1,6 @@
 #!/bin/sh
 # Cross-provider advanced UCI editor: mocked transaction and Telegram markup.
-set -eu
+set -eux
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
