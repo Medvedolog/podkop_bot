@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.20.2
+# Podkop Telegram Bot v0.20.3-dev1
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -32,7 +32,7 @@ BOT_DIR="/tmp/podkop_bot"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.2"
+BOT_VERSION="0.20.3-dev1"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -10571,9 +10571,88 @@ M3VALUES
 }
 # --- end 0.20.3 editing primitives ---
 
+
+# 0.20.3 Telegram UI for the modern routing editor (all writes are allowlisted).
+_m3_ui() {
+    local _cmd="$1" _mid="$2" _text="$3" _state="$4" _sec _f _kind _op _rows _fields _value _rc _saved
+    { _forkop_v2 || _podkop_exp_v2; } || return
+    _sec=$(get_active_section)
+    if [ "$_cmd" = STATE_INPUT ]; then
+        _saved=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+        rm -f "$STATE_FILE"
+        delete_message "$CALLBACK_MSG_ID"
+        if [ "$_saved" != "$_sec" ]; then
+            send_message "$E_WARN Секция сменилась, ввод отменён." ""
+            return
+        fi
+        _op=$(printf '%s' "$_state" | cut -d_ -f3)
+        _f=$(printf '%s' "$_state" | cut -d_ -f4-)
+        _m3_apply_items "$_op" "$_f" "$_text" "$_sec"; _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+            if [ "$_rc" -eq 5 ]; then
+                send_message "$E_WARN Некорректное значение или устаревшее поле. Изменения отменены." ""
+            else
+                send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            fi
+        fi
+        _m3_ui "m3_f_$_f" "$_mid" "" ""
+        return
+    fi
+    case "$_cmd" in
+        m3_main)
+            send_or_edit "$_mid" "$(printf '%s <b>Настройки нового движка</b>\n\nСекция: <code>%s</code>\nПоддерживаются современные поля UCI и откат при неудачном применении.' "$E_SET" "$(html_escape "$_sec")")" \
+                '{"inline_keyboard":[[{"text":"Маршруты и списки","callback_data":"m3_route"}],[{"text":"Назад","callback_data":"/menu"}]]}'
+            ;;
+        m3_route)
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            if _forkop_v2; then
+                _fields='destinations ports only_devices fully_routed_ips community_lists rule_set rule_set_with_subnets'
+            else
+                _fields='user_domains user_subnets community_lists only_devices fully_routed_ips local_domain_lists local_subnet_lists remote_domain_lists remote_subnet_lists'
+            fi
+            _rows=''
+            for _f in $_fields; do
+                _rows="$_rows$(printf '[{"text":"%s","callback_data":"m3_f_%s"}],' "$(json_escape "$(_m3_field_label "$_f")")" "$_f")"
+            done
+            send_or_edit "$_mid" "$(printf '%s <b>Маршруты и списки</b>\nАктивная секция: <code>%s</code>\n\nДобавляйте и удаляйте записи по одной в строке.' "$E_GLOB" "$(html_escape "$_sec")")" \
+                "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"callback_data\":\"m3_main\"}]]}"
+            ;;
+        m3_f_*)
+            _f=$(printf '%s' "$_cmd" | sed 's/^m3_f_//')
+            _kind=$(_m3_field_kind "$_f") || return
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            _value=$(uci -q get "$PODKOP_UCI.$_sec.$_f" 2>/dev/null)
+            [ -n "$_value" ] || _value='—'
+            _value=$(_utf8_head "$_value" 1250)
+            if [ "$_kind" = text ]; then
+                _rows='[{"text":"Заменить весь список","callback_data":"m3_replace_destinations"}]'
+            else
+                _rows=$(printf '[{"text":"Добавить","callback_data":"m3_add_%s"},{"text":"Удалить запись","callback_data":"m3_del_%s"}]' "$_f" "$_f")
+            fi
+            send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\n<pre>%s</pre>\n\nУдаление: точное значение. Добавление: можно несколько строк.' "$E_SET" "$(_m3_field_label "$_f")" "$(html_escape "$_value")")" \
+                "{\"inline_keyboard\":[$_rows,[{\"text\":\"Назад\",\"callback_data\":\"m3_route\"}]]}"
+            ;;
+        m3_add_*|m3_del_*|m3_replace_*)
+            _op=$(printf '%s' "$_cmd" | cut -d_ -f2)
+            _f=$(printf '%s' "$_cmd" | cut -d_ -f3-)
+            _kind=$(_m3_field_kind "$_f") || return
+            case "$_op:$_kind" in add:list|del:list|replace:text) ;; *) return ;; esac
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            printf 'wait_m3_%s_%s\n%s\n' "$_op" "$_f" "$_sec" > "$STATE_FILE"
+            send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\nОтправьте значения по одному в строке.\n%s' "$E_EDIT" "$(_m3_field_label "$_f")" "$( [ "$_op" = replace ] && echo 'Полная замена: старый список будет перезаписан.' || echo 'При удалении требуется точное совпадение.')")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Отмена\",\"callback_data\":\"m3_f_$_f\"}]]}"
+            ;;
+    esac
+}
+
 _handle_settings() {
     local cmd="$1" mid="$2" text="$3" state="$4"
     local sec=$(get_active_section)
+    if _forkop_v2 || _podkop_exp_v2; then
+        case "$cmd" in main_settings_menu|section_settings|global_settings)
+            _m3_ui m3_main "$mid" "" ""; return ;;
+        esac
+    fi
 
     if _podkop_exp_v2; then
         case "$cmd" in
@@ -16689,6 +16768,9 @@ EOF
 # FIXED: remote list display uses eval "set --" (uci get N broken on BusyBox)
 # ------------------------------------------------------------------------------
 _handle_lists() {
+    if _forkop_v2 || _podkop_exp_v2; then
+        case "$1" in community_lists|lists_menu) _m3_ui m3_route "$2" "" ""; return ;; esac
+    fi
     if _podkop_exp_v2; then
         _exp_v2_readonly_card "$2"; return
     fi
@@ -20899,6 +20981,7 @@ handle_command() {
             wait_ts_url|wait_ts_hostname|wait_ts_key) logger -t podkop-bot "[ts] dispatcher state=$state" ;;
         esac
         case "$state" in
+            wait_m3_*) _m3_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_sub_url_*)
@@ -20942,6 +21025,7 @@ handle_command() {
         "noop") ;;
         "doc_to_runtime") delete_message "$mid"; _handle_bot "cmd_runtime" "" "" "" ;;
         "delete_msg")     delete_message "$mid" ;;
+        m3_*) _m3_ui "$cmd" "$mid" "" "" ;;
 
         # Explicit parent navigation for warning/read-only screens. Dispatched
         # before feature handlers so a backend (Forkop) guard cannot intercept
