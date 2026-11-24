@@ -1,0 +1,71 @@
+name: Test and publish Podkop Bot 0.20.2-r3
+on:
+  push:
+    branches: [automation/publish-test-0202-r3]
+    paths:
+      - '.github/workflows/publish-0202-r3.yml'
+      - 'tools/publish-0202-r3.sh'
+      - 'docs/RELEASE-0202-R3.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-test-0202-r3
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'Medvedolog/podkop_bot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Check exact bot and test Linux/BusyBox compatibility
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = '07792a0a8fe91dc446c1f00c9348a2ef0627e5f0'
+          test "$(cat version.txt)" = 0.20.2
+          echo '91f656621344fda2b1de8dff6e1be1021ea69a242a402b3b63618e486e3c2838  podkop_bot.sh' | sha256sum --strict -c -
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox jq
+          ASH_TEST_BIN="$(command -v busybox)" sh tools/check-provider-compat.sh
+      - name: Stage the exact tested bytes
+        run: |
+          mkdir upload
+          cp podkop_bot.sh upload/podkop_bot-0.20.2-r3-fix.sh
+          (cd upload && sha256sum podkop_bot-0.20.2-r3-fix.sh > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: podkop-bot-0202-r3-verified
+          path: upload/
+          if-no-files-found: error
+  publish:
+    needs: test
+    if: github.repository == 'Medvedolog/podkop_bot'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/download-artifact@v4
+        with:
+          name: podkop-bot-0202-r3-verified
+          path: upload/
+      - name: Publish verified test prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = '07792a0a8fe91dc446c1f00c9348a2ef0627e5f0'
+          test "$(find upload -maxdepth 1 -type f | wc -l)" -eq 2
+          (cd upload && echo '91f656621344fda2b1de8dff6e1be1021ea69a242a402b3b63618e486e3c2838  podkop_bot-0.20.2-r3-fix.sh' | sha256sum --strict -c -)
+          cp docs/RELEASE-0202-R3.md release-notes.md
+          bash tools/publish-0202-r3.sh Medvedolog/podkop_bot 07792a0a8fe91dc446c1f00c9348a2ef0627e5f0 'Podkop Bot 0.20.2 r3 TEST · Podkop Experimental 0.8.21 / Forkop 2.0'
