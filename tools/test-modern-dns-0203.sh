@@ -30,7 +30,9 @@ uci() {
                 podkop.settings.bootstrap_dns_server) echo '77.88.8.8' ;;
                 forkop.settings.source_network_interfaces|podkop.settings.source_network_interfaces) echo br-lan ;;
                 podkop.settings.routing_excluded_ips) echo 192.0.2.0/24 ;;
-                network.lanif) echo interface ;;
+                forkop.settings.badwan_monitored_interfaces) echo wan2 ;;
+                forkop.settings.enable_badwan_interface_monitoring) echo 1 ;;
+                network.lanif|network.wan) echo interface ;;
                 *) return 1 ;;
             esac ;;
         add_list) printf 'ADD:%s\n' "$2" >> "$LOG" ;;
@@ -46,6 +48,7 @@ _fk_txn_fail_msg() { echo "TXN $1"; }
 [ "$(_m3x_kind dns_server)" = list ]
 [ "$(_m3x_kind bootstrap_dns_server)" = list ]
 [ "$(_m3x_kind routing_excluded_ips)" = list ]
+[ "$(_m3x_kind badwan_monitored_interfaces)" = list ]
 _m3x_apply add dns_server 'https://dns.google/dns-query'
 grep -qx 'ADD:forkop.settings.dns_server=https://dns.google/dns-query' "$LOG"
 _m3x_apply add bootstrap_dns_server '1.0.0.1'
@@ -53,6 +56,8 @@ grep -qx 'ADD:forkop.settings.bootstrap_dns_server=1.0.0.1' "$LOG"
 _m3x_apply add source_network_interfaces 'lanif'
 grep -qx 'ADD:forkop.settings.source_network_interfaces=lanif' "$LOG"
 _m3x_apply add routing_excluded_ips '@system'
+_m3x_apply add badwan_monitored_interfaces wan
+grep -Fqx 'ADD:forkop.settings.badwan_monitored_interfaces=wan' "$LOG"
 grep -qx 'ADD:forkop.settings.routing_excluded_ips=@system' "$LOG"
 cp "$LOG" "$tmp/prev"
 if _m3x_apply add dns_server 'https://dns.google/dns-query;reboot'; then exit 1; fi
@@ -60,6 +65,8 @@ if _m3x_apply add dns_server '999.1.2.3'; then exit 1; fi
 if _m3x_apply del dns_server '77.88.8.8
 1.1.1.1'; then exit 1; fi
 if _m3x_apply add source_network_interfaces 'missing_interface'; then exit 1; fi
+if _m3x_apply add badwan_monitored_interfaces lan; then exit 1; fi
+if _m3x_apply del badwan_monitored_interfaces wan2; then exit 1; fi
 if _m3x_apply del source_network_interfaces 'br-lan'; then exit 1; fi
 if _m3x_apply add source_network_interfaces 'lanif\nlanif'; then exit 1; fi
 cmp "$LOG" "$tmp/prev"
