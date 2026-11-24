@@ -10757,7 +10757,7 @@ _m3_settings_ui() {
 # --- 0.20.3 modern global DNS and interface editors ---
 _m3x_kind() {
     if _forkop_v2; then
-        case "$1" in dns_server|bootstrap_dns_server|source_network_interfaces|routing_excluded_ips) echo list ;; *) return 1 ;; esac
+        case "$1" in dns_server|bootstrap_dns_server|source_network_interfaces|routing_excluded_ips|badwan_monitored_interfaces) echo list ;; *) return 1 ;; esac
     elif _podkop_exp_v2; then
         case "$1" in bootstrap_dns_server) echo scalar ;;
             source_network_interfaces|routing_excluded_ips) echo list ;; *) return 1 ;; esac
@@ -10769,6 +10769,7 @@ _m3x_name() {
         bootstrap_dns_server) echo 'Bootstrap DNS' ;;
         source_network_interfaces) echo 'Входные интерфейсы' ;;
         routing_excluded_ips) echo 'Исключения маршрутизации' ;;
+        badwan_monitored_interfaces) echo 'Мониторинг WAN-интерфейсов' ;;
     esac
 }
 _m3x_ipv4() {
@@ -10831,6 +10832,9 @@ _m3x_valid() {
         source_network_interfaces)
             case "$_v" in lo|-*|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
             [ -d "/sys/class/net/$_v" ] || [ "$(uci -q get "network.$_v" 2>/dev/null)" = interface ] ;;
+        badwan_monitored_interfaces)
+            case "$_v" in lan|loopback|@*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+            [ "$(uci -q get "network.$_v" 2>/dev/null)" = interface ] ;;
         routing_excluded_ips)
             if _forkop_v2 && [ "$_v" = "@system" ]; then return 0; fi
             _m3x_ip_or_cidr "$_v" ;;
@@ -10886,6 +10890,12 @@ M3X
         # Reject duplicate lines before staging any UCI mutation.
         _cnt=$(printf '%s\n' "$_input" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' | sort -u | wc -l)
         [ "$_cnt" -eq "$_n" ] || return 5
+    fi
+    if [ "$_op" = del ] && [ "$_f" = badwan_monitored_interfaces ]; then
+        if [ "$(uci -q get forkop.settings.enable_badwan_interface_monitoring 2>/dev/null)" = 1 ]; then
+            _cnt=$(printf '%s\n' "$_old" | grep -c .)
+            [ "$_cnt" -gt "$_n" ] || return 5
+        fi
     fi
     if [ "$_op" = del ] && { [ "$_f" = dns_server ] || [ "$_f" = bootstrap_dns_server ] || [ "$_f" = source_network_interfaces ]; }; then
         _cnt=$(printf '%s\n' "$_old" | grep -c .)
@@ -10945,6 +10955,7 @@ _m3x_ui() {
                 fi
             else
                 _fields='source_network_interfaces routing_excluded_ips'
+                if _forkop_v2; then _fields="$_fields badwan_monitored_interfaces"; fi
                 _v='Изменение LAN может разорвать сеть. Добавляются только существующие интерфейсы.'
             fi
             _rows=''
