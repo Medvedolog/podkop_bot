@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pure mock UCI: ordered config dns_server rows, no router writes.
-set -eux
+set -eu
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
@@ -52,18 +52,18 @@ _fk_txn_fail_msg() { echo "Transaction error $1"; }
 if _m4_dns_path 2; then exit 1; fi
 if _m4_dns_path '0;reboot'; then exit 1; fi
 _m4_dns_apply add 0 'dot resolver.example:853'
-grep -qx 'ADD:podkop:dns_server' "$LOG"
-grep -qx 'set:podkop.cfgd123.type=dot' "$LOG"
-grep -qx 'set:podkop.cfgd123.server=resolver.example:853' "$LOG"
+grep -Fqx 'ADD:podkop:dns_server' "$LOG"
+grep -Fqx 'set:podkop.cfgd123.type=dot' "$LOG"
+grep -Fqx 'set:podkop.cfgd123.server=resolver.example:853' "$LOG"
 _m4_dns_apply edit 0 'provider'
-grep -qx 'set:podkop.@dns_server[0].type=provider' "$LOG"
-grep -qx 'delete:podkop.@dns_server[0].server' "$LOG"
+grep -Fqx 'set:podkop.@dns_server[0].type=provider' "$LOG"
+grep -Fqx 'delete:podkop.@dns_server[0].server' "$LOG"
 _m4_dns_apply down 0 ''
-grep -qx 'reorder:podkop.@dns_server[0]=4' "$LOG"
+grep -Fqx 'reorder:podkop.@dns_server[0]=4' "$LOG"
 _m4_dns_apply up 1 ''
-grep -qx 'reorder:podkop.@dns_server[1]=2' "$LOG"
+grep -Fqx 'reorder:podkop.@dns_server[1]=2' "$LOG"
 _m4_dns_apply del 0 ''
-grep -qx 'delete:podkop.@dns_server[0]' "$LOG"
+grep -Fqx 'delete:podkop.@dns_server[0]' "$LOG"
 cp "$LOG" "$tmp/before"
 for value in 'https://dns.google/dns-query' 'udp' 'provider anything' 'dns.google' \
     'dot dns.google:65536' 'udp 999.1.1.1' 'doh dns.google/' \
@@ -95,5 +95,5 @@ jq -e '.inline_keyboard[1][0].callback_data == "m4_dns_up_1"' "$tmp/kb.json" >/d
 _m4_dns_ui m4_dns_add 42 '' ''
 [ "$(sed -n '1p' "$STATE_FILE")" = wait_m4_dns_add ]
 _m4_dns_ui STATE_INPUT 42 'udp 8.8.8.8' wait_m4_dns_add
-grep -qx 'set:podkop.cfgd123.server=8.8.8.8' "$LOG"
+grep -Fqx 'set:podkop.cfgd123.server=8.8.8.8' "$LOG"
 echo 'PASS 0.20.3-dev4 Podkop 0.8 DNS upstream ordered rows, edits, validation, UI, rollback delegation'
