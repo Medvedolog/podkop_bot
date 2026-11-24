@@ -1,32 +1,33 @@
-# 0.20.3-dev3 — восстановление управления в Telegram
+# 0.20.3-dev4 — интеграция podkop_bot и BearGuard
 
-## Реализовано в dev-ветке
+> Черновая разработка. `main` и стабильные релизы не изменены. Без полевых тестов на маршрутизаторах сборка не считается подтверждённым стабильным релизом.
 
-- **Forkop 2.0:** собственный редактор UCI `destinations` (добавить к тексту или заменить целиком), `ports`, `only_devices`, `fully_routed_ips`, `community_lists`, `rule_set`, `rule_set_with_subnets`.
-- **Podkop Experimental 0.8 (схема config_version=2):** редактирование `user_domains`, `user_subnets`, `community_lists`, `only_devices`, `fully_routed_ips`, локальных/удалённых списков доменов и подсетей.
-- Добавление и удаление отдельных значений через `uci add_list`/`del_list`; в Forkop `destinations` — явные операции «Добавить» и «Заменить всё». Существующие значения других полей не реконструируются из текста.
-- Отбраковка неизвестных полей, проверка всей пачки значений до изменения, проверка активной секции в момент обработки. Для Podkop при добавлении динамических доменов/подсетей не перезаписывается действующий текстовый режим.
-- Открыты отдельные Telegram-меню «Маршруты и списки», «Параметры секции», «Общие настройки». Действующие обработчики Forkop 1.x и Podkop 0.7 оставлены без изменений.
-- **Обе платформы:** подтверждаемое включение/выключение секций; глобальные переключатели QUIC и YACD, уровень журнала.
-- **Forkop 2:** смена действия секции `connection/bypass/block/dns` с подтверждением; опции автообновления списков и загрузки списков через прокси.
-- **Podkop Exp:** режимы выбора серверов `fastest/loss/balance`; включение Mixed Proxy и настройка его порта; `exclude_ntp`.
-- Существующая реализация подписок и ссылок (добавление, редактирование, обновление, удаление) сохранена с 0.20.2.
-- Редакторы используют штатную `_fk_txn_commit_reload` с резервной копией конфигурации и попыткой отката при ошибке применения.
-- **Новое в dev3 — Forkop 2.0:** управление списками `settings.dns_server` и `settings.bootstrap_dns_server`, входными LAN-интерфейсами `source_network_interfaces`, глобальными исключениями `routing_excluded_ips` (включая `@system`).
-- **Новое в dev3 — Podkop Experimental 0.8:** редактор скалярного `bootstrap_dns_server`, входных `source_network_interfaces` и `routing_excluded_ips`. Нативные `config dns_server` пока не записываются из бота.
-- Операции с DNS и LAN не позволяют удалить последний сервер или входной интерфейс; повторные записи и неизвестные поля отвергаются до UCI. Все изменения используют штатный commit/reload/rollback.
-- GitHub Actions: проверки shell-синтаксиса, UCI/Telegram-клавиатур и отдельный mock DNS/LAN редакторов, плюс provider compatibility.
+## Готово и покрыто имитационными тестами
 
-## Не завершено — не считать функциональным паритетом
+- Восстановлены маршруты, списки, устройства, выбор серверов, управление секциями и подписками для Forkop 2.0 и Podkop Experimental 0.8.x.
+- Forkop 2: `destinations`, `ports`, `only_devices`, `fully_routed_ips`, `community_lists`, `rule_set`, `rule_set_with_subnets`, действия `connection/bypass/block/dns`.
+- Podkop Experimental: `user_domains`, `user_subnets`, локальные и удалённые списки, режимы `fastest/loss/balance`, Mixed Proxy (включение и порт).
+- Общие переключатели QUIC/YACD, журналы, включение секций, обновление списков и исключения маршрутизации.
+- Forkop 2: редактирование списков `settings.dns_server`, `bootstrap_dns_server`, LAN `source_network_interfaces`, `routing_excluded_ips`, `badwan_monitored_interfaces` с защитой от удаления последнего WAN при активном мониторинге.
+- **Podkop Experimental, dev4:** отдельное управление упорядоченными UCI-блоками `config dns_server` (добавить, полностью изменить строку `type server`, удалить, переставить выше/ниже). Поддерживаются типы `udp`, `dot`, `doh`, `provider`. Не используется скаляр `settings.dns_server` при записи; удаление последней строки заблокировано.
+- **Forkop 2, dev4:** `dns_strategy`, `dns_main_fallback_strategy` и `dns_bootstrap_fallback_strategy` (`parallel/sequential`), `unmatched_dns_mode`, `dns_detour_enabled` + `dns_detour_section`, `dns_timeout`, `dns_rewrite_ttl`, `enable_output_network_interface`, `output_network_interface`, `enable_badwan_interface_monitoring`, `badwan_reload_delay`, `bittorrent_direct`.
+- **Podkop Experimental, dev4:** `dns_mode`, `dns_addresses`, `dns_rewrite_ttl`, `ipv6_routing`, выходной WAN, `bittorrent`, `bittorrent_section`. Ссылки на недействующие секции отклоняются.
+- IPv4, IPv6 (включая `::` и IPv4-mapped IPv6), CIDR-маски и числовые границы валидируются до записи UCI.
+- Все новые операции применяются через `_fk_txn_commit_reload`: резервная копия, UCI commit, reload и попытка восстановления при отказе; отказ без успешного отката отдельно сообщается.
+- CI: `tools/test-modern-0203.sh`, `test-modern-dns-0203.sh`, `test-modern-dns-rows-0203.sh`, `test-modern-advanced-0203.sh`, `test-modern-ipv6-0203.sh`, `test-installer-no-downgrade-0203.sh`, provider compatibility.
+- Интеграция с BearGuard: пакетный `luci-app-podkop-bot 0.20.3-r1` содержит побайтово закреплённую версию `0.20.3-dev4` и идентичный standalone-установщик; integrity gate проверяет SHA256 и Git blob.
 
-- **Podkop Experimental:** управление упорядоченными секциями `config dns_server`, DNS mode/fallback, исходящим WAN-интерфейсом, IPv6, BitTorrent и per-server `cure`.
-- **Forkop 2:** DNS fallback-стратегии, DNS detour, исходящий WAN-интерфейс, DNS strategy/timeout/TTL и мониторинг WAN; редактирование специфичных `section_interface`/detour требует отдельных проверок.
-- Полный редактор Forkop 2 для `detour`, каскадов, отдельных фильтров устройств/условий и связанных объектов, которых нет в текущем упрощённом меню.
-- Подробные Mixed Proxy credentials и проверка устойчивого reconnect после изменения порта.
-- Сквозной hardware test на OpenWrt (Forkop 2 + Podkop Experimental 0.8.21), `opkg` и `apk`; проверка rollback при отказе движка; совместимость LuCI/BearGuard нужно проверять отдельно.
-- Ужесточение валидации IPv6/hostname, портов и DNS URI по upstream-валидаторам, в том числе на границах числовых значений. Часть форматов пока лишь предварительно проверяется ботом; финальный арбитр — сам движок.
-- Подтверждение фактического восстановления DNS/сетевой связности после неудачного reload и проверки защиты от одновременных правок через LuCI.
+## Не подтверждено; до stable остаётся
 
-## Политика публикации
+- Реальные полевые испытания на Forkop 2.0 и Podkop Experimental 0.8.21, OpenWrt с `opkg` и `apk`, включая сохранение подключения после перезагрузки движка.
+- Реальное восстановление сети после неуспешного reload; гонки параллельных записей LuCI, rpcd и Telegram; жизненный цикл BearGuard при переустановке.
+- Более узкие объекты: вложенные detour/каскады Forkop 2, управление `cure` в Podkop Experimental и подробные Mixed Proxy credentials. В Telegram пароль не вводится и не отображается ради безопасности.
+- Полная проверка DNS-адресов и интерфейсов самой платформой. Бот валидирует поддерживаемый безопасный набор форматов; наличие значения в меню не гарантирует, что движок примет конфигурацию.
 
-Версия `0.20.3-dev3` — **не стабильный релиз**. Ветка `dev/0.20.3-legacy-parity`, черновой PR #18. Не сливать в `main` и не публиковать `v0.20.3` до аппаратных испытаний и доработки недостающих редакторов. Стабильная `v0.20.2` остаётся без изменений.
+## Публикация
+
+Две связанные draft-ветки / PR:
+- [podkop_bot PR #18](https://github.com/Medvedolog/podkop_bot/pull/18)
+- [BearGuard PR #27](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/27)
+
+До завершения аппаратных испытаний не сливать в `main` и не маркировать как `v0.20.3` stable.
