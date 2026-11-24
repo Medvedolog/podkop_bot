@@ -21,5 +21,7 @@ jobs:
         run: sh tools/test-modern-0203.sh
       - name: Modern DNS and LAN editor smoke
         run: sh tools/test-modern-dns-0203.sh
+      - name: Installer downgrade prevention
+        run: sh tools/test-installer-no-downgrade-0203.sh
       - name: Provider compatibility smoke
         run: sh tools/check-provider-compat.sh
