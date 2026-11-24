@@ -10816,6 +10816,7 @@ _m3x_ip_or_cidr() {
     local _v="$1" _ip _mask _max
     case "$_v" in
         */*)
+            case "$_v" in */*/*) return 1 ;; esac
             _ip=$(printf '%s' "$_v" | cut -d/ -f1)
             _mask=$(printf '%s' "$_v" | cut -d/ -f2)
             case "$_mask" in ''|*[!0-9]*) return 1 ;; esac
