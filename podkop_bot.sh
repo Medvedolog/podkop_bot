@@ -20802,7 +20802,9 @@ handle_command() {
                 _handle_url_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fk_label|wait_fkdns_server|wait_fkpg_name|wait_fkpl_country_*)
                 _handle_forkop_0198 "STATE_INPUT" "$mid" "$cmd" "$state" "" ;;
-            wait_fkc_*|wait_fkcd_*|wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*|\
+            wait_fkc_*|wait_fkcd_*)
+                _handle_forkop_ext "STATE_INPUT" "$mid" "$cmd" "$state" ;;
+            wait_fkss_i_*|wait_fkss_px_*|wait_fkut_u_*|wait_fkut_i_*|wait_fkut_t_*|\
             wait_xp_*)
                 _handle_exp_v2 "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fksub_add|wait_fkutn_add|wait_fkutv_inc_*|wait_fkutv_exc_*|\
