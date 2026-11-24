@@ -1,0 +1,67 @@
+name: Publish Podkop Bot 0.20.2 stable
+on:
+  push:
+    branches: [automation/publish-stable-0202]
+    paths: [.github/workflows/publish-stable-0202.yml]
+permissions:
+  contents: read
+concurrency:
+  group: podkop-bot-v0202-stable
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'Medvedolog/podkop_bot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 251f7601787a5c6a0f7ecac112c849b3dc570bf9
+          persist-credentials: false
+      - name: Publish exact stable update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: Medvedolog/podkop_bot
+          TARGET: 251f7601787a5c6a0f7ecac112c849b3dc570bf9
+          SHA256: 91f656621344fda2b1de8dff6e1be1021ea69a242a402b3b63618e486e3c2838
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/branches/main" --jq .commit.sha)" = "$TARGET"
+          test "$(git rev-parse HEAD)" = "$TARGET"
+          test "$(cat version.txt)" = '0.20.2'
+          grep -Fxq 'BOT_VERSION="0.20.2"' podkop_bot.sh
+          sh -n podkop_bot.sh
+          echo "$SHA256  podkop_bot.sh" | sha256sum --strict -c -
+          old_test="$(gh api "repos/$GH_REPO/releases/tags/test-0.20.2-r3" --jq '.assets[] | select(.name=="podkop_bot-0.20.2-r3-fix.sh") | .digest')"
+          test "$old_test" = "sha256:$SHA256"
+          mkdir assets
+          cp podkop_bot.sh assets/podkop_bot-0.20.2.sh
+          (cd assets && sha256sum podkop_bot-0.20.2.sh > SHA256SUMS)
+          cat > release.md <<'NOTES'
+          ### RU
+          Отдельный Podkop Bot 0.20.2 теперь доступен в штатном обновлении из Telegram: Меню → Обслуживание → Обновление бота. Скрипт побайтово совпадает с тестовой сборкой r3. Если r3 уже установлен, повторное обновление не нужно.
+          
+          Поддержка Podkop Experimental 0.8.21 с встроенным sing-box; совместимость с 0.8.14 сохранена. На Forkop 2.0 исправлены выбор сервера Selector/Fallback и обновление подписок; URLTest остаётся автоматическим. Диагностика больше не выгружает сырые конфиги и журналы с потенциальными секретами.
+          
+          CI и тесты с имитацией служб прошли. На физическом роутере эта сборка не проверялась. Пакеты LuCI/BearGuard обновляются отдельно. Файл .sh предназначен для ручного обновления уже установленного бота, а не для запуска как установщика.
+          
+          ### EN
+          The standalone Podkop Bot 0.20.2 is available in the regular Telegram self-update menu. The script is byte-identical to r3; existing r3 installations do not need to update again.
+          
+          Supports the embedded sing-box in Podkop Experimental 0.8.21 (retains 0.8.14 compatibility). Forkop 2.0 Selector/Fallback selection and subscription refresh are fixed; URLTest remains automatic. Diagnostic exports no longer include raw configuration and logs that may contain secrets.
+          
+          CI and fixture tests passed; physical router testing is pending. Update the LuCI/BearGuard package separately. The .sh asset is for manual upgrades of an existing bot, not a fresh installer.
+          
+          [Changelog EN](https://github.com/Medvedolog/podkop_bot/blob/v0.20.2/CHANGELOG.md) · [История изменений RU](https://github.com/Medvedolog/podkop_bot/blob/v0.20.2/CHANGELOG_RUS.md)
+          NOTES
+          if gh release view v0.20.2 >/dev/null 2>&1; then
+            echo 'Release already exists. Refusing to overwrite.' >&2
+            exit 1
+          fi
+          gh release create v0.20.2 assets/podkop_bot-0.20.2.sh assets/SHA256SUMS --target "$TARGET" --title 'Podkop Bot 0.20.2 · Podkop Experimental 0.8.21 / Forkop 2.0' --notes-file release.md --draft
+          gh release edit v0.20.2 --draft=false --latest
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/v0.20.2" --jq .object.sha)" = "$TARGET"
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = 'v0.20.2'
+          test "$(gh api "repos/$GH_REPO/releases/tags/v0.20.2" --jq '.assets[] | select(.name=="podkop_bot-0.20.2.sh") | .digest')" = "sha256:$SHA256"
