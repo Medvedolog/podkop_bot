@@ -10601,7 +10601,7 @@ _m3_ui() {
     case "$_cmd" in
         m3_main)
             send_or_edit "$_mid" "$(printf '%s <b>Настройки нового движка</b>\n\nСекция: <code>%s</code>\nПоддерживаются современные поля UCI и откат при неудачном применении.' "$E_SET" "$(html_escape "$_sec")")" \
-                '{"inline_keyboard":[[{"text":"Маршруты и списки","callback_data":"m3_route"}],[{"text":"Назад","callback_data":"/menu"}]]}'
+                '{"inline_keyboard":[[{"text":"Маршруты и списки","callback_data":"m3_route"}],[{"text":"Параметры секции","callback_data":"m3_sec"}],[{"text":"Общие настройки","callback_data":"m3_global"}],[{"text":"Назад","callback_data":"/menu"}]]}'
             ;;
         m3_route)
             [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
@@ -10641,6 +10641,105 @@ _m3_ui() {
             printf 'wait_m3_%s_%s\n%s\n' "$_op" "$_f" "$_sec" > "$STATE_FILE"
             send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\nОтправьте значения по одному в строке.\n%s' "$E_EDIT" "$(_m3_field_label "$_f")" "$( [ "$_op" = replace ] && echo 'Полная замена: старый список будет перезаписан.' || echo 'При удалении требуется точное совпадение.')")" \
                 "{\"inline_keyboard\":[[{\"text\":\"Отмена\",\"callback_data\":\"m3_f_$_f\"}]]}"
+            ;;
+    esac
+}
+
+
+# 0.20.3: safe subset of native per-section and global settings.
+_m3_bool_allowed() {
+    case "$1:$2" in
+        forkop:disable_quic|forkop:enable_yacd|forkop:list_update_enabled|forkop:download_lists_via_proxy|\
+        experimental:disable_quic|experimental:enable_yacd|experimental:exclude_ntp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+_m3_settings_ui() {
+    local _cmd="$1" _mid="$2" _text="$3" _state="$4" _sec _variant _v _new _field _rows _fields _name _rc
+    _sec=$(get_active_section)
+    if _forkop_v2; then _variant=forkop; elif _podkop_exp_v2; then _variant=experimental; else return; fi
+    case "$_cmd" in
+        m3_sec)
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            _v=$(uci -q get "$PODKOP_UCI.$_sec.enabled" 2>/dev/null); [ -n "$_v" ] || _v=1
+            _rows='[{"text":"Включить / выключить","callback_data":"m3_sw_enabled"}],'
+            if [ "$_variant" = experimental ]; then
+                _rows="$_rows"'[{"text":"Выбор: fastest / loss / balance","callback_data":"m3_choose"}],'
+            fi
+            send_or_edit "$_mid" "$(printf '%s <b>Секция</b>: <code>%s</code>\nСейчас enabled=%s.' "$E_SET" "$(html_escape "$_sec")" "$_v")" \
+                "{\"inline_keyboard\":[$_rows[{\"text\":\"Маршруты\",\"callback_data\":\"m3_route\"}],[{\"text\":\"Назад\",\"callback_data\":\"m3_main\"}]]}"
+            ;;
+        m3_sw_enabled)
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            _v=$(uci -q get "$PODKOP_UCI.$_sec.enabled" 2>/dev/null)
+            [ "$_v" = 0 ] && _new=1 || _new=0
+            send_or_edit "$_mid" "$(printf '%s Изменить состояние секции <code>%s</code> на %s?' "$E_WARN" "$(html_escape "$_sec")" "$_new")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Применить\",\"callback_data\":\"m3_do_enabled_$_new\"}],[{\"text\":\"Отмена\",\"callback_data\":\"m3_sec\"}]]}"
+            ;;
+        m3_do_enabled_0|m3_do_enabled_1)
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            _new=$(printf '%s' "$_cmd" | sed 's/^.*_//')
+            _fk_stage_set "$PODKOP_UCI.$_sec.enabled" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_choose)
+            [ "$_variant" = experimental ] || return
+            send_or_edit "$_mid" "$(printf '%s <b>Режим выбора серверов</b>\nИзменение затрагивает только server_choice.' "$E_SET")" \
+                '{"inline_keyboard":[[{"text":"fastest","callback_data":"m3_choose_fastest"},{"text":"loss","callback_data":"m3_choose_loss"},{"text":"balance","callback_data":"m3_choose_balance"}],[{"text":"Назад","callback_data":"m3_sec"}]]}'
+            ;;
+        m3_choose_fastest|m3_choose_loss|m3_choose_balance)
+            [ "$_variant" = experimental ] || return
+            [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
+            _new=$(printf '%s' "$_cmd" | sed 's/^m3_choose_//')
+            _fk_stage_set "$PODKOP_UCI.$_sec.server_choice" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_global)
+            _fields='disable_quic enable_yacd'
+            if [ "$_variant" = forkop ]; then
+                _fields="$_fields list_update_enabled download_lists_via_proxy"
+            else
+                _fields="$_fields exclude_ntp"
+            fi
+            _rows=''
+            for _field in $_fields; do
+                _v=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null)
+                [ -n "$_v" ] || { [ "$_field" = list_update_enabled ] && _v=1 || _v=0; }
+                _rows="$_rows$(printf '[{"text":"%s: %s","callback_data":"m3_sw_%s"}],' "$(json_escape "$_field")" "$_v" "$_field")"
+            done
+            _rows="$_rows"'[{"text":"Уровень журнала","callback_data":"m3_log"}],'
+            send_or_edit "$_mid" "$(printf '%s <b>Общие настройки</b>\nСовместимые параметры движка. Остальные настройки DNS и интерфейсов пока остаются в LuCI.' "$E_SET")" \
+                "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"callback_data\":\"m3_main\"}]]}"
+            ;;
+        m3_sw_*)
+            _field=$(printf '%s' "$_cmd" | sed 's/^m3_sw_//')
+            _m3_bool_allowed "$_variant" "$_field" || return
+            _v=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null)
+            [ -n "$_v" ] || { [ "$_field" = list_update_enabled ] && _v=1 || _v=0; }
+            [ "$_v" = 1 ] && _new=0 || _new=1
+            send_or_edit "$_mid" "$(printf '%s Изменить <code>%s</code> на <b>%s</b>?' "$E_WARN" "$_field" "$_new")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Применить\",\"callback_data\":\"m3_apply_$_field""_$_new\"}],[{\"text\":\"Отмена\",\"callback_data\":\"m3_global\"}]]}"
+            ;;
+        m3_apply_*)
+            _field=$(printf '%s' "$_cmd" | sed 's/^m3_apply_//;s/_[01]$//')
+            _new=$(printf '%s' "$_cmd" | sed 's/^.*_//')
+            _m3_bool_allowed "$_variant" "$_field" || return
+            case "$_new" in 0|1) ;; *) return ;; esac
+            _fk_stage_set "$PODKOP_UCI.settings.$_field" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_global "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_log)
+            send_or_edit "$_mid" "$(printf '%s <b>Уровень журнала</b>' "$E_SET")" \
+                '{"inline_keyboard":[[{"text":"error","callback_data":"m3_log_error"},{"text":"warn","callback_data":"m3_log_warn"}],[{"text":"info","callback_data":"m3_log_info"},{"text":"debug","callback_data":"m3_log_debug"}],[{"text":"Назад","callback_data":"m3_global"}]]}'
+            ;;
+        m3_log_error|m3_log_warn|m3_log_info|m3_log_debug)
+            _new=$(printf '%s' "$_cmd" | sed 's/^m3_log_//')
+            _fk_stage_set "$PODKOP_UCI.settings.log_level" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_global "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
             ;;
     esac
 }
@@ -21025,6 +21124,8 @@ handle_command() {
         "noop") ;;
         "doc_to_runtime") delete_message "$mid"; _handle_bot "cmd_runtime" "" "" "" ;;
         "delete_msg")     delete_message "$mid" ;;
+        m3_sec|m3_sw_*|m3_do_enabled_*|m3_choose*|m3_global|m3_apply_*|m3_log*)
+            _m3_settings_ui "$cmd" "$mid" "" "" ;;
         m3_*) _m3_ui "$cmd" "$mid" "" "" ;;
 
         # Explicit parent navigation for warning/read-only screens. Dispatched
