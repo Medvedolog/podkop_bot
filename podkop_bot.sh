@@ -13438,8 +13438,17 @@ _fk_txn_commit_reload() {
     fi
     if ! safe_reload_podkop "force"; then
         if cp "$_bak" "/etc/config/${PODKOP_UCI}" 2>/dev/null; then
-            uci -q commit "${PODKOP_UCI}" 2>/dev/null || true
-            safe_reload_podkop "force"
+            # A restored file is not proof that service recovery succeeded.
+            if ! uci -q commit "${PODKOP_UCI}" 2>/dev/null; then
+                logger -t podkop-bot "[UCI] Restored config, but recovery commit failed"
+                rm -f "$_bak"
+                return 4
+            fi
+            if ! safe_reload_podkop "force"; then
+                logger -t podkop-bot "[UCI] Restored config, but recovery reload failed"
+                rm -f "$_bak"
+                return 4
+            fi
             rm -f "$_bak"
             return 2
         fi
@@ -13456,7 +13465,7 @@ _fk_txn_fail_msg() {
         1) printf '%s Не удалось сохранить изменения (uci commit) — конфигурация не тронута.' "$E_ERR" ;;
         2) printf '%s Forkop отклонил изменение при перезапуске — конфигурация восстановлена из резервной копии.' "$E_WARN" ;;
         3) printf '%s Не удалось создать резервную копию конфигурации — изменение НЕ выполнялось.' "$E_ERR" ;;
-        4) printf '%s Forkop отклонил изменение, и восстановить резервную копию НЕ удалось. Проверьте <code>/etc/config/%s</code> вручную.' "$E_ERR" "$PODKOP_UCI" ;;
+        4) printf '%s Восстановление после ошибки не подтверждено: файл и/или повторный запуск движка не восстановились. Проверьте <code>/etc/config/%s</code> и службу вручную.' "$E_ERR" "$PODKOP_UCI" ;;
     esac
 }
 
@@ -13467,7 +13476,7 @@ _fk_txn_toast() {
         1) printf 'Не удалось сохранить — конфигурация не изменена' ;;
         2) printf 'Forkop отклонил — конфигурация восстановлена' ;;
         3) printf 'Нет резервной копии — изменение не выполнялось' ;;
-        4) printf 'ОТКАТ НЕ УДАЛСЯ — проверьте /etc/config/'"$PODKOP_UCI" ;;
+        4) printf 'ВОССТАНОВЛЕНИЕ НЕ ПОДТВЕРЖДЕНО — проверьте /etc/config/'"$PODKOP_UCI" ;;
     esac
 }
 
