@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.20.3-dev3
+# Podkop Telegram Bot v0.20.3-dev4
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -32,7 +32,7 @@ BOT_DIR="/tmp/podkop_bot"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.3-dev3"
+BOT_VERSION="0.20.3-dev4"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -10897,7 +10897,7 @@ _m3x_ui() {
                     _v='Forkop 2: DNS и Bootstrap — упорядоченные списки.'
                 else
                     _fields='bootstrap_dns_server'
-                    _v='Podkop 0.8: Bootstrap — скаляр. Основные DNS — отдельные секции dns_server (пока редактировать в LuCI).'
+                    _v='Podkop 0.8: Bootstrap — скаляр; основные DNS-серверы — в отдельном редакторе.'
                 fi
             else
                 _fields='source_network_interfaces routing_excluded_ips'
@@ -10907,6 +10907,9 @@ _m3x_ui() {
             for _f in $_fields; do
                 _rows="$_rows$(printf '[{"text":"%s","callback_data":"m3x_f_%s"}],' "$(json_escape "$(_m3x_name "$_f")")" "$_f")"
             done
+            if [ "$_cmd" = m3x_dns ] && _podkop_exp_v2; then
+                _rows="$_rows"'[{"text":"Основные DNS: список и порядок","callback_data":"m4_dns"}],'
+            fi
             send_or_edit "$_mid" "$E_SET <b>DNS / сеть</b>
 $(html_escape "$_v")" "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"callback_data\":\"m3x_home\"}]]}" ;;
         m3x_f_*)
@@ -10937,6 +10940,179 @@ $(html_escape "$_v")" "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"c
     esac
 }
 # --- end 0.20.3 modern global DNS and interface editors ---
+
+# --- 0.20.3-dev4: native ordered Podkop Experimental DNS rows ---
+_m4_dns_count() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null |
+        awk -F= -v pkg="$PODKOP_UCI" '$1 ~ ("^" pkg "\\.[^.]+$") && $2=="dns_server" { n++ } END { print n+0 }'
+}
+_m4_dns_path() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -lt "$(_m4_dns_count)" ] && [ "$1" -le 31 ] || return 1
+    printf '%s.@dns_server[%s]' "$PODKOP_UCI" "$1"
+}
+_m4_dns_abspos() {
+    uci -q show "$PODKOP_UCI" 2>/dev/null |
+        awk -F= -v pkg="$PODKOP_UCI" -v idx="$1" '
+            $1 ~ ("^" pkg "\\.[^.]+$") {
+                if ($2=="dns_server") { if (n==idx) { print pos; exit }; n++ }
+                pos++
+            }'
+}
+_m4_dns_address() {
+    local _kind="$1" _v="$2" _host _port _path
+    [ -n "$_v" ] && [ "$(printf '%s' "$_v" | wc -c)" -le 240 ] || return 1
+    printf '%s' "$_v" | LC_ALL=C grep -Eq '^[A-Za-z0-9._:/\[\]?&=%+~-]+$' || return 1
+    case "$_v" in *://*) return 1 ;; esac
+    case "$_v" in
+        */*)
+            [ "$_kind" = doh ] || return 1
+            _path=$(printf '%s' "$_v" | cut -d/ -f2-)
+            [ -n "$_path" ] || return 1
+            _v=$(printf '%s' "$_v" | cut -d/ -f1) ;;
+    esac
+    case "$_v" in
+        \[*\]*)
+            _host=$(printf '%s' "$_v" | sed -n 's/^\[\([^]]*\)\]\(:[0-9][0-9]*\)\{0,1\}$/\1/p')
+            [ -n "$_host" ] && _m3x_ip "$_host" || return 1
+            case "$_v" in *]:*)
+                _port=$(printf '%s' "$_v" | sed 's/^.*\]://')
+                [ "$_port" -ge 1 ] 2>/dev/null && [ "$_port" -le 65535 ] || return 1 ;;
+            esac ;;
+        *:*)
+            if _m3x_ip "$_v"; then return 0; fi
+            _host=$(printf '%s' "$_v" | sed 's/:[^:]*$//')
+            _port=$(printf '%s' "$_v" | sed 's/^.*://')
+            case "$_port" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$_port" -ge 1 ] 2>/dev/null && [ "$_port" -le 65535 ] || return 1
+            _m3x_ipv4 "$_host" || _fk_valid_domain "$_host" ;;
+        *) _m3x_ipv4 "$_v" || _fk_valid_domain "$_v" ;;
+    esac
+}
+_m4_dns_parse() {
+    local _raw="$1" _type _server=''
+    _raw=$(printf '%s' "$_raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$(printf '%s' "$_raw" | wc -c)" -le 260 ] || return 1
+    case "$_raw" in
+        *' '*) _type=$(printf '%s' "$_raw" | cut -d' ' -f1); _server=$(printf '%s' "$_raw" | cut -d' ' -f2-) ;;
+        *) _type=$_raw ;;
+    esac
+    case "$_type" in
+        udp|dot|doh) [ -n "$_server" ] && _m4_dns_address "$_type" "$_server" || return 1 ;;
+        provider) [ -z "$_server" ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    M4_DNS_TYPE=$_type M4_DNS_SERVER=$_server
+}
+_m4_dns_apply() {
+    local _op="$1" _idx="$2" _txt="$3" _count _sec _new _target _pos
+    _podkop_exp_v2 && [ "$PODKOP_UCI" = podkop ] || return 5
+    [ "$(uci -q get podkop.settings 2>/dev/null)" = settings ] || return 5
+    _count=$(_m4_dns_count)
+    case "$_count" in ''|*[!0-9]*) return 5 ;; esac
+    [ "$_count" -le 32 ] || return 5
+    case "$_op" in
+        add)
+            [ "$_count" -lt 16 ] || return 5
+            _m4_dns_parse "$_txt" || return 5
+            _new=$(uci -q add podkop dns_server) || return 1
+            case "$_new" in ''|*[!A-Za-z0-9_]*) uci -q revert podkop; return 1 ;; esac
+            _sec="podkop.$_new" ;;
+        edit|del|up|down) _sec=$(_m4_dns_path "$_idx") || return 5 ;;
+        *) return 5 ;;
+    esac
+    case "$_op" in
+        add|edit)
+            [ "$_op" != edit ] || _m4_dns_parse "$_txt" || return 5
+            uci -q set "$_sec.type=$M4_DNS_TYPE" || { uci -q revert podkop; return 1; }
+            if [ "$M4_DNS_TYPE" = provider ]; then
+                if uci -q get "$_sec.server" >/dev/null 2>&1; then
+                    uci -q delete "$_sec.server" || { uci -q revert podkop; return 1; }
+                fi
+            else
+                uci -q set "$_sec.server=$M4_DNS_SERVER" || { uci -q revert podkop; return 1; }
+            fi ;;
+        del)
+            [ "$_count" -gt 1 ] || return 5
+            uci -q delete "$_sec" || { uci -q revert podkop; return 1; } ;;
+        up|down)
+            if [ "$_op" = up ]; then
+                [ "$_idx" -gt 0 ] || return 5
+                _target=$((_idx - 1))
+            else
+                [ "$_idx" -lt "$((_count - 1))" ] || return 5
+                _target=$((_idx + 1))
+            fi
+            _pos=$(_m4_dns_abspos "$_target")
+            case "$_pos" in ''|*[!0-9]*) return 5 ;; esac
+            uci -q reorder "$_sec=$_pos" || { uci -q revert podkop; return 1; } ;;
+    esac
+    _fk_txn_commit_reload
+}
+_m4_dns_ui() {
+    local _cmd="$1" _mid="$2" _txt="$3" _state="$4" _idx _count _sec _n _typ _server _rows _rc _target _saved _action
+    _podkop_exp_v2 && [ "$PODKOP_UCI" = podkop ] || return
+    if [ "$_cmd" = STATE_INPUT ]; then
+        _saved=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+        _target=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        case "$_target" in ''|*[!0-9]*) _target='' ;; esac
+        rm -f "$STATE_FILE"; delete_message "$CALLBACK_MSG_ID"
+        [ "$_saved" = "$PODKOP_UCI:$PODKOP_VARIANT" ] || { send_message "$E_WARN Движок изменился, ввод отменён." ""; return; }
+        case "$_state" in
+            wait_m4_dns_add) _m4_dns_apply add 0 "$_txt"; _rc=$? ;;
+            wait_m4_dns_edit_*)
+                _idx=$(printf '%s' "$_state" | sed 's/^wait_m4_dns_edit_//')
+                _m4_dns_apply edit "$_idx" "$_txt"; _rc=$? ;;
+            *) return ;;
+        esac
+        [ "$_rc" -eq 0 ] || { [ "$_rc" -eq 5 ] && send_message "$E_WARN Недопустимый формат DNS, индекс или операция. Запись отменена." "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""; }
+        _m4_dns_ui m4_dns "$_target" "" ""
+        return
+    fi
+    case "$_cmd" in m4_dns|m4_dns_item_*) rm -f "$STATE_FILE" ;; esac
+    case "$_cmd" in
+        m4_dns)
+            _count=$(_m4_dns_count); _rows=''; _n=0
+            while [ "$_n" -lt "$_count" ] && [ "$_n" -lt 16 ]; do
+                _sec=$(_m4_dns_path "$_n") || break
+                _typ=$(uci -q get "$_sec.type" 2>/dev/null); [ -n "$_typ" ] || _typ=doh
+                _server=$(uci -q get "$_sec.server" 2>/dev/null)
+                [ "$_typ" = provider ] && _server='DNS провайдера'
+                _rows="$_rows$(printf '[{"text":"%s. %s · %s","callback_data":"m4_dns_item_%s"}],' "$((_n+1))" "$(json_escape "$_typ")" "$(json_escape "$(_utf8_head "$_server" 55)")" "$_n")"
+                _n=$((_n + 1))
+            done
+            send_or_edit "$_mid" "$E_SET <b>Упорядоченные DNS Podkop Experimental</b>
+Изменения применяются с резервной копией. При отсутствии секций используется старый settings.dns_server." \
+                "{\"inline_keyboard\":[$_rows[{\"text\":\"Добавить DNS\",\"callback_data\":\"m4_dns_add\"}],[{\"text\":\"Назад\",\"callback_data\":\"m3x_dns\"}]]}" ;;
+        m4_dns_item_*)
+            _idx=$(printf '%s' "$_cmd" | sed 's/^m4_dns_item_//')
+            _sec=$(_m4_dns_path "$_idx") || return
+            _typ=$(uci -q get "$_sec.type" 2>/dev/null)
+            _server=$(uci -q get "$_sec.server" 2>/dev/null)
+            send_or_edit "$_mid" "$(printf '%s <b>DNS #%s</b>\nТип: <code>%s</code>\nАдрес: <code>%s</code>' "$E_SET" "$((_idx+1))" "$(html_escape "$_typ")" "$(html_escape "$_server")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"Изменить\",\"callback_data\":\"m4_dns_edit_$_idx\"}],[{\"text\":\"↑\",\"callback_data\":\"m4_dns_up_$_idx\"},{\"text\":\"↓\",\"callback_data\":\"m4_dns_down_$_idx\"}],[{\"text\":\"Удалить\",\"callback_data\":\"m4_dns_confirm_$_idx\"}],[{\"text\":\"Назад\",\"callback_data\":\"m4_dns\"}]]}" ;;
+        m4_dns_add|m4_dns_edit_*)
+            _idx=$(printf '%s' "$_cmd" | sed 's/^m4_dns_edit_//')
+            if [ "$_cmd" = m4_dns_add ]; then _action=add
+            else _m4_dns_path "$_idx" >/dev/null || return; _action="edit_$_idx"; fi
+            printf 'wait_m4_dns_%s\n%s\n' "$_action" "$PODKOP_UCI:$PODKOP_VARIANT" > "$STATE_FILE"
+            send_or_edit "$_mid" "$E_EDIT Формат: <code>udp 1.1.1.1</code>, <code>dot dns.google:853</code>, <code>doh dns.google/dns-query</code> или <code>provider</code>." \
+                '{"inline_keyboard":[[{"text":"Отмена","callback_data":"m4_dns"}]]}' ;;
+        m4_dns_confirm_*)
+            _idx=$(printf '%s' "$_cmd" | sed 's/^m4_dns_confirm_//')
+            _m4_dns_path "$_idx" >/dev/null || return
+            [ "$(_m4_dns_count)" -gt 1 ] || { send_message "$E_WARN Последний DNS удалять нельзя: сначала добавьте замену." ""; return; }
+            send_or_edit "$_mid" "$E_WARN Удалить DNS #$((_idx+1))?" \
+                "{\"inline_keyboard\":[[{\"text\":\"Подтвердить\",\"callback_data\":\"m4_dns_del_$_idx\"}],[{\"text\":\"Отмена\",\"callback_data\":\"m4_dns_item_$_idx\"}]]}" ;;
+        m4_dns_del_*|m4_dns_up_*|m4_dns_down_*)
+            _idx=$(printf '%s' "$_cmd" | sed 's/^.*_//')
+            _action=$(printf '%s' "$_cmd" | cut -d_ -f3)
+            _m4_dns_apply "$_action" "$_idx" ''; _rc=$?
+            [ "$_rc" -eq 0 ] && _m4_dns_ui m4_dns "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" "" ;;
+    esac
+}
+# --- end 0.20.3-dev4 native DNS rows ---
+
 
 # 0.20.3: native Forkop 2 section actions and Podkop 0.8 Mixed Proxy.
 _m3_section_extra() {
@@ -21344,6 +21520,7 @@ handle_command() {
         esac
         case "$state" in
             wait_m3x_*) _m3x_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
+            wait_m4_dns_*) _m4_dns_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_port) _m3_section_extra STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_*) _m3_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
@@ -21390,6 +21567,8 @@ handle_command() {
         "doc_to_runtime") delete_message "$mid"; _handle_bot "cmd_runtime" "" "" "" ;;
         "delete_msg")     delete_message "$mid" ;;
         m3x_*) _m3x_ui "$cmd" "$mid" "" "" ;;
+        m4_dns_*) _m4_dns_ui "$cmd" "$mid" "" "" ;;
+        m4_dns) _m4_dns_ui "$cmd" "$mid" "" "" ;;
         m3_action*|m3_mixed*|m3_port) _m3_section_extra "$cmd" "$mid" "" "" ;;
         m3_sec|m3_sw_*|m3_do_enabled_*|m3_choose*|m3_global|m3_apply_*|m3_log*)
             _m3_settings_ui "$cmd" "$mid" "" "" ;;
