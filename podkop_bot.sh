@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.20.3-dev4
+# Podkop Telegram Bot v0.20.3-dev5
 # Variant-aware (original / evolution / netshift / plus / forkop), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -32,7 +32,7 @@ BOT_DIR="/tmp/podkop_bot"
 
 # Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
 # header comment at the top of this file when bumping (it is not auto-derived).
-BOT_VERSION="0.20.3-dev4"
+BOT_VERSION="0.20.3-dev5"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
