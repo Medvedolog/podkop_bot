@@ -11227,7 +11227,7 @@ _m4_adv_ui() {
             fi
             _rows=''
             for _field in $_fields; do
-                _val=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null)
+                _val=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null || true)
                 [ -n "$_val" ] || _val='—'
                 _rows="$_rows$(printf '[{"text":"%s: %s","callback_data":"m4_adv_field_%s"}],' "$_field" "$(json_escape "$(_utf8_head "$_val" 36)")" "$_field")"
             done
@@ -11237,7 +11237,7 @@ _m4_adv_ui() {
         m4_adv_field_*)
             _field=$(printf '%s' "$_cmd" | sed 's/^m4_adv_field_//')
             _kind=$(_m4_adv_kind "$_field") || return
-            _val=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null)
+            _val=$(uci -q get "$PODKOP_UCI.settings.$_field" 2>/dev/null || true)
             [ -n "$_val" ] || _val='—'
             _rows=''
             if [ "$_kind" = scalar ]; then
