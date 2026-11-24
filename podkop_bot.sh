@@ -10466,6 +10466,111 @@ EOF
 # ------------------------------------------------------------------------------
 # 9.3: Core Podkop Settings
 # ------------------------------------------------------------------------------
+# --- 0.20.3: Modern Forkop 2 / Podkop Experimental UCI editing ---
+_m3_field_kind() {
+    if _forkop_v2; then
+        case "$1" in
+            destinations) echo text ;;
+            ports|only_devices|fully_routed_ips|community_lists|rule_set|rule_set_with_subnets) echo list ;;
+            *) return 1 ;;
+        esac
+    elif _podkop_exp_v2; then
+        case "$1" in
+            user_domains|user_subnets|community_lists|only_devices|fully_routed_ips|local_domain_lists|local_subnet_lists|remote_domain_lists|remote_subnet_lists) echo list ;;
+            *) return 1 ;;
+        esac
+    else
+        return 1
+    fi
+}
+_m3_field_label() {
+    case "$1" in
+        destinations) echo 'Домены и IP' ;;
+        ports) echo 'Порты' ;;
+        only_devices) echo 'Только для устройств' ;;
+        fully_routed_ips) echo 'Весь трафик устройств' ;;
+        community_lists) echo 'Встроенные списки' ;;
+        rule_set) echo 'Наборы правил' ;;
+        rule_set_with_subnets) echo 'Наборы с подсетями' ;;
+        user_domains) echo 'Домены' ;;
+        user_subnets) echo 'Подсети' ;;
+        local_domain_lists) echo 'Локальные домены' ;;
+        local_subnet_lists) echo 'Локальные подсети' ;;
+        remote_domain_lists) echo 'Удалённые домены' ;;
+        remote_subnet_lists) echo 'Удалённые подсети' ;;
+        *) echo "$1" ;;
+    esac
+}
+_m3_valid_item() {
+    local _f="$1" _v="$2"
+    [ -n "$_v" ] || return 1
+    printf '%s' "$_v" | grep -q '[[:cntrl:]]' && return 1
+    case "$_v" in *[[:space:]]*) return 1 ;; esac
+    case "$_f" in
+        ports) _fk_valid_port "$_v" ;;
+        only_devices|fully_routed_ips|user_subnets)
+            if _forkop_v2 && [ "$_v" = '@system' ]; then return 0; fi
+            case "$_v" in
+                *:*) printf '%s' "$_v" | grep -Eq '^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$' ;;
+                *) validate_ip_or_cidr "$_v" ;;
+            esac ;;
+        community_lists) printf '%s' "$_v" | grep -Eq '^[A-Za-z0-9_.-]+$' ;;
+        rule_set|rule_set_with_subnets|remote_domain_lists|remote_subnet_lists)
+            case "$_v" in https://*|http://*|/*) return 0 ;; *) return 1 ;; esac ;;
+        local_domain_lists|local_subnet_lists)
+            case "$_v" in /*) return 0 ;; *) return 1 ;; esac ;;
+        destinations|user_domains) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+_m3_apply_items() {
+    local _op="$1" _f="$2" _input="$3" _sec="$4" _kind _key _line _n=0 _mode _old
+    _kind=$(_m3_field_kind "$_f") || return 5
+    [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return 5
+    case "$_op:$_kind" in add:list|del:list|replace:text) ;; *) return 5 ;; esac
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line=$(printf '%s' "$_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$_line" ] || continue
+        _m3_valid_item "$_f" "$_line" || return 5
+        _n=$((_n + 1))
+        [ "$_n" -le 80 ] || return 5
+    done <<M3VALUES
+$_input
+M3VALUES
+    [ "$_n" -gt 0 ] || return 5
+    _key="$PODKOP_UCI.$_sec.$_f"
+    if [ "$_kind" = text ]; then
+        _fk_stage_set "$_key" "$_input" || return 1
+    else
+        if _podkop_exp_v2 && [ "$_op" = add ]; then
+            _mode=''
+            case "$_f" in
+                user_domains) _mode=user_domain_list_type ;;
+                user_subnets) _mode=user_subnet_list_type ;;
+            esac
+            if [ -n "$_mode" ]; then
+                _old=$(uci -q get "$PODKOP_UCI.$_sec.$_mode" 2>/dev/null)
+                [ "$_old" != text ] || return 5
+                [ "$_old" = dynamic ] || _fk_stage_set "$PODKOP_UCI.$_sec.$_mode" dynamic || return 1
+            fi
+        fi
+        # Mutate exact items; never reconstruct lists by splitting existing UCI data.
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            _line=$(printf '%s' "$_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -n "$_line" ] || continue
+            if [ "$_op" = add ]; then
+                uci add_list "$_key=$_line" || { uci -q revert "$PODKOP_UCI"; return 1; }
+            else
+                uci -q del_list "$_key=$_line" || { uci -q revert "$PODKOP_UCI"; return 1; }
+            fi
+        done <<M3VALUES
+$_input
+M3VALUES
+    fi
+    _fk_txn_commit_reload
+}
+# --- end 0.20.3 editing primitives ---
+
 _handle_settings() {
     local cmd="$1" mid="$2" text="$3" state="$4"
     local sec=$(get_active_section)
