@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.19.24
+# 🤖 podkop_bot 0.20.2
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
-[![version](https://img.shields.io/badge/version-0.19.24-blue?style=flat-square)](CHANGELOG_RUS.md)
+[![version](https://img.shields.io/badge/version-0.20.2-blue?style=flat-square)](CHANGELOG_RUS.md)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#-лицензия)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-24.x%20%7C%2025.x-00B5E2?style=flat-square&logo=openwrt&logoColor=white)](https://openwrt.org)
 [![POSIX ash](https://img.shields.io/badge/POSIX%20ash-curl%20%2B%20jq-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](podkop_bot.sh)
@@ -15,10 +15,18 @@
 
 </div>
 
-<!-- experimental-release-status -->
-> **Опубликована тестовая версия podkop_bot/BearGuard 0.20.1** для Forkop 2.0 и Podkop Experimental v0.8.13: [исходный скрипт бота 0.20.1](https://raw.githubusercontent.com/Medvedolog/podkop_bot/845068c4569240e5448537e537b6727fa347eaf9/podkop_bot.sh) · [ручное обновление через Telegram](#как-вручную-обновить-podkop_bot-до-0201-через-telegram-тестовая-ветка) · [pre-release APK/IPK 0.20.1-r1](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.1-r1). Ветка `main` и штатная установка бота остаются стабильными 0.19.24. Проверки CI завершены, **испытания AX6000 ещё не подтверждены**.
+> **0.20.2 — стабильный канал standalone-бота.** Поддержка Podkop Experimental 0.8.21 и Forkop 2.0. Код совпадает с проверенным в CI пререлизом r3; эту сборку на физическом роутере ещё не проверяли. [Обновление из Telegram](#обновление-подкоп-бота-из-telegram) · [История изменений (RU)](CHANGELOG_RUS.md) · [Changelog (EN)](CHANGELOG.md)
 
----
+Диагностика, выгруженная в Telegram, предназначена для передачи в поддержку:
+она не включает сырой UCI, конфиг sing-box и системный журнал. Для подробного
+разбора смотрите оригиналы локально на роутере и не пересылайте их без проверки
+на пароли, токены и ссылки подписок.
+
+### Как проверяется sing-box
+
+- **Podkop Experimental** ([0.8.21](https://github.com/podkop-net/podkop-experimental/releases/tag/v0.8.21), со встроенным Podkop Engine r28): sing-box работает внутри `podkop daemon`. Отдельного процесса не должно быть; состояние читается у самого Podkop через `ubus`. Автозапуск Podkop и готовность движка показываются отдельно.
+- **Обычный Podkop 0.7 и отдельный [Podkop Engine](https://github.com/podkop-net/podkop-engine/blob/v1.14.4-r28/openwrt/podkop-engine/files/sing-box.init):** sing-box всё ещё отдельная служба. Статус берётся у её экземпляра OpenWrt, а не у службы `podkop-engine`, которая только следит за сбоями.
+- «Статус неизвестен» означает, что ответ о состоянии получить не удалось. Это не повод перезапускать Podkop. Доступность прокси и Telegram проверяется отдельно от состояния движка.
 
 [podkop](https://github.com/itdoginfo/podkop) — это сервис маршрутизации трафика для OpenWrt на базе sing-box. Обычно им управляют через LuCI или по SSH; этот бот даёт третий вариант — переключить outbound, поправить списки маршрутизации или снять диагностику прямо из чата, с телефона и откуда угодно.
 
@@ -77,7 +85,7 @@
 ```text
 🖥️ Управление Podkop
 Устройство: AX6000
-Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
+Podkop: 0.7.14-r1 (Podkop) | Бот: v0.20.0
 Секция: main
 Активный прокси: 🇳🇱 NL-vless-reality (main-1-out)
 Подключение бота: Podkop (SOCKS5:192.168.2.1:2080)
@@ -252,25 +260,19 @@ Podkop: 0.7.14-r1 (Podkop) | Бот: v0.19.24
 | NetShift: несколько URL подписки списком | ❌ | ✅ | ❌ | ❌ |
 
 
+> **Forkop 2.0** (`config_version` 2.x) поддерживается с бота 0.20.0. Mixed-прокси секции в нём — отдельный «Сервер» (`server`, `protocol=mixed`, маршрут в секцию): бот берёт оттуда порт и учётную запись и сам создаёт такой сервер, когда вы включаете Mixed-прокси в боте. Ручные ссылки — дочерние `connection_link`, приоритетные группы — `fallback_group`, данные подписок (трафик, срок) бот берёт из Clash API. DNS указывается адресом (`tls://`, `https://`), Zapret и ByeDPI в Forkop 2 нет, фильтры URLTest меняются в LuCI. Forkop 1.x работает как раньше.
+
 > **Forkop.** Мониторинг и диагностика — наравне с Plus. Подписки бот правит нативно, через дочерние секции (`config subscription_url`), действие секции пишет в `action`. Значок 👁 означает, что операция требует создать или удалить дочернюю секцию либо правило Forkop: такие вещи бот показывает как есть и отправляет в LuCI. Записывать в поля, которые backend проигнорирует, — значит соврать об успехе, поэтому бот так не делает.
 
 > **NetShift.** Базовое управление поддерживается целиком. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, режимы `selector_text`/`urltest_text`) показываются только на чтение — править их нужно в LuCI. При обновлении с podkop-evolution на NetShift бот переключает runtime сам, вмешиваться не нужно.
 
 ---
 
-## Как вручную обновить podkop_bot до 0.20.1 через Telegram (тестовая ветка)
+## Обновление Подкоп Бота из Telegram
 
-Этот способ обновляет **только скрипт Telegram-бота**, а не пакет LuCI/BearGuard. Для использования нужен уже работающий бот с кнопкой **«📤 Загрузить скрипт»**, доступ к чату администратора и возможность отправить файл как документ.
+В чате администратора: **Меню → Обслуживание → Обновление бота → Обновить до v0.20.2 → Да, обновить**. Напрямую обновляется только standalone-бот. Он проверяет синтаксис скачанного файла, сохраняет резервную копию предыдущего скрипта и перезапускается. Сборка r3 уже сообщает версию 0.20.2, поэтому для неё повторная установка не нужна.
 
-1. На телефоне или ПК скачайте файл **[podkop_bot.sh 0.20.1, проверенный коммит](https://raw.githubusercontent.com/Medvedolog/podkop_bot/845068c4569240e5448537e537b6727fa347eaf9/podkop_bot.sh)**. Если браузер показывает текст, сохраните его в файл с расширением `.sh`, без `.txt` или `.html`.
-2. Откройте чат со своим ботом: **🏠 Меню → 🔧 Обслуживание → 📤 Загрузить скрипт**.
-3. Отправьте скачанный `podkop_bot.sh` **как файл/документ Telegram**, а не текстом сообщения или архивом. Следуйте запросам подтверждения, которые покажет бот.
-4. Бот проверит заголовок скрипта, `BOT_VERSION` и синтаксис через `busybox ash -n`, создаст резервную копию установленного скрипта (`.bak`), установит новую версию и перезапустится.
-5. Снова откройте **🏠 Меню → 📊 Статус** и проверьте, что версия бота — **0.20.1**. Затем проверьте определение Forkop 2.0 либо Podkop Experimental 0.8.x. Это экспериментальная версия без подтверждённых аппаратных испытаний.
-
-**Важно:** кнопка **«🆕 Обновление бота»** использует обычный канал обновлений и может снова поставить стабильную 0.19.24. Для установки конкретно тестовой 0.20.1 используйте **«📤 Загрузить скрипт»**. APK через Telegram-меню загрузки скрипта не устанавливается.
-
-**BearGuard/LuCI 0.20.1-r1:** [готовый pre-release APK/IPK](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.1-r1) из успешной сборки `ff410fe37`. Пакеты устанавливаются как LuCI/BearGuard через менеджер пакетов OpenWrt (APK на 25.12+, IPK на 24.10). Кнопка «Загрузить скрипт» через Telegram обновляет **только бота**, а не LuCI-пакет. Стабильный релиз не затронут.
+Если обычное обновление не скачивается, скачайте [скрипт из стабильного релиза](https://github.com/Medvedolog/podkop_bot/releases/tag/v0.20.2) и отправьте его **файлом** в чате администратора через **Обслуживание → Загрузить скрипт**. Для BearGuard обновляйте пакет через LuCI или менеджер пакетов: Telegram не обновляет пакет LuCI.
 
 ## 🚀 Быстрая установка
 
@@ -351,7 +353,7 @@ ash install.sh --unattended --action update-luci
 ## 📋 Требования
 
 * OpenWrt 24.x / 25.x или ImmortalWrt
-* Установленный и настроенный podkop (original, netshift/evolution, plus или forkop) 0.7.x с включённым Mixed Proxy Port
+* Установленный и настроенный podkop (original, netshift/evolution, plus, forkop 1.x или Forkop 2) с включённым Mixed Proxy (в Forkop 2 — сервер `mixed`, направленный в секцию)
 * Пакеты: `curl`, `jq` (устанавливаются автоматически)
 * Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
 * TG User ID администратора(-ов) — например через [@Getmyid_Work_Bot](https://t.me/Getmyid_Work_Bot)

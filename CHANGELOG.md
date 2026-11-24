@@ -1,19 +1,50 @@
 # Changelog
 
-<!-- experimental-0.20.0-r1-status -->
-## v0.20.0 — experimental branch (Forkop 2 / Podkop Experimental 0.8.x)
+## v0.20.2 — engine status and 0.20.1 regression fixes
 
-- **Manual Telegram update:** download [`podkop_bot.sh` v0.20.0](https://raw.githubusercontent.com/Medvedolog/podkop_bot/claude/funny-pascal-1kzrka/podkop_bot.sh); in your existing bot open **Menu → Maintenance (Обслуживание) → Upload script (📤 Загрузить скрипт)**, send the `.sh` file as a Telegram **document**, confirm the requested action, then verify **Status → 0.20.0**. The bot checks version and shell syntax, keeps a `.bak` backup and restarts. The normal “Update bot” command tracks the stable channel, not this test branch. [Step-by-step README](README.md#как-вручную-обновить-podkop_bot-до-0200-через-telegram-тестовая-ветка). This does not update LuCI/APK.
+- Follow-up review: Telegram diagnostic exports omit secrets and raw configuration/log content. An unavailable service bus stays unknown in the status card. Credential-bearing proxy URLs no longer travel in curl arguments.
+- Fixed false “sing-box stopped” in the status card and watchdog on Podkop Experimental 0.8.14 and 0.8.21. Read the embedded engine status from Podkop rather than searching for a separate process.
+- Standalone Podkop Engine still runs as the procd-managed `sing-box` service. An unavailable status is not treated as a confirmed stop, and an unrelated process does not count as Podkop's engine.
 
+- Fixed the Experimental section servers menu printing literal shell variables, incorrect selection mode and cure count.
+- Forkop 2 Clash selection now decodes encoded Cyrillic/space/slash group tags, verifies Selector/Fallback membership and re-encodes; URLTest/non-member PUT stays blocked, while provider subscription refresh PUT is allowed.
+- Podkop Experimental Clash groups resolve by rule label with duplicate-name disambiguation.
+- Experimental URLTest test addresses are stored as a UCI list; update checks prevent downgrading a newer bundled bot.
+- Promoted the exact r3 script to the stable standalone update channel. CI and fixture checks passed; physical OpenWrt validation is still pending.
 
-- **Status:** the implementation is on [`claude/funny-pascal-1kzrka`](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka); `main` and the normal installer remain on stable 0.19.24. The [BearGuard 0.20.0-r1 prerelease](https://github.com/Medvedolog/luci-app-podkop-bearguard/releases/tag/0.20.0-r1) now includes APK/IPK assets built from commit `3ce3983`. Hardware validation is still pending.
-- **Forkop 2.0:** UCI `config_version 2` support, Mixed Proxy via `server` and `server_client`, `connection_link` links, subscription information via Clash API, URLTest/Fallback, readable names, and transactional rollback for configuration changes.
-- **Podkop Experimental 0.8.x:** `podkop-exp` detection; for 0.8.8+ (`config_version 2`), editing section servers, subscription/link sources and URLTest settings with rollback. Older configurations follow the plain Podkop model. Experimental updates from Telegram are intentionally blocked.
-- **Limitations:** some Forkop 2 settings remain read-only in the bot and must be edited through LuCI. See [full branch changelog](https://github.com/Medvedolog/podkop_bot/tree/claude/funny-pascal-1kzrka/CHANGELOG.md).
+---
+
+## v0.20.1 — experimental compatibility fixes
+
+- Historical test build; see the [0.20.2 stable release](https://github.com/Medvedolog/podkop_bot/releases/tag/v0.20.2) for the ordinary Telegram update path.
+
+- Updated bot version and checked Podkop Experimental v0.8.13 (`podkop-exp`, config version 2), including `source`, `member`, `server_choice` (fastest/loss/balance) and `cure`. The server menu now shows the actual choice and read-only cure count; editing sources preserves the engine's cure sections.
+- Forkop 2 Mixed Proxy toggles now use transactional UCI commit/reload with rollback, and display the bound UCI server name. Regression coverage includes two mixed servers on ports 2080 and 2081.
+- The upstream Experimental installer is interactive and may remove conflicting packages. Automated Telegram updates remain blocked. Changes are not yet hardware validated.
 
 ---
 
 
+## v0.20.0
+
+- **FORKOP 2.0:** support for Forkop 2.0 (`forkop.settings.config_version` 2.x), shown as "Forkop 2". Forkop 1.x, Forkop X and the other variants are unchanged.
+  - **Mixed proxy** is now a server (`server`, `protocol=mixed`, `routing_mode=section`, `routing_section=<section>`, `listen_port`, `enabled`; accounts in `server_client`). The bot connection (primary SOCKS and reserve mixed proxies of other sections), its credentials, the section's Mixed toggle and port read and write that server; the bot creates one (named as Forkop's migration names it) when you turn Mixed on. Without a section-bound server the primary channel uses an enabled rules-mode mixed server.
+  - **Links** are `connection_link` children (`uri`, `name`, `order`) instead of `selector_proxy_links`: list, add, delete and the link of the active server work on them; an added link gets a unique name without `/`.
+  - **Clash API:** a section's group is its label, links and providers `<label>/<name>`; names are shown without the prefix, the tag→link map comes from the `parser` outbounds, and group names in `/proxies/<group>` paths are percent-encoded (labels may hold spaces or Cyrillic).
+  - **Subscriptions:** traffic and expiry from `subscriptionInfo` in `/providers/proxies` (Forkop 2 has no section cache or metadata command); the node prefix is `override_prefix`.
+  - **Priority groups** → `fallback_group` / `fallback_level`: levels by `server_filter_mode`, countries as flag patterns in `include_regex`; the "fastest" options are gone in Forkop 2 and hidden. URLTest filters are shown read-only (edited in LuCI).
+  - **DNS:** the protocol is part of the server address (`tls://`, `https://`); the protocol switch is hidden. Zapret / Zapret2 / ByeDPI are not offered; Podkop checks run `check_service`, `check_dns`, `check_traffic`, `check_servers` instead of `global_check`.
+- **PODKOP EXPERIMENTAL 0.8** (`podkop-exp`, merged from the 0.19.25-dev6 dev branch): detected by its installed package before plain Podkop; updating Podkop Experimental from Telegram is blocked because its installer may ask to remove packages.
+- **PODKOP EXPERIMENTAL 0.8.8+ (new format, `config_version 2`):** an editor instead of read-only views. "🧩 Серверы секции" — the section's rows: ⭐ servers (URLTest picks the fastest of them) and 🛟 fallbacks in order (a source, direct or block); add, delete, move up or down, "only"/"except" words that pick servers by name. "📚 Источники" — subscriptions and links: add, change the address, update interval, label, add or remove a link, refresh now (`podkop ctl subscription_update`), delete together with its rows; a subscription shows its server count, traffic, expiry and last error. "⏱ Проверка серверов" — the shared URLTest interval, tolerance and test URL. Every write is a transaction with rollback. Podkop Experimental before 0.8.8 keeps the old config format, and the bot handles it as plain Podkop.
+- **TAILSCALE ON THE ROUTER (Forkop 2, from dev6):** the wizard creates Forkop's own `server` with `protocol=tailscale` (disabled; a separate button enables it) when the core has Tailscale, checked through `ubus call forkop state`. The outgoing `tunnel` with `kind=tailscale` is left alone.
+- **PROXY NAMES (from dev4–dev5):** short button names without "label/subN/", URLTest/Fallback groups marked as groups, the selected URLTest node shown; Clash API falls back to `forkop clash_api` when the controller is unreachable by address or secret; a server switch is sent once.
+- **SUBSCRIPTIONS ON FORKOP 2:** "📡 Подписки" in the proxy menu lists the section's subscriptions: add (an `https://…` address or a `/…` file; like LuCI — hourly updates, default request headers), change the address, settings (interval, download through another section, node prefix), refresh now (one or all, Clash API `PUT /providers/proxies/<label/tag>`), delete. Addresses are shown in Telegram without tokens or credentials.
+- **URLTEST ON FORKOP 2:** "⚡ URLTest" manages the section's auto-select groups: create, delete, test URL, interval, tolerance, interrupting connections and rotation filters — "keep only" and "exclude" take country codes (`DE NL`, turned into flags) or a regular expression on the server name; the filter mode (`all` / `include` / `exclude`) follows. Select the group in the proxy list to use it.
+- **EVERY WRITE IS A TRANSACTION:** copy of `/etc/config/forkop` → write → reload; a change Forkop rejects is rolled back.
+- **STILL READ-ONLY on Forkop 2:** section routing conditions, devices, detour, domain and subnet lists, global exclusions, text proxy lists, hand-picked servers in filters — change them in LuCI.
+- **INSTALLER:** reads the Forkop 2 mixed server for the bot's SOCKS endpoint and the final summary.
+
+---
 ## v0.19.24
 
 - **FIXED (LAN address with a CIDR mask):** OpenWrt 25.12 stores `network.lan.ipaddr` as `192.168.1.1/24`. Where the sing-box config gave no listen address the bot used the raw value, so the mixed proxy became `socks5h://192.168.1.1/24:2080` and the Clash API fallback `192.168.1.1/24:9090`. Podkop 0.8 (podkop-exp) has sing-box built in and no `/etc/sing-box/config.json`, so it always hit this fallback. The LAN address is now the first `ipaddr` value without the mask.
