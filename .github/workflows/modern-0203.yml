@@ -1,0 +1,22 @@
+name: Modern 0.20.3 compatibility
+on:
+  push:
+    branches:
+      - dev/0.20.3-legacy-parity
+  pull_request:
+    paths:
+      - podkop_bot.sh
+      - tools/test-modern-0203.sh
+      - .github/workflows/modern-0203.yml
+  workflow_dispatch:
+jobs:
+  modern-uci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate ash-compatible syntax
+        run: sh -n podkop_bot.sh
+      - name: Modern routing UCI mock
+        run: sh tools/test-modern-0203.sh
+      - name: Provider compatibility smoke
+        run: sh tools/check-provider-compat.sh
