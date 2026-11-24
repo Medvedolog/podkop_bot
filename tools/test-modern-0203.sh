@@ -91,6 +91,7 @@ send_message() { :; }
 _fail() { echo "UI test failed: $*" >&2; exit 1; }
 _keyboard() { jq -e "$1" "$tmp/keyboard.json" >/dev/null || _fail "$1"; }
 
+set -x
 PODKOP_VARIANT=forkop PODKOP_UCI=forkop
 _m3_ui m3_main 42 '' ''
 _keyboard '.inline_keyboard[0][0].callback_data=="m3_route"'
