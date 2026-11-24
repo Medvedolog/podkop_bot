@@ -10671,7 +10671,7 @@ _m3_settings_ui() {
             _v=$(uci -q get "$PODKOP_UCI.$_sec.enabled" 2>/dev/null); [ -n "$_v" ] || _v=1
             _rows='[{"text":"Включить / выключить","callback_data":"m3_sw_enabled"}],'
             if [ "$_variant" = experimental ]; then
-                _rows="$_rows"'[{"text":"Выбор: fastest / loss / balance","callback_data":"m3_choose"}],[{"text":"Mixed Proxy","callback_data":"m3_mixed"},{"text":"Порт Mixed","callback_data":"m3_port"}],'
+                _rows="$_rows"'[{"text":"Выбор: fastest / loss / balance","callback_data":"m3_choose"}],[{"text":"Mixed Proxy","callback_data":"m3_mixed"},{"text":"Порт Mixed","callback_data":"m3_port"}],[{"text":"Логин Mixed","callback_data":"m3_auth_username"},{"text":"Пароль Mixed","callback_data":"m3_auth_password"},{"text":"Сброс логина","callback_data":"m3_auth_reset"}],'
             else
                 _rows="$_rows"'[{"text":"Действие маршрута","callback_data":"m3_action"}],'
             fi
@@ -11342,7 +11342,34 @@ _m3_section_extra() {
         rm -f "$STATE_FILE"
         delete_message "$CALLBACK_MSG_ID"
         [ "$_saved" = "$_sec" ] && _podkop_exp_v2 || return
-        [ "$_state" = wait_m3_port ] || return
+        case "$_state" in
+            wait_m3_auth_username|wait_m3_auth_password)
+                # Never echo credentials in Telegram menus or log them.
+                [ "$(printf '%s' "$_txt" | wc -c)" -le 256 ] && [ -n "$_txt" ] || {
+                    send_message "$E_ERR Значение пустое или слишком длинное (до 256 байт)." ""; return;
+                }
+                printf '%s' "$_txt" | LC_ALL=C grep -q '[[:cntrl:]]' && {
+                    send_message "$E_ERR Управляющие символы запрещены." ""; return;
+                }
+                case "$_state" in
+                    wait_m3_auth_username)
+                        [ "$(printf '%s' "$_txt" | wc -c)" -le 128 ] || {
+                            send_message "$E_ERR Логин не длиннее 128 байт." ""; return;
+                        }
+                        case "$_txt" in *[[:space:]]*)
+                            send_message "$E_ERR Пробелы в логине запрещены." ""; return ;;
+                        esac
+                        _new=mixed_proxy_username ;;
+                    *)  _new=mixed_proxy_password ;;
+                esac
+                _fk_stage_set "$PODKOP_UCI.$_sec.$_new" "$_txt" || return
+                _fk_txn_commit_reload; _rc=$?
+                [ "$_rc" -eq 0 ] && send_message "$E_OK Учётные данные сохранены (значение скрыто). Удалите сообщение с секретом из чата." "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+                _m3_settings_ui m3_sec "$_target_mid" "" ""
+                return ;;
+            wait_m3_port) ;;
+            *) return ;;
+        esac
         _new=$(printf '%s' "$_txt" | tr -d '\r\n ')
         case "$_new" in ''|*[!0-9]*) send_message "$E_ERR Порт должен быть числом 1–65535." ""; return ;; esac
         [ "$_new" -ge 1 ] && [ "$_new" -le 65535 ] || { send_message "$E_ERR Неверный порт." ""; return; }
@@ -11386,6 +11413,25 @@ _m3_section_extra() {
             _podkop_exp_v2 || return
             _new=$(printf '%s' "$_cmd" | sed 's/^.*_//')
             _fk_stage_set "$PODKOP_UCI.$_sec.mixed_proxy_enabled" "$_new" || return
+            _fk_txn_commit_reload; _rc=$?
+            [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
+            ;;
+        m3_auth_username|m3_auth_password)
+            _podkop_exp_v2 || return
+            _new=${_cmd#m3_auth_}
+            printf 'wait_m3_auth_%s\n%s\n' "$_new" "$_sec" > "$STATE_FILE"
+            send_or_edit "$_mid" "$E_WARN Введите ${_new#mixed_proxy_} для Mixed Proxy. Значение не будет показываться в меню, но Telegram хранит отправленные сообщения. Удалите сообщение после сохранения. Для полного отключения авторизации используйте «Сброс логина»." \
+                '{"inline_keyboard":[[{"text":"Отмена","callback_data":"m3_sec"}]]}'
+            ;;
+        m3_auth_reset)
+            _podkop_exp_v2 || return
+            send_or_edit "$_mid" "$E_WARN Удалить логин и пароль Mixed Proxy? Прокси может стать доступен без авторизации с вашей локальной сети." \
+                '{"inline_keyboard":[[{"text":"Удалить учётные данные","callback_data":"m3_auth_reset_confirm"}],[{"text":"Отмена","callback_data":"m3_sec"}]]}'
+            ;;
+        m3_auth_reset_confirm)
+            _podkop_exp_v2 || return
+            _fk_stage_delete "$PODKOP_UCI.$_sec.mixed_proxy_username" || return
+            _fk_stage_delete "$PODKOP_UCI.$_sec.mixed_proxy_password" || return
             _fk_txn_commit_reload; _rc=$?
             [ "$_rc" -eq 0 ] && _m3_settings_ui m3_sec "$_mid" "" "" || send_message "$(_fk_txn_fail_msg "$_rc")" ""
             ;;
@@ -21747,7 +21793,7 @@ handle_command() {
             wait_m3x_*) _m3x_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m4_dns_*) _m4_dns_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m4_adv_*) _m4_adv_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
-            wait_m3_port) _m3_section_extra STATE_INPUT "$mid" "$cmd" "$state" ;;
+            wait_m3_port|wait_m3_auth_*) _m3_section_extra STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_*) _m3_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -21797,7 +21843,7 @@ handle_command() {
         m4_dns) _m4_dns_ui "$cmd" "$mid" "" "" ;;
         m4_adv_*) _m4_adv_ui "$cmd" "$mid" "" "" ;;
         m4_adv) _m4_adv_ui "$cmd" "$mid" "" "" ;;
-        m3_action*|m3_mixed*|m3_port) _m3_section_extra "$cmd" "$mid" "" "" ;;
+        m3_action*|m3_mixed*|m3_port|m3_auth_*) _m3_section_extra "$cmd" "$mid" "" "" ;;
         m3_sec|m3_sw_*|m3_do_enabled_*|m3_choose*|m3_global|m3_apply_*|m3_log*)
             _m3_settings_ui "$cmd" "$mid" "" "" ;;
         m3_*) _m3_ui "$cmd" "$mid" "" "" ;;
