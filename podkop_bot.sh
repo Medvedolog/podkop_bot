@@ -9238,7 +9238,7 @@ EOF
             if _forkop_v2; then
                 kb=$(printf '%s' "$kb" | jq -c '
                     .inline_keyboard |= [ .[] | [ .[] | select(.callback_data != "cmd_edit_sub_url" and .callback_data != "do_px_auto_urltest") ] | select(length > 0) ]
-                    | .inline_keyboard |= (.[0:-2] + [[{"text":"📡 Подписки","callback_data":"cmd_edit_sub_url"},{"text":"⚡ URLTest","callback_data":"fk_ut_menu"}]] + .[-2:])' 2>/dev/null)
+                    | .inline_keyboard |= (.[0:-2] + [[{"text":"📡 Подписки","callback_data":"cmd_edit_sub_url"},{"text":"⚡ URLTest","callback_data":"fk_ut_menu"}],[{"text":"🪜 Приоритеты и резерв","callback_data":"fk_pg_menu"}]] + .[-2:])' 2>/dev/null)
             elif _podkop_exp_v2; then
                 kb=$(printf '%s' "$kb" | jq -c '
                     .inline_keyboard |= [
@@ -9248,7 +9248,7 @@ EOF
                               and .callback_data != "do_px_auto_urltest")
                         ] | select(length > 0)
                     ]
-                    | .inline_keyboard |= (.[0:-2] + [[{"text":"🧩 Серверы секции","callback_data":"xp_menu"},{"text":"📚 Источники","callback_data":"xp_src"}]] + .[-2:])' 2>/dev/null)
+                    | .inline_keyboard |= (.[0:-2] + [[{"text":"⭐ Основные / 🛟 резервные","callback_data":"xp_menu"},{"text":"📚 Источники","callback_data":"xp_src"}]] + .[-2:])' 2>/dev/null)
             fi
             local _card_title _sub_url_line=""
             # Show subscription URL(s) for subscription sections
@@ -15113,8 +15113,8 @@ _handle_forkop_0198() {
                 _n=$(_forkop_priority_levels "$_g" 2>/dev/null | grep -c .)
                 _rows="${_rows}[{\"text\":\"$(json_escape "$_name · ${_n} ур.")\",\"callback_data\":\"fkpg_$(json_escape "$_g")\"}],"
             done
-            send_or_edit "$mid" "$(printf '🪜 <b>Priority Groups</b> [<code>%s</code>]\n\nГрупп: <b>%s</b>. Уровни идут сверху вниз: верхний — основной, нижние — резерв.' "$sec" "$_cnt")" \
-                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Новая группа\",\"callback_data\":\"fkpg_add\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"section_settings\"}]]}"
+            send_or_edit "$mid" "$(printf '🪜 <b>Priority Groups</b> [<code>%s</code>]\n\nГрупп: <b>%s</b>. Уровни идут сверху вниз: верхний — основной, нижние — резерв. Изменение порядка влияет на маршрутизацию.' "$sec" "$_cnt")" \
+                "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Новая группа\",\"callback_data\":\"fkpg_add\"}],[{\"text\":\"${E_BACK} К списку прокси\",\"callback_data\":\"proxy_menu\"}]]}"
             ;;
         fkpg_add)
             printf '%s\n' "wait_fkpg_name" > "$STATE_FILE"
