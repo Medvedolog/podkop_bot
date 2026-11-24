@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🤖 podkop_bot 0.20.3-dev4
+# 🤖 podkop_bot 0.20.3-dev5
 
 **Роутер в кармане: управление podkop через Telegram — без SSH и без LuCI**
 
@@ -15,7 +15,7 @@
 
 </div>
 
-> **0.20.3-dev4 — тестовая ветка, не релиз.** Добавлены нативные упорядоченные DNS-секции Podkop Experimental, расширенные DNS fallback/detour/WAN для Forkop 2, IPv6/CIDR-валидация, тесты и синхронизация с [BearGuard PR #27](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/27). Аппаратных испытаний ещё нет. [Подробный план](docs/ROADMAP_0.20.3.md) · [Draft PR #18](https://github.com/Medvedolog/podkop_bot/pull/18).
+> **0.20.3-dev5 — тестовая ветка, не релиз.** Добавлены нативные упорядоченные DNS-секции Podkop Experimental, расширенные DNS fallback/detour/WAN для Forkop 2, IPv6/CIDR-валидация, тесты и синхронизация с [BearGuard PR #27](https://github.com/Medvedolog/luci-app-podkop-bearguard/pull/27). Аппаратных испытаний ещё нет. [Подробный план](docs/ROADMAP_0.20.3.md) · [Draft PR #18](https://github.com/Medvedolog/podkop_bot/pull/18).
 
 > **0.20.2 — стабильный канал standalone-бота.** Поддержка Podkop Experimental 0.8.21 и Forkop 2.0. Код совпадает с проверенным в CI пререлизом r3; эту сборку на физическом роутере ещё не проверяли. [Обновление из Telegram](#обновление-подкоп-бота-из-telegram) · [История изменений (RU)](CHANGELOG_RUS.md) · [Changelog (EN)](CHANGELOG.md)
 
