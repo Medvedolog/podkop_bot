@@ -29,6 +29,8 @@ jobs:
         run: sh tools/test-modern-dns-rows-0203.sh
       - name: Modern DNS/WAN/IPv6 and traffic option regressions
         run: sh tools/test-modern-advanced-0203.sh
+      - name: Mixed Proxy credential UI regression
+        run: sh tools/test-modern-mixed-auth-0203.sh
       - name: IPv4 and IPv6 CIDR boundary tests
         run: sh tools/test-modern-ipv6-0203.sh
       - name: UCI rollback verifies recovery reload
