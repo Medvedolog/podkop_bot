@@ -1,21 +1,27 @@
-# 0.20.3-dev1: legacy functionality parity
+# 0.20.3-dev2 — восстановление управления в Telegram
 
-Target: restore bot-side configuration operations for Forkop 2.0 and Podkop Experimental 0.8.21 without writing retired UCI keys.
+## Реализовано в dev-ветке
 
-## First increment (implemented on dev branch)
+- **Forkop 2.0:** собственный редактор UCI `destinations` (добавить к тексту или заменить целиком), `ports`, `only_devices`, `fully_routed_ips`, `community_lists`, `rule_set`, `rule_set_with_subnets`.
+- **Podkop Experimental 0.8 (схема config_version=2):** редактирование `user_domains`, `user_subnets`, `community_lists`, `only_devices`, `fully_routed_ips`, локальных/удалённых списков доменов и подсетей.
+- Добавление и удаление отдельных значений через `uci add_list`/`del_list`; в Forkop `destinations` — явные операции «Добавить» и «Заменить всё». Существующие значения других полей не реконструируются из текста.
+- Отбраковка неизвестных полей, проверка всей пачки значений до изменения, проверка активной секции в момент обработки. Для Podkop при добавлении динамических доменов/подсетей не перезаписывается действующий текстовый режим.
+- Открыты отдельные Telegram-меню «Маршруты и списки», «Параметры секции», «Общие настройки». Действующие обработчики Forkop 1.x и Podkop 0.7 оставлены без изменений.
+- **Обе платформы:** подтверждаемое включение/выключение секций; глобальные переключатели QUIC и YACD, уровень журнала.
+- **Forkop 2:** смена действия секции `connection/bypass/block/dns` с подтверждением; опции автообновления списков и загрузки списков через прокси.
+- **Podkop Exp:** режимы выбора серверов `fastest/loss/balance`; включение Mixed Proxy и настройка его порта; `exclude_ntp`.
+- Существующая реализация подписок и ссылок (добавление, редактирование, обновление, удаление) сохранена с 0.20.2.
+- Редакторы используют штатную `_fk_txn_commit_reload` с резервной копией конфигурации и попыткой отката при ошибке применения.
+- GitHub Actions: проверка синтаксиса скрипта и имитационные тесты UCI/Telegram-клавиатур для обеих платформ; последний прогон PASS.
 
-- Modern route/list editor for Forkop 2: destinations (one scalar with domains and IPs), ports, only_devices, fully_routed_ips, community_lists, rule_set, rule_set_with_subnets.
-- Modern route/list editor for Podkop Experimental 0.8: user_domains, user_subnets, community_lists, only_devices, fully_routed_ips and local/remote domain/subnet files.
-- Native UCI add_list / del_list, avoid reconstructing existing multi-value strings; explicit whole-field replace for Forkop destinations.
-- Reject unknown keys and invalid batch inputs before making any UCI change.
-- Podkop user_domains/user_subnets dynamic mode enabled when adding entries, without overwriting preexisting text-mode lists.
-- Reuse existing transactional UCI backup/commit/reload/rollback.
-- Old Forkop 1 and Podkop 0.7 handlers unchanged.
+## Не завершено — не считать функциональным паритетом
 
-## Remaining before a 0.20.3 release
+- DNS-серверы, Bootstrap DNS, DNS fallback, сеть и интерфейсы; глобальные исключения, некоторые дополнительные параметры 0.8.21 (IPv6, BitTorrent, per-server `cure`).
+- Полный редактор Forkop 2 для `detour`, каскадов, отдельных фильтров устройств/условий и связанных объектов, которых нет в текущем упрощённом меню.
+- Подробные Mixed Proxy credentials и проверка устойчивого reconnect после изменения порта.
+- Сквозной hardware test на OpenWrt (Forkop 2 + Podkop Experimental 0.8.21), `opkg` и `apk`; проверка rollback при отказе движка; совместимость LuCI/BearGuard нужно проверять отдельно.
+- Ужесточение проверки форматов (например, IPv6, правила DNS) до записи в UCI; на этапе dev часть ошибочных значений может быть отклонена только штатным валидатором движка.
 
-- Restore section action, toggle, Mixed Proxy, native 0.8 fastest/loss/balance and per-server cure controls.
-- Restore global DNS, interface, excluded-IP, QUIC, IPv6, log and list-update settings using per-variant schemas.
-- Add proper support for new upstream flags and device-based routing; clarify 0.8 version-dependent options.
-- Expand mock tests and CI, test real OpenWrt devices for both backends.
-- Preserve existing stable 0.20.2 until hardware validation; this is NOT a release.
+## Политика публикации
+
+Версия `0.20.3-dev2` — **не стабильный релиз**. Ветка `dev/0.20.3-legacy-parity`, черновой PR #18. Не сливать в `main` и не публиковать `v0.20.3` до аппаратных испытаний и доработки недостающих редакторов. Стабильная `v0.20.2` остаётся без изменений.
