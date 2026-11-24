@@ -10718,8 +10718,8 @@ _m3_settings_ui() {
                 [ -n "$_v" ] || { [ "$_field" = list_update_enabled ] && _v=1 || _v=0; }
                 _rows="$_rows$(printf '[{"text":"%s: %s","callback_data":"m3_sw_%s"}],' "$(json_escape "$_field")" "$_v" "$_field")"
             done
-            _rows="$_rows"'[{"text":"Уровень журнала","callback_data":"m3_log"}],'
-            send_or_edit "$_mid" "$(printf '%s <b>Общие настройки</b>\nСовместимые параметры движка. Остальные настройки DNS и интерфейсов пока остаются в LuCI.' "$E_SET")" \
+            _rows="$_rows"'[{"text":"Уровень журнала","callback_data":"m3_log"}],[{"text":"DNS и интерфейсы","callback_data":"m3x_home"}],'
+            send_or_edit "$_mid" "$(printf '%s <b>Общие настройки</b>\nСовместимые параметры движка. DNS и интерфейсы — в отдельном меню.' "$E_SET")" \
                 "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"callback_data\":\"m3_main\"}]]}"
             ;;
         m3_sw_*)
@@ -10753,6 +10753,185 @@ _m3_settings_ui() {
     esac
 }
 
+
+# --- 0.20.3 modern global DNS and interface editors ---
+_m3x_kind() {
+    if _forkop_v2; then
+        case "$1" in dns_server|bootstrap_dns_server|source_network_interfaces) echo list ;; *) return 1 ;; esac
+    elif _podkop_exp_v2; then
+        case "$1" in bootstrap_dns_server) echo scalar ;;
+            source_network_interfaces|routing_excluded_ips) echo list ;; *) return 1 ;; esac
+    else return 1; fi
+}
+_m3x_name() {
+    case "$1" in
+        dns_server) echo 'Основные DNS' ;;
+        bootstrap_dns_server) echo 'Bootstrap DNS' ;;
+        source_network_interfaces) echo 'Входные интерфейсы' ;;
+        routing_excluded_ips) echo 'Исключения маршрутизации' ;;
+    esac
+}
+_m3x_ipv4() {
+    printf '%s\n' "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++)if($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255)exit 1}'
+}
+_m3x_ip() {
+    case "$1" in
+        *:*) [ "$(printf '%s' "$1" | wc -c)" -le 45 ] && printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
+        *) _m3x_ipv4 "$1" ;;
+    esac
+}
+_m3x_valid() {
+    local _f="$1" _v="$2" _h _port
+    [ -n "$_v" ] && [ "$(printf '%s' "$_v" | wc -c)" -le 240 ] || return 1
+    case "$_f" in
+        source_network_interfaces)
+            case "$_v" in lo|-*|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+            [ -d "/sys/class/net/$_v" ] || [ "$(uci -q get "network.$_v" 2>/dev/null)" = interface ] ;;
+        routing_excluded_ips)
+            case "$_v" in */*) validate_ip_or_cidr "$_v" ;; *) _m3x_ip "$_v" ;; esac ;;
+        dns_server|bootstrap_dns_server)
+            printf '%s' "$_v" | tr -d '[]' | LC_ALL=C grep -Eq '^[A-Za-z0-9._:/?&=%+~-]+$' || return 1
+            if [ "$_f" = bootstrap_dns_server ]; then
+                case "$_v" in
+                    \[*\]:*)
+                        _h=$(printf '%s' "$_v" | sed -n 's/^\[\([^]]*\)\]:[0-9][0-9]*$/\1/p')
+                        _port=$(printf '%s' "$_v" | sed -n 's/^\[[^]]*\]:\([0-9][0-9]*\)$/\1/p')
+                        [ -n "$_port" ] && [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ] && _m3x_ip "$_h" ;;
+                    *) _m3x_ip "$_v" ;;
+                esac
+                return $?
+            fi
+            case "$_v" in
+                https://*) _fk_valid_url "$_v" ;;
+                tls://*|udp://*|tcp://*)
+                    _h=$(printf '%s' "$_v" | sed 's@^[a-z]*://@@')
+                    case "$_h" in ''|*'/'*|*'?'*) return 1 ;; *) return 0 ;; esac ;;
+                *://*) return 1 ;;
+                *) _m3x_ip "$_v" || _fk_valid_domain "$_v" ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+_m3x_values() {
+    # All editable modern lists consist of whitespace-free tokens.
+    uci -q get "$1" 2>/dev/null | tr ' ' '\n'
+}
+_m3x_apply() {
+    local _op="$1" _f="$2" _input="$3" _kind _key _line _n=0 _old _cnt
+    _kind=$(_m3x_kind "$_f") || return 5
+    [ "$(uci -q get "$PODKOP_UCI.settings" 2>/dev/null)" = settings ] || return 5
+    case "$_op:$_kind" in add:list|del:list|set:scalar) ;; *) return 5 ;; esac
+    _key="$PODKOP_UCI.settings.$_f"
+    _old=$(_m3x_values "$_key")
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line=$(printf '%s' "$_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$_line" ] || continue
+        _m3x_valid "$_f" "$_line" || return 5
+        _n=$((_n + 1)); [ "$_n" -le 32 ] || return 5
+        if [ "$_kind" = list ]; then
+            if printf '%s\n' "$_old" | grep -Fxq -- "$_line"; then [ "$_op" = del ] || return 5
+            else [ "$_op" = add ] || return 5; fi
+        fi
+    done <<M3X
+$_input
+M3X
+    [ "$_n" -gt 0 ] || return 5
+    [ "$_kind" = list ] || [ "$_n" -eq 1 ] || return 5
+    if [ "$_op" = del ] && { [ "$_f" = dns_server ] || [ "$_f" = bootstrap_dns_server ]; }; then
+        _cnt=$(printf '%s\n' "$_old" | grep -c .)
+        [ "$_cnt" -gt "$_n" ] || return 5
+    fi
+    if [ "$_kind" = scalar ]; then
+        _fk_stage_set "$_key" "$(printf '%s' "$_input" | tr -d '\r\n ')" || return 1
+    else
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            _line=$(printf '%s' "$_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -n "$_line" ] || continue
+            if [ "$_op" = add ]; then
+                uci add_list "$_key=$_line" || { uci -q revert "$PODKOP_UCI"; return 1; }
+            else
+                uci -q del_list "$_key=$_line" || { uci -q revert "$PODKOP_UCI"; return 1; }
+            fi
+        done <<M3X
+$_input
+M3X
+    fi
+    _fk_txn_commit_reload
+}
+_m3x_ui() {
+    local _cmd="$1" _mid="$2" _txt="$3" _state="$4" _f _op _kind _value _v _rows _fields _back _saved _target _rc
+    { _forkop_v2 || _podkop_exp_v2; } || return
+    if [ "$_cmd" = STATE_INPUT ]; then
+        _saved=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+        _target=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        case "$_target" in ''|*[!0-9]*) _target='' ;; esac
+        rm -f "$STATE_FILE"; delete_message "$CALLBACK_MSG_ID"
+        [ "$_saved" = "$PODKOP_UCI:$PODKOP_VARIANT" ] || { send_message "$E_WARN Движок изменился, ввод отменён." ""; return; }
+        _op=$(printf '%s' "$_state" | cut -d_ -f3)
+        _f=$(printf '%s' "$_state" | cut -d_ -f4-)
+        _m3x_apply "$_op" "$_f" "$_txt"; _rc=$?
+        if [ "$_rc" -eq 5 ]; then
+            send_message "$E_WARN Неверное или повторное значение, либо удаляется последний DNS. Изменения отменены." ""
+        elif [ "$_rc" -ne 0 ]; then
+            send_message "$(_fk_txn_fail_msg "$_rc")" ""
+        fi
+        _m3x_ui "m3x_f_$_f" "$_target" "" ""
+        return
+    fi
+    case "$_cmd" in m3x_home|m3x_dns|m3x_net|m3x_f_*) rm -f "$STATE_FILE" ;; esac
+    case "$_cmd" in
+        m3x_home)
+            send_or_edit "$_mid" "$E_SET <b>DNS и интерфейсы</b>
+Операции с резервным копированием и откатом. Смена LAN-интерфейсов может оборвать доступ." \
+                '{"inline_keyboard":[[{"text":"DNS","callback_data":"m3x_dns"}],[{"text":"LAN и исключения","callback_data":"m3x_net"}],[{"text":"Назад","callback_data":"m3_global"}]]}' ;;
+        m3x_dns|m3x_net)
+            if [ "$_cmd" = m3x_dns ]; then
+                if _forkop_v2; then
+                    _fields='dns_server bootstrap_dns_server'
+                    _v='Forkop 2: DNS и Bootstrap — упорядоченные списки.'
+                else
+                    _fields='bootstrap_dns_server'
+                    _v='Podkop 0.8: Bootstrap — скаляр. Основные DNS — отдельные секции dns_server (пока редактировать в LuCI).'
+                fi
+            else
+                _fields='source_network_interfaces'
+                _podkop_exp_v2 && _fields="$_fields routing_excluded_ips"
+                _v='Изменение LAN может разорвать сеть. Добавляются только существующие интерфейсы.'
+            fi
+            _rows=''
+            for _f in $_fields; do
+                _rows="$_rows$(printf '[{"text":"%s","callback_data":"m3x_f_%s"}],' "$(json_escape "$(_m3x_name "$_f")")" "$_f")"
+            done
+            send_or_edit "$_mid" "$E_SET <b>DNS / сеть</b>
+$(html_escape "$_v")" "{\"inline_keyboard\":[$_rows[{\"text\":\"Назад\",\"callback_data\":\"m3x_home\"}]]}" ;;
+        m3x_f_*)
+            _f=$(printf '%s' "$_cmd" | sed 's/^m3x_f_//')
+            _kind=$(_m3x_kind "$_f") || return
+            if [ "$_kind" = scalar ]; then
+                _value=$(uci -q get "$PODKOP_UCI.settings.$_f" 2>/dev/null)
+                _rows=$(printf '[{"text":"Заменить","callback_data":"m3x_set_%s"}]' "$_f")
+            else
+                _value=$(_m3x_values "$PODKOP_UCI.settings.$_f")
+                _rows=$(printf '[{"text":"Добавить","callback_data":"m3x_add_%s"},{"text":"Удалить","callback_data":"m3x_del_%s"}]' "$_f" "$_f")
+            fi
+            [ -n "$_value" ] || _value='—'
+            _value=$(_utf8_head "$_value" 1150)
+            _back=m3x_net
+            case "$_f" in dns_server|bootstrap_dns_server) _back=m3x_dns ;; esac
+            send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\n<pre>%s</pre>\n\nПо одному значению на строку, удаление — точное совпадение.' "$E_SET" "$(_m3x_name "$_f")" "$(html_escape "$_value")")" \
+                "{\"inline_keyboard\":[$_rows,[{\"text\":\"Назад\",\"callback_data\":\"$_back\"}]]}" ;;
+        m3x_add_*|m3x_del_*|m3x_set_*)
+            _op=$(printf '%s' "$_cmd" | cut -d_ -f2)
+            _f=$(printf '%s' "$_cmd" | cut -d_ -f3-)
+            _kind=$(_m3x_kind "$_f") || return
+            case "$_op:$_kind" in add:list|del:list|set:scalar) ;; *) return ;; esac
+            printf 'wait_m3x_%s_%s\n%s\n' "$_op" "$_f" "$PODKOP_UCI:$PODKOP_VARIANT" > "$STATE_FILE"
+            send_or_edit "$_mid" "$E_EDIT <b>$(_m3x_name "$_f")</b>
+Отправьте новое значение. Оно будет проверено до записи." \
+                "{\"inline_keyboard\":[[{\"text\":\"Отмена\",\"callback_data\":\"m3x_f_$_f\"}]]}" ;;
+    esac
+}
+# --- end 0.20.3 modern global DNS and interface editors ---
 
 # 0.20.3: native Forkop 2 section actions and Podkop 0.8 Mixed Proxy.
 _m3_section_extra() {
@@ -21159,6 +21338,7 @@ handle_command() {
             wait_ts_url|wait_ts_hostname|wait_ts_key) logger -t podkop-bot "[ts] dispatcher state=$state" ;;
         esac
         case "$state" in
+            wait_m3x_*) _m3x_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_port) _m3_section_extra STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_m3_*) _m3_ui STATE_INPUT "$mid" "$cmd" "$state" ;;
             wait_proxy_link|pending_sub_url_*|wait_forkop_sub_url|pending_forkop_sub_url|wait_netshift_sub_url|pending_netshift_sub_url)
@@ -21204,6 +21384,7 @@ handle_command() {
         "noop") ;;
         "doc_to_runtime") delete_message "$mid"; _handle_bot "cmd_runtime" "" "" "" ;;
         "delete_msg")     delete_message "$mid" ;;
+        m3x_*) _m3x_ui "$cmd" "$mid" "" "" ;;
         m3_action*|m3_mixed*|m3_port) _m3_section_extra "$cmd" "$mid" "" "" ;;
         m3_sec|m3_sw_*|m3_do_enabled_*|m3_choose*|m3_global|m3_apply_*|m3_log*)
             _m3_settings_ui "$cmd" "$mid" "" "" ;;
