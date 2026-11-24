@@ -28,7 +28,7 @@ uci() {
             case "$2" in
                 forkop.main|podkop.main) echo section ;;
                 *.user_domain_list_type|*.user_subnet_list_type) echo "$MODE" ;;
-                *) return 1 ;;
+                *) printf '\n' ;;
             esac ;;
         add_list) printf 'ADD:%s\n' "$2" >> "$LOG" ;;
         del_list) printf 'DEL:%s\n' "$2" >> "$LOG" ;;
