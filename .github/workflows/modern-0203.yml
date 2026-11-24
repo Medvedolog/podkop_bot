@@ -11,6 +11,7 @@ on:
       - tools/test-modern-dns-rows-0203.sh
       - tools/test-modern-advanced-0203.sh
       - tools/test-modern-ipv6-0203.sh
+      - tools/test-modern-rollback-0203.sh
       - .github/workflows/modern-0203.yml
   workflow_dispatch:
 jobs:
@@ -30,6 +31,8 @@ jobs:
         run: sh tools/test-modern-advanced-0203.sh
       - name: IPv4 and IPv6 CIDR boundary tests
         run: sh tools/test-modern-ipv6-0203.sh
+      - name: UCI rollback verifies recovery reload
+        run: sh tools/test-modern-rollback-0203.sh
       - name: Installer downgrade prevention
         run: sh tools/test-installer-no-downgrade-0203.sh
       - name: Provider compatibility smoke
