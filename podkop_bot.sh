@@ -10527,7 +10527,7 @@ _m3_apply_items() {
     local _op="$1" _f="$2" _input="$3" _sec="$4" _kind _key _line _n=0 _mode _old
     _kind=$(_m3_field_kind "$_f") || return 5
     [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return 5
-    case "$_op:$_kind" in add:list|del:list|replace:text) ;; *) return 5 ;; esac
+    case "$_op:$_kind" in add:list|del:list|replace:text|append:text) ;; *) return 5 ;; esac
     while IFS= read -r _line || [ -n "$_line" ]; do
         _line=$(printf '%s' "$_line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$_line" ] || continue
@@ -10540,6 +10540,10 @@ M3VALUES
     [ "$_n" -gt 0 ] || return 5
     _key="$PODKOP_UCI.$_sec.$_f"
     if [ "$_kind" = text ]; then
+        if [ "$_op" = append ]; then
+            _old=$(uci -q get "$_key" 2>/dev/null)
+            [ -n "$_old" ] && _input=$(printf '%s\n%s' "$_old" "$_input")
+        fi
         _fk_stage_set "$_key" "$_input" || return 1
     else
         if _podkop_exp_v2 && [ "$_op" = add ]; then
@@ -10574,11 +10578,13 @@ M3VALUES
 
 # 0.20.3 Telegram UI for the modern routing editor (all writes are allowlisted).
 _m3_ui() {
-    local _cmd="$1" _mid="$2" _text="$3" _state="$4" _sec _f _kind _op _rows _fields _value _rc _saved
+    local _cmd="$1" _mid="$2" _text="$3" _state="$4" _sec _f _kind _op _rows _fields _value _rc _saved _return_mid
     { _forkop_v2 || _podkop_exp_v2; } || return
     _sec=$(get_active_section)
     if [ "$_cmd" = STATE_INPUT ]; then
         _saved=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+        _return_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
+        case "$_return_mid" in ''|*[!0-9]*) _return_mid='' ;; esac
         rm -f "$STATE_FILE"
         delete_message "$CALLBACK_MSG_ID"
         if [ "$_saved" != "$_sec" ]; then
@@ -10595,9 +10601,10 @@ _m3_ui() {
                 send_message "$(_fk_txn_fail_msg "$_rc")" ""
             fi
         fi
-        _m3_ui "m3_f_$_f" "$_mid" "" ""
+        _m3_ui "m3_f_$_f" "$_return_mid" "" ""
         return
     fi
+    case "$_cmd" in m3_main|m3_route|m3_f_*) rm -f "$STATE_FILE" ;; esac
     case "$_cmd" in
         m3_main)
             send_or_edit "$_mid" "$(printf '%s <b>Настройки нового движка</b>\n\nСекция: <code>%s</code>\nПоддерживаются современные поля UCI и откат при неудачном применении.' "$E_SET" "$(html_escape "$_sec")")" \
@@ -10625,18 +10632,18 @@ _m3_ui() {
             [ -n "$_value" ] || _value='—'
             _value=$(_utf8_head "$_value" 1250)
             if [ "$_kind" = text ]; then
-                _rows='[{"text":"Заменить весь список","callback_data":"m3_replace_destinations"}]'
+                _rows='[{"text":"Добавить записи","callback_data":"m3_append_destinations"}],[{"text":"Заменить весь список","callback_data":"m3_replace_destinations"}]'
             else
                 _rows=$(printf '[{"text":"Добавить","callback_data":"m3_add_%s"},{"text":"Удалить запись","callback_data":"m3_del_%s"}]' "$_f" "$_f")
             fi
             send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\n<pre>%s</pre>\n\nУдаление: точное значение. Добавление: можно несколько строк.' "$E_SET" "$(_m3_field_label "$_f")" "$(html_escape "$_value")")" \
                 "{\"inline_keyboard\":[$_rows,[{\"text\":\"Назад\",\"callback_data\":\"m3_route\"}]]}"
             ;;
-        m3_add_*|m3_del_*|m3_replace_*)
+        m3_add_*|m3_del_*|m3_replace_*|m3_append_*)
             _op=$(printf '%s' "$_cmd" | cut -d_ -f2)
             _f=$(printf '%s' "$_cmd" | cut -d_ -f3-)
             _kind=$(_m3_field_kind "$_f") || return
-            case "$_op:$_kind" in add:list|del:list|replace:text) ;; *) return ;; esac
+            case "$_op:$_kind" in add:list|del:list|replace:text|append:text) ;; *) return ;; esac
             [ "$(uci -q get "$PODKOP_UCI.$_sec" 2>/dev/null)" = section ] || return
             printf 'wait_m3_%s_%s\n%s\n' "$_op" "$_f" "$_sec" > "$STATE_FILE"
             send_or_edit "$_mid" "$(printf '%s <b>%s</b>\n\nОтправьте значения по одному в строке.\n%s' "$E_EDIT" "$(_m3_field_label "$_f")" "$( [ "$_op" = replace ] && echo 'Полная замена: старый список будет перезаписан.' || echo 'При удалении требуется точное совпадение.')")" \
