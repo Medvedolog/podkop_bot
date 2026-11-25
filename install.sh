@@ -1979,6 +1979,29 @@ validate_socks_url() {
     awk -v p="$_port" 'BEGIN { exit (p >= 1 && p <= 65535) ? 0 : 1 }'
 }
 
+# Refuse to downgrade from a newer bot when updating from the stable main branch.
+# An intentional rollback remains available through an explicit reinstall.
+_inst_version_newer(){
+    local _a="$1" _b="$2" _aa _bb _v1 _v2 _i _da _db
+    printf '%s\n' "$_a" | grep -Eq '^[0-9]+(\.[0-9]+){2}(-dev[0-9]+)?$' || return 1
+    printf '%s\n' "$_b" | grep -Eq '^[0-9]+(\.[0-9]+){2}(-dev[0-9]+)?$' || return 1
+    _aa=$(printf '%s' "$_a" | cut -d- -f1)
+    _bb=$(printf '%s' "$_b" | cut -d- -f1)
+    for _i in 1 2 3; do
+        _v1=$(printf '%s' "$_aa" | cut -d. -f"$_i")
+        _v2=$(printf '%s' "$_bb" | cut -d. -f"$_i")
+        [ "$_v1" -gt "$_v2" ] && return 0
+        [ "$_v1" -lt "$_v2" ] && return 1
+    done
+    [ "$_a" = "$_b" ] && return 1
+    case "$_a" in *-dev*) _da=$(printf '%s' "$_a" | sed 's/.*-dev//') ;; *) _da=stable ;; esac
+    case "$_b" in *-dev*) _db=$(printf '%s' "$_b" | sed 's/.*-dev//') ;; *) _db=stable ;; esac
+    [ "$_da" = stable ] && [ "$_db" != stable ] && return 0
+    [ "$_db" = stable ] && return 1
+    [ "$_da" = stable ] && return 1
+    [ "$_da" -gt "$_db" ]
+}
+
 # _validate_downloaded_script: sanity-check a downloaded shell script before
 # trusting it — catches the case where curl/wget "succeeded" but actually
 # saved an HTML error page, an empty file, or a truncated/corrupt download
@@ -2563,6 +2586,12 @@ if [ "$HAS_EXISTING" = "1" ]; then
             printf "$(msg installed_label)\n" "${INSTALLED_VER}"
             printf "$(msg available_label)\n" "${REMOTE_VER}"
             echo ""
+
+            if _inst_version_newer "$INSTALLED_VER" "$REMOTE_VER"; then
+                warn "Installed $INSTALLED_VER is newer than GitHub $REMOTE_VER. Automatic downgrade is blocked; use explicit reinstall to roll back."
+                _release_lock
+                exit 0
+            fi
 
             if [ "$UNATTENDED" = "1" ]; then
                 if [ "$INSTALLED_VER" = "$REMOTE_VER" ] && [ "$REMOTE_VER" != "unknown" ]; then

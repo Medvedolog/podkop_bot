@@ -1,0 +1,45 @@
+name: Modern 0.20.3 compatibility
+on:
+  push:
+    branches:
+      - dev/0.20.3-legacy-parity
+  pull_request:
+    paths:
+      - podkop_bot.sh
+      - tools/test-modern-0203.sh
+      - tools/test-modern-dns-0203.sh
+      - tools/test-modern-dns-rows-0203.sh
+      - tools/test-modern-advanced-0203.sh
+      - tools/test-modern-ipv6-0203.sh
+      - tools/test-modern-rollback-0203.sh
+      - .github/workflows/modern-0203.yml
+  workflow_dispatch:
+jobs:
+  modern-uci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate ash-compatible syntax
+        run: sh -n podkop_bot.sh
+      - name: Modern routing UCI mock
+        run: sh tools/test-modern-0203.sh
+      - name: Modern DNS and LAN editor smoke
+        run: sh tools/test-modern-dns-0203.sh
+      - name: Ordered Podkop Experimental DNS upstream UCI test
+        run: sh tools/test-modern-dns-rows-0203.sh
+      - name: Modern DNS/WAN/IPv6 and traffic option regressions
+        run: sh tools/test-modern-advanced-0203.sh
+      - name: Podkop Experimental 0.8.23 native settings
+        run: sh tools/test-exp-0823-0203.sh
+      - name: Native proxy priority menu integration
+        run: sh tools/test-proxy-priorities-0203.sh
+      - name: Mixed Proxy credential UI regression
+        run: sh tools/test-modern-mixed-auth-0203.sh
+      - name: IPv4 and IPv6 CIDR boundary tests
+        run: sh tools/test-modern-ipv6-0203.sh
+      - name: UCI rollback verifies recovery reload
+        run: sh tools/test-modern-rollback-0203.sh
+      - name: Installer downgrade prevention
+        run: sh tools/test-installer-no-downgrade-0203.sh
+      - name: Provider compatibility smoke
+        run: sh tools/check-provider-compat.sh
