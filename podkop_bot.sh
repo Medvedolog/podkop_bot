@@ -15649,7 +15649,7 @@ XPM
             _body="${_body}
 <b>Режим:</b> $(html_escape "$_xp_choice_human") (<code>$(html_escape "$_xp_choice")</code>)
 <b>Индивидуальные обходы (cure):</b> ${_xp_cure_count} · управление в LuCI"
-            send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — участвуют в режиме выбора сервера. 🛟 резервные — используются по порядку при недоступности основных.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
+            send_or_edit "$mid" "$(printf '%s <b>Серверы секции</b> [<code>%s</code>]\n%s\n\n⭐ основные строки — участвуют в режиме выбора сервера. 🛟 резервные — вступают в работу при недоступности основных; на 0.8.23+ стратегия выбирается выше.' "$E_GLOB" "$(html_escape "$(section_display_label "$sec")")" "$_body")" \
                 "{\"inline_keyboard\":[${_rows}[{\"text\":\"${E_ADD} Основная строка\",\"callback_data\":\"xp_add_s\"},{\"text\":\"${E_ADD} Резервная\",\"callback_data\":\"xp_add_f\"}],[{\"text\":\"📚 Источники\",\"callback_data\":\"xp_src\"},{\"text\":\"⏱ Проверка серверов\",\"callback_data\":\"xp_chk\"}],[{\"text\":\"${E_BACK} Прокси\",\"callback_data\":\"proxy_menu\"}]]}"
             ;;
         xp_add_s|xp_add_f)
