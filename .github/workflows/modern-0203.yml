@@ -29,6 +29,8 @@ jobs:
         run: sh tools/test-modern-dns-rows-0203.sh
       - name: Modern DNS/WAN/IPv6 and traffic option regressions
         run: sh tools/test-modern-advanced-0203.sh
+      - name: Podkop Experimental 0.8.23 native settings
+        run: sh tools/test-exp-0823-0203.sh
       - name: Native proxy priority menu integration
         run: sh tools/test-proxy-priorities-0203.sh
       - name: Mixed Proxy credential UI regression
