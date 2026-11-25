@@ -15423,6 +15423,41 @@ xp_member_words() {
     _fk_txn_commit_reload
 }
 
+# Detect native 0.8.23 capabilities from the installed package version, not config_version.
+_xp_0823() {
+    _podkop_exp_v2 || return 1
+    local _v=""
+    if command -v opkg >/dev/null 2>&1; then
+        _v=$(opkg list-installed 2>/dev/null | awk '$1=="podkop-exp" {print $3; exit}')
+    elif [ -r /lib/apk/db/installed ]; then
+        _v=$(awk 'BEGIN{RS="";FS="\\n"} {p=0;v="";for(i=1;i<=NF;i++){if($i=="P:podkop-exp")p=1;if(index($i,"V:")==1)v=substr($i,3)}if(p){print v;exit}}' /lib/apk/db/installed 2>/dev/null)
+    fi
+    _v=${_v#v}; _v=${_v%%-*}
+    case "$_v" in
+        0.8.*) local _patch=${_v##*.}; case "$_patch" in ''|*[!0-9]*) return 1 ;; esac; [ "$_patch" -ge 23 ] ;;
+        0.9.*|1.*|2.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+xp_member_protocols() {
+    local _m="$1" _sec="$2" _input="$3" _p _values=""
+    _xp_0823 && _xp_member_owned "$_m" "$_sec" || return 1
+    _input=$(printf '%s' "$_input" | tr ',;' '  ' | tr '[:upper:]' '[:lower:]')
+    [ "$_input" = "-" ] && _input=""
+    for _p in $_input; do
+        case "$_p" in
+            vless|vmess|trojan|shadowsocks|hysteria2|hysteria|tuic|anytls|naive|socks|http) ;;
+            *) return 2 ;;
+        esac
+        case " $_values " in *" $_p "*) continue ;; esac
+        _values="${_values}${_values:+
+}${_p}"
+    done
+    _fk_list_stage_replace_any "${PODKOP_UCI}.${_m}.protocols" "$_values" || return 1
+    _fk_txn_commit_reload
+}
+
 # xp_member_move MEMBER SECTION up|down — swap with the neighbouring row of the
 # same role (fallback order is the order rows are tried in).
 xp_member_move() {
@@ -15506,6 +15541,18 @@ _handle_exp_v2() {
                 _rc=1; _xp_is_source "$_s" && _fk_stage_set "${PODKOP_UCI}.${_s}.${_key}" "$_v" && { _rc=0; _fk_txn_commit_reload || _rc=$?; }
                 [ "$_rc" -eq 0 ] && _handle_exp_v2 "xp_s_${_s}" "$_rmid" "" "" || send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb "xp_s_${_s}")"
                 ;;
+            wait_xp_mp_*)
+                local _m="${state#wait_xp_mp_}"
+                _xp_0823 && _xp_member_owned "$_m" "$sec" || { send_message "${E_WARN} Нужна версия 0.8.23+." "$(_xp_back_kb xp_menu)"; return; }
+                _rc=0; xp_member_protocols "$_m" "$sec" "$_v" || _rc=$?
+                if [ "$_rc" -eq 2 ]; then
+                    send_message "${E_ERR} Неизвестный протокол. Разрешены vless, vmess, trojan, shadowsocks, hysteria2, hysteria, tuic, anytls, naive, socks, http, либо -." "$(_xp_back_kb "xp_m_${_m}")"
+                elif [ "$_rc" -eq 0 ]; then
+                    _handle_exp_v2 "xp_m_${_m}" "$_rmid" "" ""
+                else
+                    send_or_edit "$_rmid" "$(_fk_txn_fail_msg "$_rc")" "$(_xp_back_kb xp_menu)"
+                fi
+                ;;
             wait_xp_mi_*|wait_xp_mx_*)
                 local _m _key
                 case "$state" in wait_xp_mi_*) _m="${state#wait_xp_mi_}"; _key=include ;; *) _m="${state#wait_xp_mx_}"; _key=exclude ;; esac
@@ -15547,6 +15594,13 @@ _handle_exp_v2() {
     fi
 
     case "$cmd" in
+        xp_fc_*)
+            local _mode="${cmd#xp_fc_}"
+            _xp_0823 || { CB_ANSWER_TEXT="Нужна Podkop Experimental 0.8.23+"; return; }
+            case "$_mode" in order|fastest|loss|balance) ;; *) return ;; esac
+            _rc=0; _fk_stage_set "${PODKOP_UCI}.${sec}.fallback_choice" "$_mode" && { _fk_txn_commit_reload || _rc=$?; } || _rc=1
+            [ "$_rc" -eq 0 ] && _handle_exp_v2 xp_menu "$mid" "" "" || _fk_txn_report "$_rc" "$mid" xp_menu
+            ;;
         xp_menu)
             rm -f "$STATE_FILE"
             local _body="" _rows="" _id _role _src _inc _exc _via _ns=0 _nf=0 _line
@@ -15578,6 +15632,20 @@ XPM
             esac
             _xp_cure_count=$(uci -q show "${PODKOP_UCI}" 2>/dev/null | grep -Ec "^${PODKOP_UCI}\.[^.]+=cure$" || true)
             case "$_xp_cure_count" in ''|*[!0-9]*) _xp_cure_count=0 ;; esac
+            if _xp_0823; then
+                local _fc _fc_h
+                _fc=$(uci -q get "${PODKOP_UCI}.${sec}.fallback_choice" 2>/dev/null)
+                case "$_fc" in
+                    ''|order) _fc=order; _fc_h="по порядку" ;;
+                    fastest) _fc_h="самый быстрый" ;;
+                    loss) _fc_h="с учётом потерь" ;;
+                    balance) _fc_h="балансировка" ;;
+                    *) _fc_h="неизвестный" ;;
+                esac
+                _body="${_body}
+<b>Запасные:</b> $(html_escape "$_fc_h")"
+                _rows="${_rows}[{\"text\":\"🛟 По порядку$([ "$_fc" = order ] && printf ' ✓')\",\"callback_data\":\"xp_fc_order\"},{\"text\":\"Самый быстрый$([ "$_fc" = fastest ] && printf ' ✓')\",\"callback_data\":\"xp_fc_fastest\"}],[{\"text\":\"С учётом потерь$([ "$_fc" = loss ] && printf ' ✓')\",\"callback_data\":\"xp_fc_loss\"},{\"text\":\"Балансировка$([ "$_fc" = balance ] && printf ' ✓')\",\"callback_data\":\"xp_fc_balance\"}],"
+            fi
             _body="${_body}
 <b>Режим:</b> $(html_escape "$_xp_choice_human") (<code>$(html_escape "$_xp_choice")</code>)
 <b>Индивидуальные обходы (cure):</b> ${_xp_cure_count} · управление в LuCI"
@@ -15617,12 +15685,22 @@ fallback|block
             local _m="${cmd#xp_m_}" _r
             _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Строка устарела"; _handle_exp_v2 xp_menu "$mid" "" ""; return; }
             _r=$(_xp_members "$sec" | awk -F'|' -v m="$_m" '$1 == m')
-            local _role _src _inc _exc _via
+            local _role _src _inc _exc _via _proto_btn=""
+            if _xp_0823; then
+                _proto_btn=",[{\"text\":\"Протоколы\",\"callback_data\":\"xp_mp_${_m}\"}]"
+            fi
             IFS='|' read -r _ _role _src _inc _exc _via <<XPR
 $_r
 XPR
             send_or_edit "$mid" "$(printf '%s <b>Строка секции</b>\n\n<b>Роль:</b> %s\n<b>Источник:</b> %s\n<b>Только серверы со словами:</b> %s\n<b>Кроме слов:</b> %s%s\n\n<i>Слово ищется в начале слов имени сервера без учёта регистра: <code>de</code> найдёт «DE-1», флаг 🇩🇪 ищется как есть.</i>' "$E_SET" "$( [ "$_role" = fallback ] && echo 'резервная' || echo 'основная')" "$(html_escape "$(_xp_source_label "$_src")")" "$(html_escape "${_inc:-все}")" "$(html_escape "${_exc:-—}")" "$( [ -n "$_via" ] && printf '\n<b>Через:</b> %s' "$(html_escape "$(_xp_source_label "$_via")")")")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Только…\",\"callback_data\":\"xp_mi_${_m}\"},{\"text\":\"${E_EDIT} Кроме…\",\"callback_data\":\"xp_mx_${_m}\"}],[{\"text\":\"⬆️ Выше\",\"callback_data\":\"xp_mu_${_m}\"},{\"text\":\"⬇️ Ниже\",\"callback_data\":\"xp_md_${_m}\"}],[{\"text\":\"${E_DEL} Удалить строку\",\"callback_data\":\"xp_mdel_${_m}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Только…\",\"callback_data\":\"xp_mi_${_m}\"},{\"text\":\"${E_EDIT} Кроме…\",\"callback_data\":\"xp_mx_${_m}\"}]${_proto_btn},[{\"text\":\"⬆️ Выше\",\"callback_data\":\"xp_mu_${_m}\"},{\"text\":\"⬇️ Ниже\",\"callback_data\":\"xp_md_${_m}\"}],[{\"text\":\"${E_DEL} Удалить строку\",\"callback_data\":\"xp_mdel_${_m}\"}],[{\"text\":\"${E_BACK} Назад\",\"callback_data\":\"xp_menu\"}]]}"
+            ;;
+        xp_mp_*)
+            local _m="${cmd#xp_mp_}"
+            _xp_0823 && _xp_member_owned "$_m" "$sec" || { CB_ANSWER_TEXT="Нужна версия 0.8.23+"; return; }
+            printf '%s\n' "wait_xp_mp_${_m}" > "$STATE_FILE"
+            local _cur; _cur=$(_fk_list_read_any "${PODKOP_UCI}.${_m}.protocols" | paste -sd',' -)
+            send_or_edit "$mid" "Фильтр протоколов: $(html_escape "${_cur:-все}"). Отправьте через пробел или запятую: vless, hysteria2, trojan. Для сброса — -" "$(_xp_back_kb "xp_m_${_m}")"
             ;;
         xp_mi_*|xp_mx_*)
             local _m _what
