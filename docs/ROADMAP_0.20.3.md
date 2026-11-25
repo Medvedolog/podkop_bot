@@ -15,6 +15,7 @@
 - IPv4, IPv6 (включая `::` и IPv4-mapped IPv6), CIDR-маски и числовые границы валидируются до записи UCI.
 - Все новые операции применяются через `_fk_txn_commit_reload`: резервная копия, UCI commit, reload и попытка восстановления при отказе; отказ без успешного отката отдельно сообщается.
 - CI: `tools/test-modern-0203.sh`, `test-modern-dns-0203.sh`, `test-modern-dns-rows-0203.sh`, `test-modern-advanced-0203.sh`, `test-modern-ipv6-0203.sh`, `test-installer-no-downgrade-0203.sh`, provider compatibility.
+- **Podkop Experimental 0.8.23+:** `section.fallback_choice` (`order`, `fastest`, `loss`, `balance`) и UCI-списки `member.protocols` в редакторе основных/резервных строк. Проверка версии установленного пакета скрывает новые элементы на старых сборках. Источник схемы — `podkop-net/podkop-experimental` (`src/backend/model/model.go`, `src/backend/model/protocols.go`).
 - Единое меню «Прокси»: приоритеты Forkop 2 и основные/резервные строки Podkop Experimental доступны напрямую, без отдельной модели каскадов.\n- Интеграция с BearGuard: пакетный `luci-app-podkop-bot 0.20.3-r1` содержит побайтово закреплённую версию `0.20.3-dev5` и идентичный standalone-установщик; integrity gate проверяет SHA256 и Git blob.
 
 ## Не подтверждено; до stable остаётся
